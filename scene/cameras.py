@@ -15,7 +15,7 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, head_mask, mouth_mask,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, head_mask, mouth_mask, hair_mask, hair_orient,
                  exp_param, eyes_pose, eyelids, jaw_pose,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
@@ -42,6 +42,8 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
         self.head_mask = head_mask.to(self.data_device)
         self.mouth_mask = mouth_mask.to(self.data_device)
+        self.hair_mask = hair_mask.to(self.data_device)
+        self.hair_orient = hair_orient.to(self.data_device)
         self.exp_param = exp_param.to(self.data_device)
         self.eyes_pose = eyes_pose.to(self.data_device)
         self.eyelids = eyelids.to(self.data_device)

@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 
 from scene.gaussian_model import GaussianModel
+from scene.gaussian_perm import GaussianPerm
 from scene.cameras import Camera
 from arguments import ModelParams
 from utils.general_utils import PILtoTensor
@@ -21,6 +22,8 @@ class Scene_mica:
         images_folder = os.path.join(datadir, "imgs")
         parsing_folder = os.path.join(datadir, "parsing")
         alpha_folder = os.path.join(datadir, "alpha")
+        hair_mask_folder = os.path.join(datadir, "hair_mask")
+        hair_orient_folder = os.path.join(datadir, "hairstep")
         
         self.bg_image = torch.zeros((3, 512, 512))
         if white_background:
@@ -95,9 +98,19 @@ class Scene_mica:
             mouth_mask = Image.open(mouth_mask_path)
             mouth_mask = PILtoTensor(mouth_mask)
 
+            # hair_mask
+            hair_mask_path = os.path.join(hair_mask_folder, image_name_ori+'.jpg')
+            hair_mask = Image.open(hair_mask_path)
+            hair_mask = PILtoTensor(hair_mask)
+
+            # hairstep map
+            hair_orient_path = os.path.join(hair_orient_folder, image_name_ori+'.jpg')
+            hair_orient = Image.open(hair_orient_path)
+            hair_orient = PILtoTensor(hair_orient)
+
             camera_indiv = Camera(colmap_id=frame_id, R=R, T=T, 
                                 FoVx=FovX, FoVy=FovY, 
-                                image=gt_image, head_mask=head_mask, mouth_mask=mouth_mask,
+                                image=gt_image, head_mask=head_mask, mouth_mask=mouth_mask, hair_mask=hair_mask, hair_orient=hair_orient,
                                 exp_param=exp_param, eyes_pose=eyes_pose, eyelids=eyelids, jaw_pose=jaw_pose,
                                 image_name=image_name_mica, uid=frame_id, data_device=device)
             self.cameras.append(camera_indiv)
