@@ -58,8 +58,8 @@ if __name__ == "__main__":
     DeformModel.training_setup()
 
     ## dataloader
-    data_dir = os.path.join('dataset', args.idname)
-    mica_datadir = os.path.join('metrical-tracker/output', args.idname)
+    data_dir = os.path.join(args.source_path, args.idname)
+    mica_datadir = os.path.join(args.source_path, 'track_out', args.idname)
     log_dir = os.path.join(data_dir, 'log')
     train_dir = os.path.join(log_dir, 'train')
     model_dir = os.path.join(log_dir, 'ckpt')
