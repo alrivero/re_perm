@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from torch import nn
 from hair import Strands
 from models.encoder import EncodingNetwork
 from models.networks_stylegan2 import FullyConnectedLayer
@@ -59,7 +60,7 @@ class RawNeuralTexture(torch.nn.Module):
         position = position.reshape(batch_size, num_coords, -1, 3)
         position = F.pad(position, (0, 0, 1, 0), mode='constant', value=0)
 
-        return {'strands': Strands(position=position), 'coeff': coeff}
+        return {'strands': Strands(position=position), 'coef': coeff}
 
 
 @persistence.persistent_class
@@ -88,6 +89,9 @@ class ResNeuralTexture(torch.nn.Module):
         self.encoder = EncodingNetwork(in_features=img_channels + 1, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
         self.decoder = PCADecoder(in_features=img_channels, out_features=img_channels, decoder_lr_mul=1)
         self.strand_codec = StrandCodec(**strand_kwargs)
+
+        self.mean = nn.Parameter(torch.rand((1, 54, 1, 1)))
+        self.std = nn.Parameter(torch.rand((1, 54, 1, 1)))
 
     def encode(self, img, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         image = img['image']
@@ -123,7 +127,7 @@ class ResNeuralTexture(torch.nn.Module):
         position = position.reshape(batch_size, num_coords, -1, 3)
         position = F.pad(position, (0, 0, 1, 0), mode='constant', value=0)
 
-        return {'strands': Strands(position=position), 'coeff': coeff}
+        return {'strands': Strands(position=position), 'coef': coeff}
 
 
 @persistence.persistent_class
@@ -200,7 +204,7 @@ class NeuralTextureSuperRes(torch.nn.Module):
         position = position.reshape(batch_size, num_coords, -1, 3)
         position = F.pad(position, (0, 0, 1, 0), mode='constant', value=0)
 
-        return {'strands': Strands(position=position), 'coeff': coeff}
+        return {'strands': Strands(position=position), 'coef': coeff}
 
 
 @persistence.persistent_class

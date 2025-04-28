@@ -1,0 +1,16 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - plyfile=0.8.1
+  - tqdm
+  - pip:
+    - submodules/diff-gaussian-rasterization
+    - submodules/simple-knn
+    - scipy
+    - chumpy
+    - scikit-image
+    - opencv-python
+    - ninja
+    - lpips
+    - loguru

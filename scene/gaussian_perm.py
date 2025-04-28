@@ -1,13 +1,15 @@
 import torch
+import trimesh
+import pickle
 import numpy as np
 import torch.nn as nn
 
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmetric, build_scaling_rotation
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmetric, build_scaling_rotation, quatProduct_batch
 
-STRAND_VERTEX_COUNT = 100
+STRAND_VERTEX_COUNT = 25
 
 class GaussianPerm(nn.Module):
-    def __init__(self, perm, sh_degree, num_strands=10000):
+    def __init__(self, perm, roots, sh_degree, num_strands=2535):
         super(GaussianPerm, self).__init__()
 
         self.optimizer = None
@@ -16,10 +18,7 @@ class GaussianPerm(nn.Module):
         self.num_strands = num_strands
 
         self.perm = perm
-        self.scalp_mask = np.load(
-            "/home/alrivero/ENPC/sparkly_perm/src/assets/FLAME_masks/FLAME_masks.pkl")["scalp"]
-
-        self.init_parameters()
+        self.init_parameters(roots)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -35,12 +34,12 @@ class GaussianPerm(nn.Module):
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-    def init_parameters(self):
+    def init_parameters(self, roots):
         gaussian_count = self.num_strands * STRAND_VERTEX_COUNT
 
         # Save PERM and also the items we'll need to optimize
-        sampled_roots = self.perm.hair_roots.sample_scalp_surface(self.scalp_mask, self.num_strands)
-        self.roots = nn.Parameter(sampled_roots.requires_grad_(True))
+        # self.roots = nn.Parameter(roots.requires_grad_(True))
+        self.roots = roots
         self.theta = nn.Parameter(self.perm.theta_avg().requires_grad_(True))
         self.beta = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
         
@@ -57,11 +56,13 @@ class GaussianPerm(nn.Module):
             features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
         )
 
-        self._scaling = nn.Parameter(torch.rand((gaussian_count, 3)).requires_grad_(True))
+        self._scaling_base = nn.Parameter(torch.rand((gaussian_count, 3)).requires_grad_(True))
+        self._scaling = None
 
         rots = torch.zeros((gaussian_count, 4))
         rots[:, 0] = 1
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._rotation_base = nn.Parameter(rots.requires_grad_(True))
+        self._rotation = None
 
         opacities = inverse_sigmoid(
             0.1
@@ -71,10 +72,12 @@ class GaussianPerm(nn.Module):
         )
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
 
-        # Not actually learned, but still integral
-        self.max_radii2D = torch.zeros((gaussian_count))
-        self.xyz_gradient_accum = torch.zeros((gaussian_count, 1), device="cuda")
-        self.denom = torch.zeros((gaussian_count, 1), device="cuda")
+        # Need a global scale parameter to bring PERM strands into the correct frame of reference
+        p2g_rigid = torch.eye(4)
+        p2g_rigid[:3, :3] *= 0.01175745458
+        self._p2g_rigid_transform = nn.Parameter(p2g_rigid)
+        
+        self._xyz = None
 
     def capture(self):
         return (
@@ -84,9 +87,6 @@ class GaussianPerm(nn.Module):
             self._scaling_base,
             self._rotation_base,
             self._opacity,
-            self.max_radii2D,
-            self.xyz_gradient_accum,
-            self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.roots,
@@ -101,18 +101,21 @@ class GaussianPerm(nn.Module):
         self._scaling_base, 
         self._rotation_base, 
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
         opt_dict, 
         self.spatial_lr_scale,
         self.roots,
         self.theta,
         self.beta) = model_args
         self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+
+    @property
+    def get_roots_xyz(self):
+        return self.roots
+
+    @property
+    def get_xyz(self):
+        return self._xyz
 
     @property
     def get_scaling(self):
@@ -121,11 +124,6 @@ class GaussianPerm(nn.Module):
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-
-    @property
-    def get_xyz(self):
-        # REWRITE ME
-        return None
 
     @property
     def get_features(self):
@@ -147,18 +145,14 @@ class GaussianPerm(nn.Module):
             self.active_sh_degree += 1
 
     def training_setup(self, training_args):
-        self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-
         self.spatial_lr_scale = 5
 
         l = [
-            {
-                "params": [self.roots],
-                "lr": training_args.perm_lr_init,
-                "name": "roots",
-            },
+            # {
+            #     "params": [self.roots],
+            #     "lr": training_args.perm_lr_init,
+            #     "name": "roots_uv",
+            # },
             {
                 "params": [self.theta],
                 "lr": training_args.perm_lr_init,
@@ -168,6 +162,11 @@ class GaussianPerm(nn.Module):
                 "params": [self.beta],
                 "lr": training_args.perm_lr_init,
                 "name": "beta",
+            },
+            {
+                "params": [self._p2g_rigid_transform],
+                "lr": training_args.perm_lr_init,
+                "name": "p2g_rigid_transform",
             },
             {
                 "params": [self._features_dc],
@@ -185,12 +184,12 @@ class GaussianPerm(nn.Module):
                 "name": "opacity",
             },
             {
-                "params": [self._scaling],
+                "params": [self._scaling_base],
                 "lr": training_args.scaling_lr * self.spatial_lr_scale,
                 "name": "scaling",
             },
             {
-                "params": [self._rotation],
+                "params": [self._rotation_base],
                 "lr": training_args.rotation_lr,
                 "name": "rotation",
             },
@@ -233,3 +232,15 @@ class GaussianPerm(nn.Module):
         )
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+
+    def perm2scene(self, points):
+        ones = points.new_ones(points.shape[0], 1)
+        pts_h = torch.cat([points, ones], dim=1)
+        transformed = (self._p2g_rigid_transform @ pts_h.T).T 
+        
+        return transformed[:, :3]
+    
+    def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
+        self._xyz = points
+        self._rotation = quatProduct_batch(self._rotation_base, rot_delta)
+        self._scaling = self._scaling_base * scale_coeff

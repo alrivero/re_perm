@@ -6,13 +6,15 @@ import torch.nn as nn
 import argparse
 import cv2
 import lpips
+import pickle
+import debug
 
 from hair import save_hair
 from hair.hair_models import Perm
 from scene.gaussian_perm import GaussianPerm
 
 from scene import Scene_mica
-from src.deform_model import Deform_Model
+from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.loss_utils import huber_loss
@@ -48,18 +50,17 @@ if __name__ == "__main__":
     opt = op.extract(args)
     ppt = pp.extract(args)
 
+    torch.autograd.set_detect_anomaly(True)
+
     batch_size = 1
     set_random_seed(args.seed)
 
     percep_module = lpips.LPIPS(net='vgg').to(args.device)
 
-    ## deform model
-    DeformModel = Deform_Model(args.device).to(args.device)
-    DeformModel.training_setup()
 
     ## dataloader
     data_dir = os.path.join(args.source_path, args.idname)
-    mica_datadir = os.path.join(args.source_path, 'track_out', args.idname)
+    mica_datadir = os.path.join(args.source_path, args.idname, 'track_out', args.idname)
     log_dir = os.path.join(data_dir, 'log')
     train_dir = os.path.join(log_dir, 'train')
     model_dir = os.path.join(log_dir, 'ckpt')
@@ -70,16 +71,26 @@ if __name__ == "__main__":
     
     first_iter = 0
     
-    perm = Perm(lpt.perm_path, lpt.head_path)
-    gaussians = GaussianPerm(perm, lpt.sh_degree)
+    # scalp_mask = pickle.load(open(
+    #     "/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl", "rb"),
+    #     encoding="latin1")["scalp"]
+
+    perm = Perm(lpt.perm_path, lpt.obj_head_path, scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047]).to(args.device)
+
+    roots = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0][::4].to(args.device)
+    gaussians = GaussianPerm(perm, roots, lpt.sh_degree, len(roots)).to(args.device)
     gaussians.training_setup(opt)
+
+    ## deform model
+    DeformModel = PermDeformModel(perm, args.device).to(args.device)
+    DeformModel.training_setup()
 
     if args.start_checkpoint:
         (model_params, gauss_params, first_iter) = torch.load(args.start_checkpoint)
         DeformModel.restore(model_params)
         gaussians.restore(gauss_params, opt)
 
-    bg_color = [1, 1, 1] if lpt.white_background else [1, 0, 0]
+    bg_color = [1, 1, 1] if lpt.white_background else [0, 1, 0]
     bg_image = torch.zeros((3, 512, 512)).to(args.device)
     if lpt.white_background:
         bg_image[:, :, :] = 1
@@ -92,7 +103,6 @@ if __name__ == "__main__":
     first_iter += 1
     mid_num = 15000
 
-    import pdb; pdb.set_trace()
     for iteration in range(first_iter, opt.iterations + 1):
         # Every 500 its we increase the levels of SH up to a maximum degree
         if iteration % 500 == 0:
@@ -104,39 +114,49 @@ if __name__ == "__main__":
             random.shuffle(viewpoint_stack)
             if len(viewpoint_stack)>2000:
                 viewpoint_stack = viewpoint_stack[:2000]
-        viewpoint_cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack)-1)) 
+        viewpoint_cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam.load2device(args.device)
+
         frame_id = viewpoint_cam.uid
 
         # For now, assuming camera/subject movement is the same
-        codedict['R'] = viewpoint_cam.R
-        codedict['T'] = viewpoint_cam.T
+        codedict['R'] = torch.tensor(viewpoint_cam.R).to(args.device)
+        codedict['T'] = torch.tensor(viewpoint_cam.T).to(args.device)
+        codedict["roots"] = gaussians.get_roots_xyz[None]
         codedict["theta"] = gaussians.theta
         codedict["beta"] = gaussians.beta
-        verts_final, rot_delta, scale_coef = DeformModel.decode(codedict)
-        
-        if iteration == 1:
-            gaussians.training_setup(opt)
-        gaussians.update_xyz_rot_scale(verts_final[0], rot_delta[0], scale_coef[0])
+
+        # import pdb; pdb.set_trace()
+
+        verts_final, rot_delta, scale_coef = DeformModel.decode(gaussians, codedict)
+        gaussians.update_xyz_rot_scale(verts_final, rot_delta, scale_coef)
 
         # Render
+        # import pdb; pdb.set_trace()
         render_pkg = render(viewpoint_cam, gaussians, ppt, background)
         image = render_pkg["render"]
 
-        # Loss
+        # Composite ground-truth against background
         gt_image = viewpoint_cam.original_image
-        alpha = viewpoint_cam.hair_mask
-
+        alpha    = viewpoint_cam.hair_mask     # (H,W) mask
         gt_image = gt_image * alpha + bg_image * (1 - alpha)
-        loss_huber = huber_loss(image, gt_image, 0.1)
-        
-        # loss_G = 0.
-        # head_mask = viewpoint_cam.head_mask
-        # image_percep = normalize_for_percep(image*head_mask)
-        # gt_image_percep = normalize_for_percep(gt_image*head_mask)
-        # if iteration>mid_num:
-        #     loss_G = torch.mean(percep_module.forward(image_percep, gt_image_percep))*0.05
 
-        loss = loss_huber # + loss_G*1
+        # --- Masked Huber Loss using our custom huber_loss ---
+        # 1) element-wise Huber with no reduction
+        loss_map = huber_loss(image, gt_image, delta=0.1, reduction='none')  # (C,H,W) or (H,W)
+
+        # 2) broadcast mask over channels if needed
+        if loss_map.dim() == 3:                  # (C,H,W)
+            mask = alpha.unsqueeze(0)            # (1,H,W) -> (C,H,W)
+        else:                                    # (H,W)
+            mask = alpha
+
+        # 3) zero out non-hair pixels, then average over mask
+        masked_loss = loss_map * mask
+        loss_huber  = masked_loss.sum() / (mask.sum() + 1e-6)
+
+        # Total loss
+        loss = loss_huber  # + other terms…
 
         loss.backward()
 
@@ -149,25 +169,27 @@ if __name__ == "__main__":
                 DeformModel.optimizer.zero_grad(set_to_none = True)
             
             # print loss
-            if iteration % 500 == 0:
+            if iteration % 20 == 0:
                 if iteration<=mid_num:
                     print("step: %d, huber: %.5f" %(iteration, loss_huber.item()))
                 else:
-                    print("step: %d, huber: %.5f, percep: %.5f" %(iteration, loss_huber.item(), loss_G.item()))
+                    print("step: %d, huber: %.5f, percep: %.5f" %(iteration, loss_huber.item()))
             
             # visualize results
-            if iteration % 500 == 0 or iteration==1:
+            if iteration % 250 == 0 or iteration==1:
                 save_image = np.zeros((args.image_res, args.image_res*2, 3))
                 gt_image_np = (gt_image*255.).permute(1,2,0).detach().cpu().numpy().astype(np.uint8)
                 image = image.clamp(0, 1)
                 image_np = (image*255.).permute(1,2,0).detach().cpu().numpy().astype(np.uint8)
                 save_image[:, :args.image_res, :] = gt_image_np
                 save_image[:, args.image_res:, :] = image_np
-                cv2.imwrite(os.path.join(train_dir, f"{iteration}.jpg"), save_image[:,:,[2,1,0]])
+                cv2.imwrite(os.path.join(train_dir, f"{iteration}.png"), save_image[:,:,[2,1,0]])
             
             # save checkpoint
             if iteration % 5000 == 0:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((DeformModel.capture(), gaussians.capture(), iteration), model_dir + "/chkpnt" + str(iteration) + ".pth")
+        
+        viewpoint_cam.load2device("cpu")
 
            

@@ -152,7 +152,7 @@ if __name__ == "__main__":
                 image_np = (image*255.).permute(1,2,0).detach().cpu().numpy().astype(np.uint8)
                 save_image[:, :args.image_res, :] = gt_image_np
                 save_image[:, args.image_res:, :] = image_np
-                cv2.imwrite(os.path.join(train_dir, f"{iteration}.jpg"), save_image[:,:,[2,1,0]])
+                cv2.imwrite(os.path.join(train_dir, f"{iteration}.png"), save_image[:,:,[2,1,0]])
             
             # save checkpoint
             if iteration % 5000 == 0:

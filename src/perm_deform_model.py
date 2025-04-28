@@ -1,29 +1,29 @@
-import sys
-import pickle
 import torch
-import numpy as np
-from torch import nn
-import math
 import torch.nn.functional as F
-from pytorch3d.io import load_obj
 
-from deform_model import DeformModel
-from flame import FLAME_mica, parse_args
-from utils.general_utils import Pytorch3dRasterizer, Embedder, load_binary_pickle, a_in_b_torch, face_vertices_gen
+from torch import nn
+from utils.general_utils import get_embedder
 
 
-class PermDeformModel:
+class PermDeformModel(nn.Module):
     def __init__(self, perm, device):
+        super().__init__()
+
         self.perm = perm
         self.device = device
         
         self.pts_freq = 8
-        self.pts_embedder = Embedder(self.pts_freq)
+        self.pts_embedder, self.embed_size = get_embedder(
+            10,
+            3,
+            use_gauss_encoding=False,
+            gauss_sigma=1.0,
+        )
         self.init_networks()
 
     def init_networks(self):       
         self.deformNet = MLP(
-            input_dim=self.pts_embedder.dim_embeded+78,
+            input_dim=self.embed_size+136,
             output_dim=10,
             hidden_dim=256,
             hidden_layers=6
@@ -36,7 +36,7 @@ class PermDeformModel:
         self.optimizer = torch.optim.Adam(params_group, betas=(0.9, 0.999))
 
     def compute_mlp_delta_coef(self, vert_embed, condition, mlp):
-        uv_vertices_shape_embeded_condition = torch.cat((vert_embed, condition), dim=2)
+        uv_vertices_shape_embeded_condition = torch.cat((vert_embed, condition), dim=-1)[None]
         deforms = mlp(uv_vertices_shape_embeded_condition)
         deforms = torch.tanh(deforms)
         uv_vertices_deforms = deforms[..., :3]
@@ -47,24 +47,32 @@ class PermDeformModel:
         scale_coef = deforms[..., 7:]
         scale_coef = torch.exp(scale_coef)
 
-        return uv_vertices_deforms, rot_delta, scale_coef
+        return uv_vertices_deforms[0], rot_delta[0], scale_coef[0]
     
-    def decode(self, roots, codedict):
+    def decode(self, gaussians, codedict):
+        roots = codedict['roots']
         theta = codedict['theta']
         beta = codedict['beta']
         perm_out = self.perm(roots=roots, theta=theta, beta=beta)
 
-        coef = perm_out["coef"]
-        rotation = codedict['R'].flatten().detach()
-        translation = codedict['T'].flatten().detach()
-        condition = torch.cat((coef, rotation, translation))
+        strands = perm_out["strands"].position[0]
+        strands = strands[:, ::4]
+        N, C, _ = strands.shape
+        strands = strands.reshape(N * C, -1)
+        strands = gaussians.perm2scene(strands)
+        strands_enc = self.pts_embedder(strands)
+
+        coef = perm_out["coef"][0].unsqueeze(1).expand(-1, C, -1).reshape(N * C, -1)
+        rotation = codedict['R'].flatten()[None].expand(N * C, -1)
+        translation = self.pts_embedder(codedict['T'][None].expand(N * C, -1))
+        condition = torch.cat((coef, rotation, translation), dim=-1)
 
         hair_deforms, strand_rot_delta, strand_scale_coef = self.compute_mlp_delta_coef(
-            self.pts_embedder(roots),
+            strands_enc,
             condition,
-            self.hairDeformNet
+            self.deformNet
         )
-        strands_final = perm_out["strands"] + hair_deforms
+        strands_final = strands + hair_deforms
 
         return strands_final, strand_rot_delta, strand_scale_coef
     
