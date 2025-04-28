@@ -15,6 +15,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import rff
 
 import pickle
 from pytorch3d.structures import Meshes
@@ -271,39 +272,97 @@ class Pytorch3dRasterizer(nn.Module):
             **self.raster_settings_dict)
 
 
-class Embedder(nn.Module):
-    def __init__(self, N_freqs, input_dims=3, include_input=True) -> None:
-        super().__init__()
-        self.log_sampling = True
-        self.periodic_fns = [torch.sin, torch.cos]
-        self.max_freq = N_freqs - 1
-        self.N_freqs = N_freqs
-        self.include_input = include_input
-        self.input_dims = input_dims
-        embed_fns = []
-        if self.include_input:
-            embed_fns.append(lambda x: x)
+def get_embedder(multires, i=1, use_gauss_encoding=False, gauss_sigma=1.0):
+    if use_gauss_encoding:
+        embed = rff.layers.GaussianEncoding(
+            sigma=gauss_sigma, input_size=i, encoded_size=multires
+        )
+        print("Using random fourier gaussain encoding")
+        return embed, 2 * multires
+    else:
+        if i == -1:
+            return nn.Identity(), 3
 
-        if self.log_sampling:
-            freq_bands = 2.**torch.linspace(0.,
-                                            self.max_freq, steps=self.N_freqs)
+        embed_kwargs = {
+            "include_input": True,
+            "input_dims": i,
+            "max_freq_log2": multires - 1,
+            "num_freqs": multires,
+            "log_sampling": True,
+            "periodic_fns": [torch.sin, torch.cos],
+        }
+
+        embedder_obj = Embedder(**embed_kwargs)
+        embed = lambda x, eo=embedder_obj: eo.embed(x)
+        return embed, embedder_obj.out_dim
+
+
+class Embedder:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs["input_dims"]
+        out_dim = 0
+        if self.kwargs["include_input"]:
+            embed_fns.append(lambda x: x)
+            out_dim += d
+
+        max_freq = self.kwargs["max_freq_log2"]
+        N_freqs = self.kwargs["num_freqs"]
+
+        if self.kwargs["log_sampling"]:
+            freq_bands = 2.0 ** torch.linspace(0.0, max_freq, steps=N_freqs)
         else:
-            freq_bands = torch.linspace(
-                2.**0., 2.**self.max_freq, steps=self.N_freqs)
+            freq_bands = torch.linspace(2.0**0.0, 2.0**max_freq, steps=N_freqs)
 
         for freq in freq_bands:
-            for p_fn in self.periodic_fns:
-                embed_fns.append(lambda x, p_fn=p_fn,
-                                 freq=freq: p_fn(x * freq))
-        self.embed_fns = embed_fns
-        self.dim_embeded = self.input_dims*len(self.embed_fns)
+            for p_fn in self.kwargs["periodic_fns"]:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                out_dim += d
 
-    def forward(self, inputs, alpha = 10.):
-        output = torch.cat([fn(inputs) for fn in self.embed_fns], 2)
-        start = 0
-        # print(alpha)
-        # if self.include_input:
-        #     start = 1
-        # for i in range(output.shape[1]//2):
-        #     output[:, (2*i+start)*self.input_dims:(2*(i+1)+start)*self.input_dims] *= (1-math.cos(math.pi*(max(min(alpha-i, 1.), 0.))))*.5
-        return output
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+
+
+# class Embedder(nn.Module):
+#     def __init__(self, N_freqs, input_dims=3, include_input=True) -> None:
+#         super().__init__()
+#         self.log_sampling = True
+#         self.periodic_fns = [torch.sin, torch.cos]
+#         self.max_freq = N_freqs - 1
+#         self.N_freqs = N_freqs
+#         self.include_input = include_input
+#         self.input_dims = input_dims
+#         embed_fns = []
+#         if self.include_input:
+#             embed_fns.append(lambda x: x)
+
+#         if self.log_sampling:
+#             freq_bands = 2.**torch.linspace(0.,
+#                                             self.max_freq, steps=self.N_freqs)
+#         else:
+#             freq_bands = torch.linspace(
+#                 2.**0., 2.**self.max_freq, steps=self.N_freqs)
+
+#         for freq in freq_bands:
+#             for p_fn in self.periodic_fns:
+#                 embed_fns.append(lambda x, p_fn=p_fn,
+#                                  freq=freq: p_fn(x * freq))
+#         self.embed_fns = embed_fns
+#         self.dim_embeded = self.input_dims*len(self.embed_fns)
+
+#     def forward(self, inputs, alpha = 10.):
+#         output = torch.cat([fn(inputs) for fn in self.embed_fns], 2)
+#         start = 0
+#         # print(alpha)
+#         # if self.include_input:
+#         #     start = 1
+#         # for i in range(output.shape[1]//2):
+#         #     output[:, (2*i+start)*self.input_dims:(2*(i+1)+start)*self.input_dims] *= (1-math.cos(math.pi*(max(min(alpha-i, 1.), 0.))))*.5
+#         return output

@@ -51,6 +51,7 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._perm_path = ""
         self._obj_head_path = ""
+        self._loaded_roots_path = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -73,10 +74,17 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 150_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+
+        self.perm_lr_init = 0.016
+        self.perm_lr_final = 0.00016
+        self.perm_lr_delay_mult = 0.01
+        self.perm_lr_max_steps = 30_000
+
+        # self.position_lr_init = 0.00016
+        # self.position_lr_final = 0.0000016
+        # self.position_lr_delay_mult = 0.01
+        # self.position_lr_max_steps = 30_000
+
         lr_coef = 1
         self.feature_lr = 0.0025*lr_coef
         self.opacity_lr = 0.05*lr_coef

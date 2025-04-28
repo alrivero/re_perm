@@ -76,13 +76,13 @@ class Scene_mica:
             R = np.transpose(w2cR) # R is stored transposed due to 'glm' in CUDA code
             T = w2cT
 
-            image_path = os.path.join(images_folder, image_name_ori+'.jpg')
+            image_path = os.path.join(images_folder, image_name_ori+'.png')
             image = Image.open(image_path)
             resized_image_rgb = PILtoTensor(image)
             gt_image = resized_image_rgb[:3, ...]
             
             # alpha
-            alpha_path = os.path.join(alpha_folder, image_name_ori+'.jpg')
+            alpha_path = os.path.join(alpha_folder, image_name_ori+'.png')
             alpha = Image.open(alpha_path)
             alpha = PILtoTensor(alpha)
 
@@ -99,12 +99,12 @@ class Scene_mica:
             mouth_mask = PILtoTensor(mouth_mask)
 
             # hair_mask
-            hair_mask_path = os.path.join(hair_mask_folder, image_name_ori+'.jpg')
+            hair_mask_path = os.path.join(hair_mask_folder, image_name_ori+'.png')
             hair_mask = Image.open(hair_mask_path)
             hair_mask = PILtoTensor(hair_mask)
 
             # hairstep map
-            hair_orient_path = os.path.join(hair_orient_folder, image_name_ori+'.jpg')
+            hair_orient_path = os.path.join(hair_orient_folder, image_name_ori+'.png')
             hair_orient = Image.open(hair_orient_path)
             hair_orient = PILtoTensor(hair_orient)
 

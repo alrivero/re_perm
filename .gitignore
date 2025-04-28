@@ -9,4 +9,7 @@ metrical-tracker
 *sh
 flame/generic_model.pkl
 flame/FLAME_masks
-
+flame
+data
+flame/FLAME_texture.npz
+pretrained_models

@@ -14,11 +14,37 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
-def huber_loss(network_output, gt, alpha):
-    diff = torch.abs(network_output - gt)
-    mask = (diff < alpha).float()
-    loss = 0.5*diff**2*mask + alpha*(diff-0.5*alpha)*(1.-mask)
-    return loss.mean()
+
+def huber_loss(network_output, gt, delta, reduction='mean'):
+    """
+    delta: the Huber‐transition point
+    reduction: 'none' | 'sum' | 'mean'
+    """
+    diff = network_output - gt
+    abs_diff = diff.abs()
+    mask = (abs_diff < delta)
+
+    # elementwise Huber:
+    loss = torch.where(
+        mask,
+        0.5 * diff**2,
+        delta * (abs_diff - 0.5 * delta)
+    )
+
+    if reduction == 'none':
+        return loss
+    elif reduction == 'sum':
+        return loss.sum()
+    elif reduction == 'mean':
+        return loss.mean()
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")
+
+# def huber_loss(network_output, gt, alpha):
+#     diff = torch.abs(network_output - gt)
+#     mask = (diff < alpha).float()
+#     loss = 0.5*diff**2*mask + alpha*(diff-0.5*alpha)*(1.-mask)
+#     return loss.mean()
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()

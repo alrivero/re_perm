@@ -1,24 +1,50 @@
-name: FlashAvatar
+name: re_perm          # call it whatever you like
 channels:
   - pytorch
+  - nvidia                      # needed only if you rely on CUDA-toolkit from nvidia
   - conda-forge
   - defaults
+
 dependencies:
-  - cudatoolkit=11.6
-  - plyfile=0.8.1
-  - python=3.7.13
-  - pip=22.3.1
+  # ---- core toolchain -------------------------------------------------
+  - python=3.9                  # compromise: first file had 3.7, second ≥3.9
+  - pip
+  - setuptools>=58
+  - wheel>=0.37
+  - twine>=3.7
+  - ninja=1.10.2                # both envs wanted ninja
+  - click
+
+  # ---- CUDA / PyTorch stack ------------------------------------------
+  - cudatoolkit=11.6            # keep first file’s toolkit version
   - pytorch=1.12.1
-  - torchaudio=0.12.1
   - torchvision=0.13.1
-  - tqdm
+  - torchaudio=0.12.1
+
+  # ---- scientific / image stack --------------------------------------
+  - numpy
+  - scipy
+  - pillow
+  - matplotlib
+  - imageio
+  - scikit-image                # pulled out of pip section
+  - opencv                      # conda-forge name for opencv-python
+  - plyfile
+
+  # ---- misc libs ------------------------------------------------------
+  - requests
+  - tqdm                        # let conda pick a recent version (≥4.67 comes with 11.6 images)
+  - embree
+  - pyembree                     # no version pin; only on conda-forge
+
+  # ---- pip-only bits --------------------------------------------------
   - pip:
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
-    - scipy
-    - chumpy
-    - scikit-image
-    - opencv-python
-    - ninja
-    - lpips
-    - loguru
+      # local sub-modules
+      - ./submodules/diff-gaussian-rasterization
+      - ./submodules/simple-knn
+
+      # packages not (reliably) on conda-forge
+      - openexr-python
+      - chumpy
+      - lpips
+      - loguru

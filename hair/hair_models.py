@@ -1,15 +1,37 @@
+import copy
 import os
-from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import dnnlib
-import legacy
 from hair import HairRoots
+from models import RawNeuralTexture, ResNeuralTexture, NeuralTextureSuperRes
+from typing import Optional, Tuple, List
+from .legacy import load_network_pkl
 
+def load_with_custom_class(f, cls, which: str):
+    """
+    Unpickle the saved dict, extract the specified network (`which`),
+    then build and return an instance of `cls` loaded with the same weights.
+
+    Args:
+        f      : Open file-like object for the .pkl
+        cls    : Class to instantiate (e.g. RawNeuralTexture)
+        which  : Key in the unpickled dict ('G', 'G_ema', etc.)
+
+    Returns:
+        An instance of `cls` with pre-trained weights loaded.
+    """
+    data    = load_network_pkl(f)
+    old_net = data[which]
+    state_dict = old_net.state_dict()
+    init_kwargs = copy.deepcopy(old_net.init_kwargs)
+
+    net = cls(**init_kwargs).eval().requires_grad_(False)
+    net.load_state_dict(state_dict)
+    return net
 
 class Perm(nn.Module):
     """ A wrapper class for 3D Parametric Hair Model.
@@ -19,38 +41,51 @@ class Perm(nn.Module):
         self,
         model_path: str,
         head_mesh: str,
+        scalp_vertex_idxs: Optional[List[int]] = None,
         scalp_bounds: Optional[Tuple[float]] = None,
     ):
-        """ ParaHair model constructor.
-
-        Args:
-            model_path (str): Path to the folder where all model components are stored.
-            head_mesh (str): Path to the head mesh.
-            scalp_bounds (Tuple[float]): Precomputed scalp AABB. (default = None)
-        """
         super().__init__()
 
+        # -- Load raw guide texture network (EMA) --
         network_pkl_raw = os.path.join(model_path, 'stylegan2-raw-texture.pkl')
-        print('Loading guide texture network from "%s"...' % network_pkl_raw)
-        with dnnlib.util.open_url(network_pkl_raw) as f:
-            self.G_raw = legacy.load_network_pkl(f)['G_ema'].eval().requires_grad_(False)  # type: ignore
+        print(f'Loading guide texture network from "{network_pkl_raw}"...')
+        with open(network_pkl_raw, 'rb') as f:
+            self.G_raw = load_with_custom_class(f, RawNeuralTexture, 'G_ema')
 
+        # -- Load super-resolution network --
         network_pkl_superres = os.path.join(model_path, 'unet-superres.pkl')
-        print('Loading super resolution network from "%s"...' % network_pkl_superres)
-        with dnnlib.util.open_url(network_pkl_superres) as f:
-            self.G_superres = legacy.load_network_pkl(f)['G'].eval().requires_grad_(False)  # type: ignore
+        print(f'Loading super resolution network from "{network_pkl_superres}"...')
+        with open(network_pkl_superres, 'rb') as f:
+            self.G_superres = load_with_custom_class(f, NeuralTextureSuperRes, 'G')
 
+        # -- Load residual texture network --
         network_pkl_res = os.path.join(model_path, 'vae-res-texture.pkl')
-        print('Loading residual texture network from "%s"...' % network_pkl_res)
-        with dnnlib.util.open_url(network_pkl_res) as f:
-            self.G_res = legacy.load_network_pkl(f)['G'].eval().requires_grad_(False)  # type: ignore
+        print(f'Loading residual texture network from "{network_pkl_res}"...')
+        with open(network_pkl_res, 'rb') as f:
+            self.G_res = load_with_custom_class(f, ResNeuralTexture, 'G')
 
-        self.hair_roots = HairRoots(head_mesh, scalp_bounds)
-        u, v = torch.meshgrid(torch.linspace(0, 1, steps=self.G_superres.img_resolution), torch.linspace(0, 1, steps=self.G_superres.img_resolution), indexing='ij')
-        uv = torch.dstack((u, v)).permute(2, 1, 0)  # (2, H, W)
-        uv_guide = F.interpolate(uv.unsqueeze(0), size=(self.G_raw.img_resolution, self.G_raw.img_resolution), mode='nearest')[0]
-        uv_guide = uv_guide.permute(1, 2, 0).reshape(-1, 2)
+        # -- Hair roots setup --
+        self.hair_roots = HairRoots(head_mesh, scalp_vertex_idxs, scalp_bounds)
+
+        # Compute guide_roots buffer
+        res_sup = self.G_superres.img_resolution
+        res_raw = self.G_raw.img_resolution
+        device = self.hair_roots.centroid.device
+
+        u, v = torch.meshgrid(
+            torch.linspace(0, 1, steps=res_sup, device=device),
+            torch.linspace(0, 1, steps=res_sup, device=device),
+            indexing='ij'
+        )
+        uv = torch.stack((u, v), dim=0)                # (2, H, W)
+        uv_guide = F.interpolate(
+            uv.unsqueeze(0),
+            size=(res_raw, res_raw),
+            mode='nearest'
+        )[0]                                         # (2, res_raw, res_raw)
+        uv_guide = uv_guide.permute(1, 2, 0).reshape(-1, 2)  # (res_raw^2, 2)
         uv_guide = self.hair_roots.rescale(uv_guide, inverse=True)
+
         guide_roots = self.hair_roots.spherical_to_cartesian(uv_guide).unsqueeze(0)
         self.register_buffer('guide_roots', guide_roots)
 

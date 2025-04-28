@@ -1,0 +1,31 @@
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ─── Python & pip ─────────────────────────────────────────────────
+  - python=3.8
+  - pip
+
+  # ─── CUDA / PyTorch ───────────────────────────────────────────────
+  - cudatoolkit=11.6
+  - pytorch=1.12.1
+  - torchvision=0.13.1
+  - torchaudio=0.12.1
+
+  # ─── Core science / I/O ───────────────────────────────────────────
+  - scipy>=1.7
+  - scikit-image
+  - opencv                 # conda-forge’s OpenCV
+  - tqdm
+  - ninja
+
+  # ─── pip-only & local submodules ─────────────────────────────────
+  - pip:
+    - ./submodules/diff-gaussian-rasterization
+    - ./submodules/simple-knn
+    - chumpy
+    - lpips
+    - loguru
+    - plyfile
