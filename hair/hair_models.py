@@ -43,6 +43,7 @@ class Perm(nn.Module):
         head_mesh: str,
         scalp_vertex_idxs: Optional[List[int]] = None,
         scalp_bounds: Optional[Tuple[float]] = None,
+        mesh_scale: float = 1.0
     ):
         super().__init__()
 
@@ -65,7 +66,12 @@ class Perm(nn.Module):
             self.G_res = load_with_custom_class(f, ResNeuralTexture, 'G')
 
         # -- Hair roots setup --
-        self.hair_roots = HairRoots(head_mesh, scalp_vertex_idxs, scalp_bounds)
+        self.hair_roots = HairRoots(
+            head_mesh,
+            scalp_vertex_idxs=scalp_vertex_idxs,
+            scalp_bounds=scalp_bounds,
+            mesh_scale=mesh_scale
+        )
 
         # Compute guide_roots buffer
         res_sup = self.G_superres.img_resolution

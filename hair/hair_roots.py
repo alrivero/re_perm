@@ -19,7 +19,8 @@ class HairRoots(nn.Module):
         head_mesh: str,
         scalp_vertex_idxs: Optional[List[int]] = None,   # <-- list of vertex indices
         scalp_bounds: Optional[List[float]] = None,
-        mask_resolution: int = 256                    # <-- UV-mask size (H = W)
+        mask_resolution: int = 256,                    # <-- UV-mask size (H = W)
+        mesh_scale: float = 1.0
     ) -> None:
         """
         Args:
@@ -32,6 +33,8 @@ class HairRoots(nn.Module):
 
         # ── load mesh & build centroid ───────────────────────────────
         self.head = trimesh.load(head_mesh)
+        self.head.vertices *= mesh_scale
+
         centroid = (self.head.bounds[0] + self.head.bounds[1]) / 2.0
         centroid[1] = 0.0            # keep head centred on y = 0
         self.register_buffer(       # <-- buffer ⇒ auto-moved
@@ -47,23 +50,6 @@ class HairRoots(nn.Module):
             self.scalp_vertex_idxs = None
 
         self.scalp_bounds = scalp_bounds
-        if self.scalp_vertex_idxs:
-            self.scalp_bounds = self._compute_scalp_bounds()
-
-        # ── 1-channel scalp mask (1,H,W)  ────────────────────────────
-        if self.scalp_vertex_idxs:
-            mask = self._generate_scalp_uv_mask(mask_resolution, mask_resolution)  # tensor
-            self.register_buffer("scalp_mask", mask)
-        else:
-            self.register_buffer("scalp_mask", None)
-
-        # ── differentiable UV ➜ XYZ lookup map  (1,3,H,W) ────────────
-        if self.scalp_bounds is not None:
-            uv_xyz   = self.uv(mask_resolution, mask_resolution, include_normal=False)   # (H,W,3) numpy
-            xyz_map  = torch.from_numpy(uv_xyz.transpose(2, 0, 1)).unsqueeze(0)          # (1,3,H,W)
-            self.register_buffer("scalp_xyz_map", xyz_map.float())
-        else:
-            self.register_buffer("scalp_xyz_map", None)
 
     def _compute_scalp_bounds(self) -> List[float]:
         """Return [u_min, u_max, v_min, v_max] for the supplied scalp vertices."""
@@ -346,7 +332,54 @@ class HairRoots(nn.Module):
         uv_norm[:, 0] = (uv_raw[:, 0] - u0) / (u1 - u0)
         uv_norm[:, 1] = (uv_raw[:, 1] - v0) / (v1 - v0)
         return uv_norm
+    
+    def sample_scalp_mesh(
+        self,
+        num_samples: int,
+        pseudo_roots: torch.Tensor  # shape (M,3)
+    ) -> torch.Tensor:
+        """
+        Sample points uniformly on the scalp mesh, but only on faces:
+        1) Whose vertices are in the scalp mask, AND
+        2) Whose all-vertex y > min(pseudo_roots[:,1])
 
+        Args:
+            num_samples: how many points to sample
+            pseudo_roots: a (M,3) tensor of points; y-threshold = pseudo_roots[:,1].min()
+
+        Returns:
+            Tensor of shape (num_samples, 3) of sampled points.
+        """
+        # 1) build the scalp-only face set
+        faces = self.head.faces
+        mask_idxs = np.array(list(self.scalp_vertex_idxs), dtype=int)
+        mask_keep = np.all(np.isin(faces, mask_idxs), axis=1)
+        scalp_faces = faces[mask_keep]
+
+        # 2) derive y_min from your pseudo-roots
+        if isinstance(pseudo_roots, torch.Tensor):
+            y_vals = pseudo_roots[:, 1].cpu().numpy()
+        else:
+            y_vals = np.asarray(pseudo_roots)[:, 1]
+        y_min = float(y_vals.min())
+
+        # 3) cull any scalp face that has a vertex at or below y_min
+        verts = self.head.vertices  # (V,3) numpy
+        face_y = verts[scalp_faces][:, :, 1]  # (F,3), take column 1 for Y
+        y_keep = np.all(face_y > y_min, axis=1)
+        final_faces = scalp_faces[y_keep]
+
+        # 4) build a little submesh
+        submesh = trimesh.Trimesh(
+            vertices=verts,
+            faces=final_faces,
+            process=False
+        )
+
+        # 5) sample uniformly across its surface
+        pts, _ = trimesh.sample.sample_surface_even(submesh, num_samples)
+
+        return torch.from_numpy(pts).float()
 
     def uv_to_cartesian(self, uv_norm: torch.Tensor) -> torch.Tensor:
         """

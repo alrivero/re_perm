@@ -9,7 +9,7 @@ from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmet
 STRAND_VERTEX_COUNT = 25
 
 class GaussianPerm(nn.Module):
-    def __init__(self, perm, roots, sh_degree, num_strands=2535):
+    def __init__(self, perm, pseudo_roots, start_hair_style, sh_degree, num_strands=2500):
         super(GaussianPerm, self).__init__()
 
         self.optimizer = None
@@ -18,7 +18,9 @@ class GaussianPerm(nn.Module):
         self.num_strands = num_strands
 
         self.perm = perm
-        self.init_parameters(roots)
+        self.roots = self.perm.hair_roots.sample_scalp_mesh(num_strands, pseudo_roots)
+
+        self.init_parameters(start_hair_style)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -34,14 +36,16 @@ class GaussianPerm(nn.Module):
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-    def init_parameters(self, roots):
+    def init_parameters(self, start_hair_style):
         gaussian_count = self.num_strands * STRAND_VERTEX_COUNT
 
         # Save PERM and also the items we'll need to optimize
-        # self.roots = nn.Parameter(roots.requires_grad_(True))
-        self.roots = roots
-        self.theta = nn.Parameter(self.perm.theta_avg().requires_grad_(True))
-        self.beta = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
+        if start_hair_style is not None:
+            self.theta = nn.Parameter(torch.tensor(start_hair_style["theta"])[None].requires_grad_(True))
+            self.beta = nn.Parameter(torch.tensor(start_hair_style["beta"])[None].requires_grad_(True))
+        else:
+            self.theta = nn.Parameter(self.perm.theta_avg().requires_grad_(True))
+            self.beta = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
         
         # Save Gaussian Paramters
         self.active_sh_degree = 0
@@ -72,11 +76,6 @@ class GaussianPerm(nn.Module):
         )
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
 
-        # Need a global scale parameter to bring PERM strands into the correct frame of reference
-        p2g_rigid = torch.eye(4)
-        p2g_rigid[:3, :3] *= 0.01175745458
-        self._p2g_rigid_transform = nn.Parameter(p2g_rigid)
-        
         self._xyz = None
 
     def capture(self):
@@ -148,11 +147,6 @@ class GaussianPerm(nn.Module):
         self.spatial_lr_scale = 5
 
         l = [
-            # {
-            #     "params": [self.roots],
-            #     "lr": training_args.perm_lr_init,
-            #     "name": "roots_uv",
-            # },
             {
                 "params": [self.theta],
                 "lr": training_args.perm_lr_init,
@@ -162,11 +156,6 @@ class GaussianPerm(nn.Module):
                 "params": [self.beta],
                 "lr": training_args.perm_lr_init,
                 "name": "beta",
-            },
-            {
-                "params": [self._p2g_rigid_transform],
-                "lr": training_args.perm_lr_init,
-                "name": "p2g_rigid_transform",
             },
             {
                 "params": [self._features_dc],
@@ -234,13 +223,15 @@ class GaussianPerm(nn.Module):
         self._opacity = optimizable_tensors["opacity"]
 
     def perm2scene(self, points):
-        ones = points.new_ones(points.shape[0], 1)
-        pts_h = torch.cat([points, ones], dim=1)
-        transformed = (self._p2g_rigid_transform @ pts_h.T).T 
-        
-        return transformed[:, :3]
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        points_corr = torch.stack([x, -z, y], dim=1)
+
+        points_corr /= 100.0
+        return points_corr
     
     def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
         self._xyz = points
-        self._rotation = quatProduct_batch(self._rotation_base, rot_delta)
-        self._scaling = self._scaling_base * scale_coeff
+        self._rotation = self._rotation_base
+        self._scaling = self._scaling_base

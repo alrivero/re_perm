@@ -67,14 +67,14 @@ class PermDeformModel(nn.Module):
         translation = self.pts_embedder(codedict['T'][None].expand(N * C, -1))
         condition = torch.cat((coef, rotation, translation), dim=-1)
 
-        hair_deforms, strand_rot_delta, strand_scale_coef = self.compute_mlp_delta_coef(
-            strands_enc,
-            condition,
-            self.deformNet
-        )
-        strands_final = strands + hair_deforms
+        # hair_deforms, strand_rot_delta, strand_scale_coef = self.compute_mlp_delta_coef(
+        #     strands_enc,
+        #     condition,
+        #     self.deformNet
+        # )
+        strands_final = strands
 
-        return strands_final, strand_rot_delta, strand_scale_coef
+        return strands_final, None, None
     
     def capture(self):
         return (

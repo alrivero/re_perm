@@ -21,6 +21,28 @@ import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 
+def save_tensor_to_ply(points: torch.Tensor, path: str):
+    """
+    Save a (N,3) torch tensor as a PLY point cloud (vertex only, float).
+    """
+    points = points.detach().cpu().numpy()
+    N = points.shape[0]
+
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {N}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n"
+    )
+
+    with open(path, 'w') as f:
+        f.write(header)
+        for p in points:
+            f.write(f"{p[0]} {p[1]} {p[2]}\n")
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 

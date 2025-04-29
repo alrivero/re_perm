@@ -114,6 +114,9 @@ class Scene_mica:
                                 exp_param=exp_param, eyes_pose=eyes_pose, eyelids=eyelids, jaw_pose=jaw_pose,
                                 image_name=image_name_mica, uid=frame_id, data_device=device)
             self.cameras.append(camera_indiv)
+
+            if frame_id >= 20:
+                break
     
     def getCameras(self):
         return self.cameras

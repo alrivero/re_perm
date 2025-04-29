@@ -1,115 +1,66 @@
-#!/usr/bin/env python3
-"""
-align_meshes.py
-
-Scales the source mesh by the ratio of its AABB to the target's AABB,
-then fits a rigid (rotation + translation) transform via ICP, and writes
-out the final aligned mesh.
-"""
-
-import argparse
 import numpy as np
+import trimesh
 import open3d as o3d
+import argparse
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Scale & align one OBJ to another using ICP."
-    )
-    parser.add_argument(
-        "source", help="Path to the OBJ file to be aligned (the moving mesh)."
-    )
-    parser.add_argument(
-        "target", help="Path to the OBJ file whose size/orientation you want to match."
-    )
-    parser.add_argument(
-        "output", help="Output path for the aligned version of the source OBJ."
-    )
-    parser.add_argument(
-        "--voxel_size", type=float, default=0.01,
-        help="Voxel size for downsampling point clouds (default: 0.01)."
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=0.02,
-        help="Max correspondence point distance for ICP (default: 0.02)."
-    )
-    parser.add_argument(
-        "--max_iter", type=int, default=50,
-        help="Maximum number of ICP iterations (default: 50)."
-    )
-    parser.add_argument(
-        "--num_points", type=int, default=200000,
-        help="Number of points to sample uniformly from each mesh (default: 200k)."
-    )
-    return parser.parse_args()
+def load_mesh_as_points(filename):
+    mesh = trimesh.load(filename, process=False)
+    return np.array(mesh.vertices), mesh
 
-def preprocess_point_cloud(pcd, voxel_size):
-    """Downsample and estimate normals."""
-    pcd_down = pcd.voxel_down_sample(voxel_size)
-    pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 2, max_nn=30
-        )
-    )
-    return pcd_down
+def prepare_point_cloud(points):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    return pcd
 
-def run_icp(source_down, target_down, threshold, max_iter):
-    """Perform point-to-point ICP and return the transformation matrix."""
+def run_icp(source_points, target_points, threshold=0.01, max_iteration=50):
+    source_pcd = prepare_point_cloud(source_points)
+    target_pcd = prepare_point_cloud(target_points)
+
     icp_result = o3d.pipelines.registration.registration_icp(
-        source_down, target_down,
+        source_pcd, target_pcd,
         threshold,
         np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iteration)
     )
-    return icp_result.transformation, icp_result
+    return icp_result.transformation
 
-def main():
-    args = parse_args()
+def main(file_a, file_b, scale_factor, output_file):
+    # Load points and meshes
+    points_a, mesh_a = load_mesh_as_points(file_a)
+    points_b, _ = load_mesh_as_points(file_b)
 
-    # --- Load raw meshes ---
-    source_mesh = o3d.io.read_triangle_mesh(args.source)
-    target_mesh = o3d.io.read_triangle_mesh(args.target)
+    # Apply scale for ICP only
+    points_a_scaled = points_a / scale_factor
 
-    # --- Compute and apply initial uniform scale by AABB ---
-    bb_src = source_mesh.get_axis_aligned_bounding_box()
-    bb_tgt = target_mesh.get_axis_aligned_bounding_box()
-    size_src = bb_src.get_max_bound() - bb_src.get_min_bound()
-    size_tgt = bb_tgt.get_max_bound() - bb_tgt.get_min_bound()
-    scales = size_tgt / size_src
-    init_scale = float(np.min(scales))
-    source_mesh.scale(init_scale, center=bb_src.get_center())
-    print(f"[Init] Applied uniform scale: {init_scale:.6f}")
+    # Run ICP on scaled points
+    transformation_icp = run_icp(points_a_scaled, points_b)
 
-    # --- Sample point clouds ---
-    if not source_mesh.has_vertex_normals():
-        source_mesh.compute_vertex_normals()
-    source_pcd = source_mesh.sample_points_uniformly(number_of_points=args.num_points)
+    # Incorporate scaling into the transform
+    final_transformation = transformation_icp.copy()
+    final_transformation[:3, :3] /= scale_factor  # Divide rotation part by scale
+    # translation stays the same
 
-    if not target_mesh.has_vertex_normals():
-        target_mesh.compute_vertex_normals()
-    target_pcd = target_mesh.sample_points_uniformly(number_of_points=args.num_points)
+    print("Final transformation matrix (incorporating division scale):")
+    print(final_transformation)
 
-    # --- Preprocess for ICP ---
-    source_down = preprocess_point_cloud(source_pcd, args.voxel_size)
-    target_down = preprocess_point_cloud(target_pcd, args.voxel_size)
+    # Apply final transform directly to original (unscaled) points
+    points_a_transformed = (points_a @ final_transformation[:3, :3].T) + final_transformation[:3, 3]
 
-    # --- Run ICP ---
-    transformation, icp_info = run_icp(
-        source_down, target_down,
-        args.threshold, args.max_iter
-    )
+    # Save transformed mesh or point cloud
+    if hasattr(mesh_a, 'faces') and mesh_a.faces is not None and len(mesh_a.faces) > 0:
+        transformed_mesh = trimesh.Trimesh(vertices=points_a_transformed, faces=mesh_a.faces, process=False)
+    else:
+        transformed_mesh = trimesh.PointCloud(points_a_transformed)
 
-    # --- Apply the ICP transform to the (already–scaled) mesh ---
-    source_mesh.transform(transformation)
-
-    # --- Save the aligned mesh ---
-    o3d.io.write_triangle_mesh(args.output, source_mesh)
-
-    # --- Report results ---
-    print("Final rigid transformation (4×4 matrix) applied after initial scale:")
-    print(transformation)
-    print(f"ICP fitness: {icp_info.fitness:.4f}, RMSE: {icp_info.inlier_rmse:.4f}")
-    print(f"Aligned mesh written to: {args.output}")
+    transformed_mesh.export(output_file)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run ICP between two OBJ files with scaling incorporated into the final transform.")
+    parser.add_argument("--file_a", type=str, required=True, help="Path to source OBJ file (File A)")
+    parser.add_argument("--file_b", type=str, required=True, help="Path to target OBJ file (File B)")
+    parser.add_argument("--scale", type=float, required=True, help="Scale factor to divide points in File A before ICP")
+    parser.add_argument("--output", type=str, required=True, help="Output path for transformed A OBJ")
+
+    args = parser.parse_args()
+    main(args.file_a, args.file_b, args.scale, args.output)

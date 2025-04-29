@@ -18,7 +18,7 @@ from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.loss_utils import huber_loss
-from utils.general_utils import normalize_for_percep
+from utils.general_utils import normalize_for_percep, save_tensor_to_ply
 
 
 def set_random_seed(seed):
@@ -67,18 +67,35 @@ if __name__ == "__main__":
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
-    scene = Scene_mica(data_dir, mica_datadir, train_type=0, white_background=lpt.white_background, device = args.device)
     
     first_iter = 0
     
-    # scalp_mask = pickle.load(open(
-    #     "/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl", "rb"),
-    #     encoding="latin1")["scalp"]
+    scalp_mask = pickle.load(open(
+        "/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl", "rb"),
+        encoding="latin1")["scalp"]
 
-    perm = Perm(lpt.perm_path, lpt.obj_head_path, scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047]).to(args.device)
+    perm = Perm(
+        lpt.perm_path,
+        lpt.obj_head_path,
+        scalp_vertex_idxs=scalp_mask,
+        scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047],
+        mesh_scale=100.0
+    ).to(args.device)
 
-    roots = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0][::4].to(args.device)
-    gaussians = GaussianPerm(perm, roots, lpt.sh_degree, len(roots)).to(args.device)
+    pseudo_roots = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0]
+    # ps_x = pseudo_roots[:, [0]]
+    # ps_y = pseudo_roots[:, [1]]
+    # ps_z = pseudo_roots[:, [2]]
+    # pseudo_roots = torch.cat([ps_x, -ps_z, ps_y], dim=-1)
+
+    start_hair_style = None
+    if lpt.emp_hair_path:
+        start_hair_style = np.load(lpt.emp_hair_path)
+    else:
+        start_hair_style = None
+
+    gaussians = GaussianPerm(perm, pseudo_roots, start_hair_style, lpt.sh_degree).to(args.device)
+    gaussians.roots = gaussians.roots.to(args.device)
     gaussians.training_setup(opt)
 
     ## deform model
@@ -98,6 +115,8 @@ if __name__ == "__main__":
         bg_image[1, :, :] = 1
     background = torch.tensor(bg_color, dtype=torch.float32, device=args.device)
     
+    scene = Scene_mica(data_dir, mica_datadir, train_type=0, white_background=lpt.white_background, device = args.device)
+
     codedict = {}
     viewpoint_stack = None
     first_iter += 1
@@ -173,7 +192,7 @@ if __name__ == "__main__":
                 if iteration<=mid_num:
                     print("step: %d, huber: %.5f" %(iteration, loss_huber.item()))
                 else:
-                    print("step: %d, huber: %.5f, percep: %.5f" %(iteration, loss_huber.item()))
+                    print("step: %d, huber: %.5f" %(iteration, loss_huber.item()))
             
             # visualize results
             if iteration % 250 == 0 or iteration==1:
@@ -184,6 +203,8 @@ if __name__ == "__main__":
                 save_image[:, :args.image_res, :] = gt_image_np
                 save_image[:, args.image_res:, :] = image_np
                 cv2.imwrite(os.path.join(train_dir, f"{iteration}.png"), save_image[:,:,[2,1,0]])
+                save_tensor_to_ply(verts_final, os.path.join(train_dir, f"{iteration}.ply"))
+                
             
             # save checkpoint
             if iteration % 5000 == 0:

@@ -52,6 +52,7 @@ class ModelParams(ParamGroup):
         self._perm_path = ""
         self._obj_head_path = ""
         self._loaded_roots_path = ""
+        self._emp_hair_path = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
