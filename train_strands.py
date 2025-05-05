@@ -19,6 +19,7 @@ from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.loss_utils import huber_loss
 from utils.general_utils import normalize_for_percep, save_tensor_to_ply
+from utils.loss_utils import orientation_loss
 
 
 def set_random_seed(seed):
@@ -158,24 +159,15 @@ if __name__ == "__main__":
         # Composite ground-truth against background
         gt_image = viewpoint_cam.original_image
         alpha    = viewpoint_cam.hair_mask     # (H,W) mask
+        hair_orient = viewpoint_cam.hair_orient
         gt_image = gt_image * alpha + bg_image * (1 - alpha)
 
-        # --- Masked Huber Loss using our custom huber_loss ---
-        # 1) element-wise Huber with no reduction
-        loss_map = huber_loss(image, gt_image, delta=0.1, reduction='none')  # (C,H,W) or (H,W)
-
-        # 2) broadcast mask over channels if needed
-        if loss_map.dim() == 3:                  # (C,H,W)
-            mask = alpha.unsqueeze(0)            # (1,H,W) -> (C,H,W)
-        else:                                    # (H,W)
-            mask = alpha
-
-        # 3) zero out non-hair pixels, then average over mask
-        masked_loss = loss_map * mask
-        loss_huber  = masked_loss.sum() / (mask.sum() + 1e-6)
+    # 3) zero out non-hair pixels, then average over mask
+        loss_huber  = loss_huber = huber_loss(image, gt_image, delta=0.1, reduction='mean')
+        loss_orient = loss_orient(viewpoint_cam, gaussians, hair_orient)
 
         # Total loss
-        loss = loss_huber  # + other terms…
+        loss = loss_huber + loss_orient  # + other terms…
 
         loss.backward()
 

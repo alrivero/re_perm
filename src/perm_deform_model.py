@@ -24,7 +24,7 @@ class PermDeformModel(nn.Module):
     def init_networks(self):       
         self.deformNet = MLP(
             input_dim=self.embed_size+136,
-            output_dim=10,
+            output_dim=9,
             hidden_dim=256,
             hidden_layers=6
         )

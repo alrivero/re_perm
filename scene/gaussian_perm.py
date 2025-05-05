@@ -37,7 +37,7 @@ class GaussianPerm(nn.Module):
         self.rotation_activation = torch.nn.functional.normalize
 
     def init_parameters(self, start_hair_style):
-        gaussian_count = self.num_strands * STRAND_VERTEX_COUNT
+        gaussian_count = self.num_strands * STRAND_VERTEX_COUNT - self.num_strands
 
         # Save PERM and also the items we'll need to optimize
         if start_hair_style is not None:
@@ -60,7 +60,7 @@ class GaussianPerm(nn.Module):
             features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
         )
 
-        self._scaling_base = nn.Parameter(torch.rand((gaussian_count, 3)).requires_grad_(True))
+        self._scaling_base = nn.Parameter(torch.rand((gaussian_count, 2)).requires_grad_(True))
         self._scaling = None
 
         rots = torch.zeros((gaussian_count, 4))
@@ -232,6 +232,13 @@ class GaussianPerm(nn.Module):
         return points_corr
     
     def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
-        self._xyz = points
+        points = points.reshape(self.num_strands, STRAND_VERTEX_COUNT, -1)
+        midpoints = points[:, :-1, :] + (points[:, 1:, :] - points[:, :-1, :])
+
+        self._xyz = midpoints
         self._rotation = self._rotation_base
-        self._scaling = self._scaling_base
+        self._scaling = torch.cat([
+            self._scaling_base[:, [0]],
+            self._scaling_base[:, [1]],
+            self._scaling_base[:, [0]]
+        ], dim=-1)

@@ -21,6 +21,55 @@ import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 
+def convert_normal_to_camera_space(normals, extrinsic_rot, intrinsics):
+    # Use the inverse transpose of the extrinsic matrix for transforming the normals
+    inverse_transpose_rotation = torch.inverse(extrinsic_rot).T
+
+    # Transform the normals using the inverse transpose of the rotational part
+    transformed_normals = torch.matmul(normals, inverse_transpose_rotation.T)
+    transformed_normals /= transformed_normals[:, [2]]
+
+    screen_normals = torch.matmul(transformed_normals, intrinsics.T)[:, :2]
+
+    return screen_normals
+
+def quaternion_to_rotation_matrix(quaternions):
+    # Ensure quaternions tensor has the correct shape (n x 4)
+    assert quaternions.shape[-1] == 4, "Input tensor must be of shape (n, 4)"
+
+    # Unpack quaternion components
+    a, b, c, d = quaternions.unbind(dim=-1)
+
+    # Calculate rotation matrix elements
+    aa, bb, cc, dd = a*a, b*b, c*c, d*d
+    ab, ac, ad, bc, bd, cd = a*b, a*c, a*d, b*c, b*d, c*d
+
+    # Form the rotation matrix
+    rotation_matrix = torch.stack([
+        torch.stack([aa + bb - cc - dd, 2 * (bc - ad), 2 * (bd + ac)]),
+        torch.stack([2 * (bc + ad), aa - bb + cc - dd, 2 * (cd - ab)]),
+        torch.stack([2 * (bd - ac), 2 * (cd + ab), aa - bb - cc + dd])
+    ], dim=-2).permute(2, 1, 0)
+
+    return rotation_matrix
+
+def project_to_screen(points, all_k, all_w2c, width=512, height=512):
+    points = torch.cat((points, torch.ones((len(points), 1)).cuda()), dim=-1)
+    points = points.unsqueeze(0).expand(len(all_k), -1, -1)
+
+    # Now convert into camera space and project onto focal plane
+    points_cam = torch.bmm(points, all_w2c.transpose(1, 2))
+    points_cam = points_cam[:, :, :3]
+    points_cam /= points_cam[:, :, [2]]
+
+    # Now bring them into screen space and define uvs
+    points_screen = torch.bmm(points_cam, all_k.transpose(1, 2))[:, :, :2]
+    points_screen[:, :, 0] = (points_screen[:, :, 0] + 1.0) * 0.5 * width
+    points_screen[:, :, 1] = (points_screen[:, :, 1] + 1.0) * 0.5 * height
+    uvs = torch.round(points_screen).long()
+
+    return uvs
+
 def save_tensor_to_ply(points: torch.Tensor, path: str):
     """
     Save a (N,3) torch tensor as a PLY point cloud (vertex only, float).
