@@ -233,7 +233,8 @@ class GaussianPerm(nn.Module):
     
     def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
         points = points.reshape(self.num_strands, STRAND_VERTEX_COUNT, -1)
-        midpoints = points[:, :-1, :] + (points[:, 1:, :] - points[:, :-1, :])
+        midpoints = 0.5*(points[:, :-1] + points[:, 1:])
+        midpoints = midpoints.reshape(-1, 3)
 
         self._xyz = midpoints
         self._rotation = self._rotation_base

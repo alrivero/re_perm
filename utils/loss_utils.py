@@ -195,3 +195,64 @@ def orientation_loss(
     loss          = (weight * inv_dot).mean()                             # scalar
 
     return loss.to(device)
+
+def strand_length_loss(strand_points,
+                       L_max   = 0.10,   # metres (== 10 cm in scene space)
+                       delta   = 0.01):  # 1 cm smooth hinge
+    """
+    strand_points : (S,V+1,3) tensor – vertices of every strand
+    Returns a scalar.
+    """
+    seg_len   = (strand_points[:, 1:] - strand_points[:, :-1]).norm(dim=-1)  # (S,V)
+    total_len = seg_len.sum(dim=-1)                                          # (S,)
+
+    excess    = F.relu(total_len - L_max)                                    # (S,)
+    # Huber hinge on the excess
+    loss = torch.where(excess < delta,
+                       0.5 * excess**2 / delta,
+                       excess - 0.5 * delta)
+    return loss.mean()
+
+def neighbour_orientation_loss(strand_points,
+                               k             = 8,      # how many neighbours per strand
+                               eps           = 1e-6):  # numerical safety
+    """
+    strand_points : (S,V,3)  tensor  (S = num_strands, V = STRAND_VERTEX_COUNT)
+                     *must* contain the root at index‑0 and the first off‑root
+                     vertex at index‑1 so we can define an orientation vector
+                     along the strand.
+
+    Returns a scalar loss in [0,2].
+    """
+    S = strand_points.size(0)
+
+    # ------------------------------------------------------------------ #
+    # 1 ) orientation vector of every strand (root → vertex‑1)           #
+    # ------------------------------------------------------------------ #
+    orient = strand_points[:, 1] - strand_points[:, 0]         # (S,3)
+    orient = F.normalize(orient, dim=-1, eps=eps)              # (S,3)
+
+    # ------------------------------------------------------------------ #
+    # 2 ) find spatial neighbours using root positions                  #
+    # ------------------------------------------------------------------ #
+    roots = strand_points[:, 0]                                # (S,3)
+    # pairwise squared distance matrix  (S,S)
+    d2 = torch.cdist(roots, roots, p=2)**2                     # (S,S)
+
+    # k+1 because distance to itself == 0
+    _, idx_knn = torch.topk(d2, k=k+1, largest=False)          # (S,k+1)
+    idx_knn = idx_knn[:, 1:]                                   # drop self → (S,k)
+
+    # ------------------------------------------------------------------ #
+    # 3 ) cosine similarity with each neighbour                         #
+    # ------------------------------------------------------------------ #
+    v_i   = orient.unsqueeze(1).expand(-1, k, -1)              # (S,k,3)
+    v_j   = orient[idx_knn]                                    # (S,k,3)
+
+    cos_ij = (v_i * v_j).sum(dim=-1).clamp(-1.0, 1.0)          # (S,k)
+
+    # ------------------------------------------------------------------ #
+    # 4 ) loss  = 1 – cosθ   (0 when perfectly aligned, ↑ as they diverge)
+    # ------------------------------------------------------------------ #
+    loss = (1.0 - cos_ij).mean()                               # scalar
+    return loss
