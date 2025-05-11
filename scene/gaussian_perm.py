@@ -6,10 +6,10 @@ import torch.nn as nn
 
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmetric, build_scaling_rotation, quatProduct_batch
 
-STRAND_VERTEX_COUNT = 25
+STRAND_VERTEX_COUNT = 50
 
 class GaussianPerm(nn.Module):
-    def __init__(self, perm, pseudo_roots, start_hair_style, sh_degree, num_strands=2500):
+    def __init__(self, perm, pseudo_roots, start_hair_style, sh_degree, num_strands=20000):
         super(GaussianPerm, self).__init__()
 
         self.optimizer = None
@@ -19,8 +19,6 @@ class GaussianPerm(nn.Module):
 
         self.perm = perm
         self.roots = self.perm.hair_roots.sample_scalp_mesh(num_strands, pseudo_roots)
-
-        self.init_parameters(start_hair_style)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -35,48 +33,81 @@ class GaussianPerm(nn.Module):
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
+        self.segmentation_activation = torch.sigmoid
+
+
+        self.init_parameters(start_hair_style)
 
     def init_parameters(self, start_hair_style):
-        gaussian_count = self.num_strands * STRAND_VERTEX_COUNT - self.num_strands
-
-        # Save PERM and also the items we'll need to optimize
+        # --- initialize perm parameters (theta, beta) ---
         if start_hair_style is not None:
-            self.theta = nn.Parameter(torch.tensor(start_hair_style["theta"])[None].requires_grad_(True))
-            self.beta = nn.Parameter(torch.tensor(start_hair_style["beta"])[None].requires_grad_(True))
+            self.theta = nn.Parameter(torch.tensor(start_hair_style["theta"])[None]
+                                    .requires_grad_(True))
+            self.beta  = nn.Parameter(torch.tensor(start_hair_style["beta"])[None]
+                                    .requires_grad_(True))
+            # self.beta  = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
         else:
             self.theta = nn.Parameter(self.perm.theta_avg().requires_grad_(True))
-            self.beta = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
-        
-        # Save Gaussian Paramters
+            self.beta  = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
+
+        full_strands = self.perm(
+            roots=self.get_roots_xyz[None].cuda(),
+            theta=self.theta.cuda(),
+            beta=self.beta.cuda()
+        )["strands"].position[0]
+        base_strands = full_strands[:, ::2, :] / 100.0
+
+        # import pdb; pdb.set_trace()
+
+        S, N_ds, _ = base_strands.shape
+        gaussian_count = S * (N_ds - 1)
         self.active_sh_degree = 0
 
-        features = torch.rand((gaussian_count, 3, (self.max_sh_degree + 1) ** 2)).float()
-        features[:, 3:, 1:] = 0.0
+        # --- compute segment directions and lengths ---
+        # edges: (S, N_ds-1, 3)
+        edges = base_strands[:, 1:, :] - base_strands[:, :-1, :]
+        # flatten to (M, 3)
+        edge_dirs = edges.reshape(-1, 3)
+        # lengths: (M, 1)
+        edge_lens = edge_dirs.norm(dim=1, keepdim=True)
+        M = edge_dirs.shape[0]
+        device = edge_dirs.device
+        eps = 1e-6
 
-        self._features_dc = nn.Parameter(
-            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
-        )
-        self._features_rest = nn.Parameter(
-            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
-        )
-
-        self._scaling_base = nn.Parameter(torch.rand((gaussian_count, 2)).requires_grad_(True))
+        # --- initialize scales: (M, 2) ---
+        # y-scale = segment length, x/z-scale = length / 5
+        scale_y  = edge_lens[:, 0]
+        scale_xz = scale_y / 10000.0
+        raw_scales = torch.stack([scale_xz, scale_y], dim=1).to(device)
+        # invert the activation (log) so that exp(_scaling_base) == desired raw_scales
+        base_scales = self.scaling_inverse_activation(raw_scales)
+        self._scaling_base = nn.Parameter(base_scales.requires_grad_(True))
         self._scaling = None
 
-        rots = torch.zeros((gaussian_count, 4))
-        rots[:, 0] = 1
-        self._rotation_base = nn.Parameter(rots.requires_grad_(True))
+        # --- initialize spherical-harmonic features: (M,3,n_sh) ---
+        avg_color = torch.tensor([0.12, 0.13, 0.14], device=device) * 0.0
+        n_sh = (self.max_sh_degree + 1) ** 2
+        feats = torch.zeros((M, 3, n_sh), device=device)
+        feats[:, :, 0] = avg_color.unsqueeze(0)
+
+        # split into DC and rest
+        dc = feats[:, :, 0:1].transpose(1, 2).contiguous()   # (M,1,3)
+        rest = feats[:, :, 1:].transpose(1, 2).contiguous()  # (M,n_sh-1,3)
+        self._features_dc   = nn.Parameter(dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(rest.requires_grad_(True))
+
+        # --- initialize opacity: (M,1) ---
+        opacs = inverse_sigmoid(
+            1.0 * torch.ones((M, 1), dtype=torch.float, device=device)
+        )
+        self._opacity = nn.Parameter(opacs.requires_grad_(True))
+        
+        # self._seg_logit = nn.Parameter(torch.ones((M, 1), device=device))
+
+        # --- placeholder for Gaussian centers/rotations ---
+        self._xyz = None
         self._rotation = None
 
-        opacities = inverse_sigmoid(
-            0.1
-            * torch.ones(
-                (gaussian_count, 1), dtype=torch.float
-            )
-        )
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-
-        self._xyz = None
 
     def capture(self):
         return (
@@ -84,7 +115,6 @@ class GaussianPerm(nn.Module):
             self._features_dc,
             self._features_rest,
             self._scaling_base,
-            self._rotation_base,
             self._opacity,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
@@ -98,7 +128,6 @@ class GaussianPerm(nn.Module):
         self._features_dc, 
         self._features_rest,
         self._scaling_base, 
-        self._rotation_base, 
         self._opacity,
         opt_dict, 
         self.spatial_lr_scale,
@@ -133,6 +162,10 @@ class GaussianPerm(nn.Module):
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+    
+    # @property
+    # def get_seg_logit(self):
+    #     return self.segmentation_activation(self._seg_logit)
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(
@@ -177,11 +210,6 @@ class GaussianPerm(nn.Module):
                 "lr": training_args.scaling_lr * self.spatial_lr_scale,
                 "name": "scaling",
             },
-            {
-                "params": [self._rotation_base],
-                "lr": training_args.rotation_lr,
-                "name": "rotation",
-            },
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -195,7 +223,7 @@ class GaussianPerm(nn.Module):
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "perm":
+            if param_group["name"] == "beta" or param_group["name"] == "theta":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
@@ -226,20 +254,40 @@ class GaussianPerm(nn.Module):
         x = points[:, 0]
         y = points[:, 1]
         z = points[:, 2]
-        points_corr = torch.stack([x, -z, y], dim=1)
+        points_corr = torch.stack([x, y, z], dim=1) / 100.0
 
-        points_corr /= 100.0
         return points_corr
     
-    def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
-        points = points.reshape(self.num_strands, STRAND_VERTEX_COUNT, -1)
-        midpoints = 0.5*(points[:, :-1] + points[:, 1:])
-        midpoints = midpoints.reshape(-1, 3)
+    def compute_edge_quats(self, edge_dirs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """
+        Given edge direction vectors (M,3) return unit quaternions (M,4)
+        which rotate the world +Y axis to each edge direction.
+        """
+        up   = torch.tensor([0.0, 1.0, 0.0], device=edge_dirs.device).expand_as(edge_dirs)
+        b    = edge_dirs / (edge_dirs.norm(dim=1, keepdim=True) + eps)
+        dot  = (up * b).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
+        axis = torch.cross(up, b, dim=1)
+        axis = axis / (axis.norm(dim=1, keepdim=True) + eps)
+        ang  = torch.acos(dot)
+        qw   = torch.cos(ang * 0.5)
+        qxyz = axis * torch.sin(ang * 0.5)
+        return torch.cat([qw, qxyz], dim=1)  # (M,4)
+    
+    def update_xyz_rot_scale(self, strand_vertices, rot_delta, scale_coeff):
+        """
+        strand_vertices : (S*V,3) vertices output by deformer
+        Re‑computes mid‑points and edge‑quaternions; updates xyz, scaling, rotation buffers.
+        """
+        pts = strand_vertices.reshape(self.num_strands, STRAND_VERTEX_COUNT, 3)
+        mids = 0.5 * (pts[:, :-1] + pts[:, 1:])                  # (S,V-1,3)
+        edges = pts[:, 1:, :] - pts[:, :-1, :]                   # (S,V-1,3)
+        edge_dirs = edges.reshape(-1, 3)
 
-        self._xyz = midpoints
-        self._rotation = self._rotation_base
-        self._scaling = torch.cat([
-            self._scaling_base[:, [0]],
-            self._scaling_base[:, [1]],
-            self._scaling_base[:, [0]]
-        ], dim=-1)
+        # update buffers (not learnable)
+        self._xyz      = mids.reshape(-1, 3)
+        self._rotation = self.compute_edge_quats(edge_dirs)
+        # scaling keeps the same learnable bases; _scaling is cached form
+        self._scaling  = torch.cat([self._scaling_base[:, [0]],
+                                    self._scaling_base[:, [1]],
+                                    self._scaling_base[:, [0]]],
+                                   dim=-1)

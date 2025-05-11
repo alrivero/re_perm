@@ -15,7 +15,7 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getWorld2View
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, head_mask, mouth_mask, hair_mask, hair_orient,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, head_mask, mouth_mask, hair_mask, hair_orient, depth_map,
                  exp_param, eyes_pose, eyelids, jaw_pose,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
@@ -44,6 +44,7 @@ class Camera(nn.Module):
         self.mouth_mask = mouth_mask
         self.hair_mask = hair_mask
         self.hair_orient = hair_orient
+        self.depth_map = depth_map
         self.exp_param = exp_param
         self.eyes_pose = eyes_pose
         self.eyelids = eyelids
@@ -67,12 +68,17 @@ class Camera(nn.Module):
         self.mouth_mask = self.mouth_mask.to(data_device)
         self.hair_mask = self.hair_mask.to(data_device)
         self.hair_orient = self.hair_orient.to(data_device)
+        self.depth_map = self.depth_map.to(data_device)
         self.exp_param = self.exp_param.to(data_device)
         self.eyes_pose = self.eyes_pose.to(data_device)
         self.eyelids = self.eyelids.to(data_device)
         self.jaw_pose = self.jaw_pose.to(data_device)
 
         self.w2c = self.w2c.to(data_device)
+        self.world_view_transform = self.world_view_transform.to(data_device)
+        self.projection_matrix = self.projection_matrix.to(data_device)
+        self.full_proj_transform = self.full_proj_transform.to(data_device)
+        self.camera_center = self.camera_center.to(data_device)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

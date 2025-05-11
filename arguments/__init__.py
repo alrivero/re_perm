@@ -74,12 +74,13 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 150_000
+        self.iterations = 600_000
+        self.theta_warmup = 20000
 
-        self.perm_lr_init = 0.016
-        self.perm_lr_final = 0.00016
+        self.perm_lr_init = 0.0075
+        self.perm_lr_final = 0.001
         self.perm_lr_delay_mult = 0.01
-        self.perm_lr_max_steps = 30_000
+        self.perm_lr_max_steps = 300_000
 
         # self.position_lr_init = 0.00016
         # self.position_lr_final = 0.0000016
@@ -89,8 +90,8 @@ class OptimizationParams(ParamGroup):
         lr_coef = 1
         self.feature_lr = 0.0025*lr_coef
         self.opacity_lr = 0.05*lr_coef
-        self.scaling_lr = 0.005*lr_coef
-        self.rotation_lr = 0.001*lr_coef
+        self.scaling_lr = 0.0001*lr_coef
+        self.rotation_lr = 0.005*lr_coef
         self.percent_dense = 0.01
 
         self.lambda_huber = 1.0
@@ -100,6 +101,19 @@ class OptimizationParams(ParamGroup):
         self.max_strand_len = 0.22
         self.delta_strand_len = 0.01
         self.k_neigh = 8
+
+        self.lambda_huber = 10.0
+        self.lambda_seg = 1.0
+        self.lambda_orient = 10.0
+        self.lambda_len = 100.0
+        self.lambda_neigh = 50.0
+        self.lambda_out = 0.0
+        self.lambda_ori_match = 1e2
+        self.lambda_oblong = 1e9
+        self.lambda_len_consist = 1e11
+        self.lambda_bend = 1e7
+        self.lambda_smooth_scale = 1e8
+        self.lambda_depth = 1.0
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000

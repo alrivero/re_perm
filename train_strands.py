@@ -3,10 +3,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import lpips
+import datetime as dt
 
 try:
     import wandb
-    _use_wandb = True
+    _use_wandb = False
 except ModuleNotFoundError:
     print("[wandb] not found – continuing without online logging.")
     _use_wandb = False
@@ -26,9 +27,17 @@ from utils.loss_utils import (
     orientation_loss,
     strand_length_loss,
     neighbour_orientation_loss,
+    outside_opacity_loss,
+    orientation_match_strands_loss,
+    oblong_shape_loss_from_strands_loss,
+    length_consistency_loss_from_strands_loss,
+    bending_loss,
+    neighbor_scale_smoothness_loss,
+    aligned_depth_loss,
+    orientation_loss_kernel
 )
 
-STRAND_VERTEX_COUNT = 25    # same as in GaussianPerm
+STRAND_VERTEX_COUNT = 50    # same as in GaussianPerm
 
 
 # --------------------------------------------------------------------- #
@@ -41,19 +50,37 @@ def set_random_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def to_image_np(tensor: torch.Tensor) -> np.ndarray:
+    t = tensor.detach().clamp(0, 1)
+    if t.dim() == 4:
+        t = t[0]
+    if t.dim() == 3:
+        arr = t.permute(1, 2, 0).cpu().numpy()
+    elif t.dim() == 2:
+        gray = t.cpu().numpy()
+        arr = np.stack([gray, gray, gray], axis=-1)
+    else:
+        raise RuntimeError(f"Cannot convert tensor shape {tuple(t.shape)} to image")
+    return (arr * 255.0).astype(np.uint8)
+
+def make_side_by_side(left: torch.Tensor, right: torch.Tensor, image_res: int) -> np.ndarray:
+    left_np  = to_image_np(left)
+    right_np = to_image_np(right)
+    canvas = np.zeros((image_res, image_res * 2, 3), dtype=np.uint8)
+    canvas[:, :image_res] = left_np
+    canvas[:, image_res:] = right_np
+    return canvas
 
 # --------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------- #
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("perm‑fitting")
+    parser = argparse.ArgumentParser("perm-fitting")
 
-    # default groups (unchanged)
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
 
-    # experiment‑specific flags (unchanged)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--idname", type=str, default="id1_25")
     parser.add_argument("--image_res", type=int, default=512)
@@ -62,9 +89,6 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.device = "cuda"
 
-    # ------------------------------------------------------------------ #
-    #  initialise
-    # ------------------------------------------------------------------ #
     set_random_seed(args.seed)
     torch.autograd.set_detect_anomaly(True)
 
@@ -72,37 +96,33 @@ if __name__ == "__main__":
     opt = op.extract(args)
     ppt = pp.extract(args)
 
-    # --------------------- wandb init --------------------------------- #
     if _use_wandb:
-        wandb.init(
-            project="re_perm",
-            name=args.idname,
-            config={**args.__dict__,
-                    **opt.__dict__},
-        )
+        run_name = f"{args.idname}—{dt.datetime.now().strftime('%b-%d-%Y_%Hh%Mm')}"
+        wandb.init(project="re_perm", name=run_name,
+                   config={**args.__dict__, **opt.__dict__, **ppt.__dict__, **lpt.__dict__})
 
-    # ------------------------- data paths ----------------------------- #
-    data_dir       = os.path.join(args.source_path, args.idname)
-    mica_datadir   = os.path.join(data_dir, "track_out", args.idname)
-    log_dir        = os.path.join(data_dir, "log")
-    train_dir      = os.path.join(log_dir, "train")
-    model_dir      = os.path.join(log_dir, "ckpt")
+    data_dir     = os.path.join(args.source_path, args.idname)
+    mica_datadir = os.path.join(data_dir, "track_out", args.idname)
+    log_dir      = os.path.join(data_dir, "log")
+    train_dir    = os.path.join(log_dir, "train")
+    model_dir    = os.path.join(log_dir, "ckpt")
 
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    # ------------------------- FLAME scalp mask ----------------------- #
-    scalp_mask = pickle.load(open(
-        "/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl", "rb"),
-        encoding="latin1")["scalp"]
+    scalp_mask = pickle.load(
+        open("/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl", "rb"),
+        encoding="latin1"
+    )["scalp"]
 
-    # ------------------------- PERM mesh ------------------------------ #
+    sb = 1.0
     perm = Perm(
         lpt.perm_path,
         lpt.obj_head_path,
         scalp_vertex_idxs=scalp_mask,
-        scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047],
-        mesh_scale=100.0).to(args.device)
+        scalp_bounds=[0.1870 * sb, 0.8018 * (1 + (1 - sb)), 0.4011 * sb, 0.8047 * (1 + (1 - sb))],
+        mesh_scale=100.0
+    ).to(args.device)
 
     pseudo_roots = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0]
 
@@ -110,29 +130,27 @@ if __name__ == "__main__":
     if lpt.emp_hair_path:
         start_hair_style = np.load(lpt.emp_hair_path)
 
-    gaussians = GaussianPerm(
-        perm,
-        pseudo_roots,
-        start_hair_style,
-        lpt.sh_degree).to(args.device)
+    gaussians = GaussianPerm(perm, pseudo_roots, start_hair_style, lpt.sh_degree).to(args.device)
     gaussians.roots = gaussians.roots.to(args.device)
     gaussians.training_setup(opt)
 
-    # ------------------------- deformation model ---------------------- #
+    # --- freeze theta during warm‑up -------------------------------------
+    gaussians.beta.requires_grad_(False)
+    for g in gaussians.optimizer.param_groups:
+        if g["name"] == "beta":
+            g["lr"] = 0.0
+
     deform_model = PermDeformModel(perm, args.device).to(args.device)
     deform_model.training_setup()
 
-    # restore if checkpoint provided
     first_iter = 0
     if args.start_checkpoint:
         m_params, g_params, first_iter = torch.load(args.start_checkpoint)
         deform_model.restore(m_params)
         gaussians.restore(g_params, opt)
 
-    # ------------------------- background / scene -------------------- #
     bg_color = [1, 1, 1] if lpt.white_background else [0, 1, 0]
-    bg_image = torch.zeros((3, args.image_res, args.image_res),
-                           device=args.device)
+    bg_image = torch.zeros((3, args.image_res, args.image_res), device=args.device)
     if lpt.white_background:
         bg_image[:] = 1
     else:
@@ -143,16 +161,20 @@ if __name__ == "__main__":
         data_dir, mica_datadir,
         train_type=0,
         white_background=lpt.white_background,
-        device=args.device)
+        device=args.device
+    )
 
-    # ------------------------- main loop ----------------------------- #
     viewpoint_stack = None
     for it in range(first_iter + 1, opt.iterations + 1):
-        # progressive SH
         if it % 500 == 0:
             gaussians.oneupSHdegree()
 
-        # random camera selection
+        if it == opt.theta_warmup + 1:
+            gaussians.beta.requires_grad_(True)
+            for g in gaussians.optimizer.param_groups:
+                if g["name"] == "beta":
+                    g["lr"] = opt.perm_lr_init      # restore normal LR
+
         if not viewpoint_stack:
             viewpoint_stack = scene.getCameras().copy()
             random.shuffle(viewpoint_stack)
@@ -161,56 +183,92 @@ if __name__ == "__main__":
         cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack) - 1))
         cam.load2device(args.device)
 
-        # ------------- forward pass ---------------------------------- #
         codedict = {
-            "R":      torch.tensor(cam.R, device=args.device),
-            "T":      torch.tensor(cam.T, device=args.device),
-            "roots":  gaussians.get_roots_xyz[None],
-            "theta":  gaussians.theta,
-            "beta":   gaussians.beta,
+            "R":     torch.tensor(cam.R, device=args.device),
+            "T":     torch.tensor(cam.T, device=args.device),
+            "roots": gaussians.get_roots_xyz[None],
+            "theta": gaussians.theta,
+            "beta":  gaussians.beta,
         }
 
-        verts_final, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
+        verts_final, guide_final, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
         gaussians.update_xyz_rot_scale(verts_final, rot_delta, scale_coef)
 
         render_pkg = render(cam, gaussians, ppt, background)
-        img_render = render_pkg["render"]
+        img_render   = render_pkg["render"]
+        img_segment  = render_pkg["segment"]
+        depth_pred   = render_pkg["depth"][0]
 
-        # ground‑truth composite
-        gt_img   = cam.original_image
-        alpha    = cam.hair_mask
-        orient   = cam.hair_orient             # (H,W,2)
-        gt_img   = gt_img * alpha + bg_image * (1 - alpha)
+        gt_img  = cam.original_image
+        alpha   = cam.hair_mask
+        orient  = cam.hair_orient
+        depth_gt   = cam.depth_map
+        gt_img  = gt_img * alpha + bg_image * (1 - alpha)
 
-        # ------------------------------------------------------------------ #
-        # losses
-        # ------------------------------------------------------------------ #
-        loss_h  = huber_loss(img_render, gt_img, delta=0.1, reduction="mean")
-        loss_o  = orientation_loss(cam, gaussians, alpha, orient)
+        loss_h   = huber_loss(img_render, gt_img, alpha, delta=0.1, reduction="mean")
+        loss_seg = huber_loss(img_segment, alpha, torch.ones_like(alpha), delta=0.1, reduction="mean")
 
-        strand_pts = verts_final.reshape(
-            gaussians.num_strands, STRAND_VERTEX_COUNT + 1, 3)
+        strand_pts = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
+        guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
-        loss_len = strand_length_loss(
-            strand_pts,
-            L_max = opt.max_strand_len,
-            delta = opt.delta_strand_len)
+        loss_o             = orientation_loss(cam, gaussians, alpha, orient)
+        loss_len           = strand_length_loss(strand_pts, L_max=opt.max_strand_len, delta=opt.delta_strand_len)
+        loss_nei           = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], k=opt.k_neigh)
+        loss_out           = outside_opacity_loss(cam, gaussians, alpha)
+        loss_ori_match     = torch.tensor(0.0).to(args.device) # Not used
+        loss_oblong        = oblong_shape_loss_from_strands_loss(strand_pts, gaussians)
+        loss_len_consist   = length_consistency_loss_from_strands_loss(strand_pts, gaussians)
+        loss_bend          = bending_loss(strand_pts)
+        loss_smooth_scale  = neighbor_scale_smoothness_loss(strand_pts, gaussians)
+        loss_depth, depth_rescaled = aligned_depth_loss(depth_pred, depth_gt, (alpha > 0.5)[0])
 
-        loss_nei = neighbour_orientation_loss(
-            strand_pts[:, :STRAND_VERTEX_COUNT, :],
-            k = opt.k_neigh)
+        if it <= opt.theta_warmup:
+            lambda_huber        = 0.0
+            lambda_neigh        = 0.0
+        else:
+            lambda_huber        = opt.lambda_huber
+            lambda_neigh        = opt.lambda_neigh
+        lambda_orient       = opt.lambda_orient
+        lambda_seg           = opt.lambda_seg
+        lambda_len           = opt.lambda_len
+        lambda_out           = opt.lambda_out
+        lambda_ori_match     = opt.lambda_ori_match
+        lambda_oblong        = opt.lambda_oblong
+        lambda_len_consist   = opt.lambda_len_consist
+        lambda_bend          = opt.lambda_bend
+        lambda_smooth_scale  = opt.lambda_smooth_scale
+        lambda_depth         = opt.lambda_depth
 
-        lambda_h = getattr(opt, "lambda_huber", 1.0)
-        loss     = (lambda_h          * loss_h +
-                    opt.lambda_orient * loss_o +
-                    opt.lambda_len    * loss_len +
-                    opt.lambda_neigh  * loss_nei)
+        w_huber         = lambda_huber        * loss_h.item()
+        w_seg           = lambda_seg          * loss_seg.item()
+        w_orient        = lambda_orient       * loss_o.item()
+        w_len           = lambda_len          * loss_len.item()
+        w_neigh         = lambda_neigh        * loss_nei.item()
+        w_out           = lambda_out          * loss_out.item()
+        w_ori_match     = lambda_ori_match    * loss_ori_match.item()
+        w_oblong        = lambda_oblong       * loss_oblong.item()
+        w_len_consist   = lambda_len_consist  * loss_len_consist.item()
+        w_bend          = lambda_bend         * loss_bend.item()
+        w_smooth_scale  = lambda_smooth_scale * loss_smooth_scale.item()
+        w_depth         = lambda_depth        * loss_depth.item()
+
+        loss = (
+            lambda_huber        * loss_h +
+            lambda_seg          * loss_seg +
+            lambda_orient       * loss_o +
+            lambda_len          * loss_len +
+            lambda_neigh        * loss_nei +
+            lambda_out          * loss_out +
+            lambda_ori_match    * loss_ori_match +
+            lambda_oblong       * loss_oblong +
+            lambda_len_consist  * loss_len_consist +
+            lambda_bend         * loss_bend +
+            lambda_smooth_scale * loss_smooth_scale +
+            lambda_depth        * loss_depth
+        )
 
         loss.backward()
 
-        # ------------------------------------------------------------------ #
-        # optimiser step
-        # ------------------------------------------------------------------ #
         with torch.no_grad():
             if it < opt.iterations:
                 gaussians.optimizer.step()
@@ -218,44 +276,57 @@ if __name__ == "__main__":
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 deform_model.optimizer.zero_grad(set_to_none=True)
 
-        # ------------------------------------------------------------------ #
-        # logging / visualisation
-        # ------------------------------------------------------------------ #
         if it % 20 == 0:
-            log_dict = {
-                "loss/total":  loss.item(),
-                "loss/huber":  loss_h.item(),
-                "loss/orient": loss_o.item(),
-                "loss/len":    loss_len.item(),
-                "loss/neigh":  loss_nei.item(),
-                "iter":        it,
-            }
-            print(f"[{it:06d}] "
-                  f"huber {loss_h.item():.4f}  "
-                  f"orient {loss_o.item():.4f}  "
-                  f"len {loss_len.item():.4f}  "
-                  f"neigh {loss_nei.item():.4f}  "
-                  f"→ total {loss.item():.4f}")
+            print(
+                f"[{it:06d}] "
+                f"huber {loss_h:.4f} (w {w_huber:.4f})  "
+                f"seg {loss_seg:.4f} (w {w_seg:.4f})  "
+                f"orient {loss_o:.4f} (w {w_orient:.4f})  "
+                f"len {loss_len:.4f} (w {w_len:.4f})  "
+                f"neigh {loss_nei:.4f} (w {w_neigh:.4f})  "
+                f"out {loss_out:.4f} (w {w_out:.4f})  "
+                f"ori_match {loss_ori_match:.4f} (w {w_ori_match:.4f})  "
+                f"oblong {loss_oblong:.4f} (w {w_oblong:.4f})  "
+                f"len_consist {loss_len_consist:.4f} (w {w_len_consist:.4f})  "
+                f"bend {loss_bend:.4f} (w {w_bend:.4f})  "
+                f"smooth_scale {loss_smooth_scale:.4f} (w {w_smooth_scale:.4f})  "
+                f"depth {loss_depth:.4f} (w {w_depth:.4f})  "
+                f"→ total {loss.item():.4f}"
+            )
             if _use_wandb:
-                wandb.log(log_dict, step=it)
+                wandb.log({
+                    "loss/total":        loss.item(),
+                    "loss/huber":        loss_h.item(),
+                    "loss/seg":          loss_seg.item(),
+                    "loss/orient":       loss_o.item(),
+                    "loss/len":          loss_len.item(),
+                    "loss/neigh":        loss_nei.item(),
+                    "loss/out":          loss_out.item(),
+                    "loss/ori_match":    loss_ori_match.item(),
+                    "loss/oblong":       loss_oblong.item(),
+                    "loss/len_consist":  loss_len_consist.item(),
+                    "loss/bend":         loss_bend.item(),
+                    "loss/smooth_scale": loss_smooth_scale.item(),
+                    "loss/depth":        loss_depth.item(),
+                    "iter":              it,
+                }, step=it)
 
-        if it % 250 == 0 or it == 1:
-            canvas = np.zeros((args.image_res, args.image_res * 2, 3), dtype=np.uint8)
-            gt_np  = (gt_img.clamp(0,1)*255).permute(1,2,0).cpu().numpy().astype(np.uint8)
-            ren_np = (img_render.clamp(0,1)*255).permute(1,2,0).cpu().numpy().astype(np.uint8)
-            canvas[:, :args.image_res] = gt_np
-            canvas[:, args.image_res:] = ren_np
-            cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"),
-                        canvas[:, :, ::-1])        # BGR for OpenCV
-            save_tensor_to_ply(verts_final,
-                               os.path.join(train_dir, f"{it:06d}.ply"))
+        if it % 1000 == 0 or it == 1:
+            canvas = make_side_by_side(gt_img, img_render, args.image_res)
+            cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
+            seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
+            cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
+            depth_canvas = make_side_by_side(depth_gt[None].expand(3, -1, -1), depth_rescaled[None].expand(3, -1, -1), args.image_res)
+            cv2.imwrite(os.path.join(train_dir, f"{it:06d}_depth.png"), depth_canvas[:, :, ::-1])
+
+            save_tensor_to_ply(verts_final, os.path.join(train_dir, f"{it:06d}.ply"))
+            save_tensor_to_ply(guide_final, os.path.join(train_dir, f"guide_{it:06d}.ply"))
             if _use_wandb:
                 wandb.log({"preview": wandb.Image(canvas[:, :, ::-1])}, step=it)
 
         if it % 5000 == 0:
-            torch.save(
-                (deform_model.capture(), gaussians.capture(), it),
-                os.path.join(model_dir, f"chkpnt_{it:06d}.pth"))
+            torch.save((deform_model.capture(), gaussians.capture(), it),
+                       os.path.join(model_dir, f"chkpnt_{it:06d}.pth"))
             print(f"\n[ITER {it}] Checkpoint saved.\n")
 
         cam.load2device("cpu")

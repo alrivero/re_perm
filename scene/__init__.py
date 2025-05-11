@@ -58,7 +58,7 @@ class Scene_mica:
             range_down = self.N_frames - eval_num
             range_up = self.N_frames
 
-        for frame_id in tqdm(range(range_down, range_up)):
+        for frame_id in tqdm(range(0, 1435)):
             image_name_mica = str(frame_id).zfill(5) # obey mica tracking
             image_name_ori = str(frame_id+frame_delta).zfill(5)
             ckpt_path = os.path.join(mica_ckpt_dir, image_name_mica+'.frame')
@@ -108,15 +108,17 @@ class Scene_mica:
             hair_orient = Image.open(hair_orient_path)
             hair_orient = PILtoTensor(hair_orient)
 
+            # depth map
+            depth_path = os.path.join(datadir, "depth", image_name_ori + ".npy")
+            depth_map_np = np.load(depth_path)                      # (H, W) float
+            depth_map = torch.from_numpy(depth_map_np)
+
             camera_indiv = Camera(colmap_id=frame_id, R=R, T=T, 
                                 FoVx=FovX, FoVy=FovY, 
-                                image=gt_image, head_mask=head_mask, mouth_mask=mouth_mask, hair_mask=hair_mask, hair_orient=hair_orient,
+                                image=gt_image, head_mask=head_mask, mouth_mask=mouth_mask, hair_mask=hair_mask, hair_orient=hair_orient, depth_map=depth_map,
                                 exp_param=exp_param, eyes_pose=eyes_pose, eyelids=eyelids, jaw_pose=jaw_pose,
                                 image_name=image_name_mica, uid=frame_id, data_device=device)
             self.cameras.append(camera_indiv)
-
-            if frame_id >= 20:
-                break
     
     def getCameras(self):
         return self.cameras
