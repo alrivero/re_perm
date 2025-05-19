@@ -333,7 +333,71 @@ class HairRoots(nn.Module):
         uv_norm[:, 1] = (uv_raw[:, 1] - v0) / (v1 - v0)
         return uv_norm
     
+    def _project_to_surface(self, pts: torch.Tensor) -> torch.Tensor:
+        """
+        Project arbitrary 3-D points to the closest point on the head mesh.
+
+        Args
+        ----
+        pts : (N,3) torch tensor (any device)
+
+        Returns
+        -------
+        (N,3) tensor on the same device - each row lies on the mesh surface
+        """
+        pts_np = pts.detach().cpu().numpy()
+        loc_np, _, _ = self.head.nearest.on_surface(pts_np)  # (N,3) float64
+        loc = torch.from_numpy(loc_np).to(pts.device, dtype=torch.float32)
+        return loc
+
     def sample_scalp_mesh(
+        self,
+        num_samples: int,
+        pseudo_roots: torch.Tensor  # (M,3) arbitrary points near the scalp
+    ) -> torch.Tensor:
+        """
+        1. Snap each pseudo_root to the closest point on the head surface,
+        recording which face it landed on.
+        2. Build a submesh consisting only of those faces.
+        3. Return num_samples points:
+        • all snapped roots (deduplicated, clipped),
+        • plus uniform samples on that submesh to fill up to num_samples.
+        """
+        device = pseudo_roots.device
+
+        # 1) project each pseudo_root onto the mesh surface
+        pts_np = pseudo_roots.cpu().numpy()
+        snapped_pts, _, face_idx = self.head.nearest.on_surface(pts_np)
+        # snapped_pts: (M,3) numpy, face_idx: (M,) numpy
+
+        # convert back to torch
+        roots_on_surf = torch.from_numpy(snapped_pts.astype(np.float32)).to(device)
+
+        # 2) build a submesh using only the faces hit by those projections
+        unique_faces = np.unique(face_idx)
+        submesh = trimesh.Trimesh(
+            vertices=self.head.vertices,
+            faces=self.head.faces[unique_faces],
+            process=False
+        )
+
+        # 3a) deduplicate and clip the snapped roots
+        unique_roots = np.unique(snapped_pts, axis=0).astype(np.float32)
+        clipped      = unique_roots[:num_samples]
+        pts_list     = [clipped]
+
+        # 3b) if we need more, sample uniformly on that submesh
+        remainder = num_samples - clipped.shape[0]
+        if remainder > 0:
+            extra_pts, _ = trimesh.sample.sample_surface_even(submesh, remainder)
+            pts_list.append(extra_pts.astype(np.float32))
+
+        # 3c) assemble and return
+        all_pts = np.vstack(pts_list)
+        assert all_pts.shape[0] == num_samples, f"Expected {num_samples} points but got {all_pts.shape[0]}"
+        return torch.from_numpy(all_pts).to(device)
+    
+    def sample_scalp_mesh_old(
         self,
         num_samples: int,
         pseudo_roots: torch.Tensor  # shape (M,3)

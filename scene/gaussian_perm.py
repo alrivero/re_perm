@@ -7,6 +7,7 @@ import torch.nn as nn
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmetric, build_scaling_rotation, quatProduct_batch
 
 STRAND_VERTEX_COUNT = 50
+SCALE_DIVISOR = 1e4
 
 class GaussianPerm(nn.Module):
     def __init__(self, perm, pseudo_roots, start_hair_style, sh_degree, num_strands=20000):
@@ -74,18 +75,8 @@ class GaussianPerm(nn.Module):
         device = edge_dirs.device
         eps = 1e-6
 
-        # --- initialize scales: (M, 2) ---
-        # y-scale = segment length, x/z-scale = length / 5
-        scale_y  = edge_lens[:, 0]
-        scale_xz = scale_y / 10000.0
-        raw_scales = torch.stack([scale_xz, scale_y], dim=1).to(device)
-        # invert the activation (log) so that exp(_scaling_base) == desired raw_scales
-        base_scales = self.scaling_inverse_activation(raw_scales)
-        self._scaling_base = nn.Parameter(base_scales.requires_grad_(True))
-        self._scaling = None
-
         # --- initialize spherical-harmonic features: (M,3,n_sh) ---
-        avg_color = torch.tensor([0.12, 0.13, 0.14], device=device) * 0.0
+        avg_color = torch.tensor([0.0, 0.0, 0.0], device=device)
         n_sh = (self.max_sh_degree + 1) ** 2
         feats = torch.zeros((M, 3, n_sh), device=device)
         feats[:, :, 0] = avg_color.unsqueeze(0)
@@ -114,7 +105,6 @@ class GaussianPerm(nn.Module):
             self.active_sh_degree,
             self._features_dc,
             self._features_rest,
-            self._scaling_base,
             self._opacity,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
@@ -127,7 +117,6 @@ class GaussianPerm(nn.Module):
         (self.active_sh_degree, 
         self._features_dc, 
         self._features_rest,
-        self._scaling_base, 
         self._opacity,
         opt_dict, 
         self.spatial_lr_scale,
@@ -135,7 +124,7 @@ class GaussianPerm(nn.Module):
         self.theta,
         self.beta) = model_args
         self.training_setup(training_args)
-        self.optimizer.load_state_dict(opt_dict)
+        # self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_roots_xyz(self):
@@ -205,11 +194,6 @@ class GaussianPerm(nn.Module):
                 "lr": training_args.opacity_lr,
                 "name": "opacity",
             },
-            {
-                "params": [self._scaling_base],
-                "lr": training_args.scaling_lr * self.spatial_lr_scale,
-                "name": "scaling",
-            },
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -273,21 +257,41 @@ class GaussianPerm(nn.Module):
         qxyz = axis * torch.sin(ang * 0.5)
         return torch.cat([qw, qxyz], dim=1)  # (M,4)
     
-    def update_xyz_rot_scale(self, strand_vertices, rot_delta, scale_coeff):
-        """
-        strand_vertices : (S*V,3) vertices output by deformer
-        Re‑computes mid‑points and edge‑quaternions; updates xyz, scaling, rotation buffers.
-        """
-        pts = strand_vertices.reshape(self.num_strands, STRAND_VERTEX_COUNT, 3)
-        mids = 0.5 * (pts[:, :-1] + pts[:, 1:])                  # (S,V-1,3)
-        edges = pts[:, 1:, :] - pts[:, :-1, :]                   # (S,V-1,3)
-        edge_dirs = edges.reshape(-1, 3)
+    @staticmethod
+    def _mid_and_edge(strands):
+        mids = 0.5 * (strands[:, :-1] + strands[:, 1:]).reshape(-1, 3)
+        edges = (strands[:, 1:] - strands[:, :-1]).reshape(-1, 3)
+        return mids, edges
 
-        # update buffers (not learnable)
-        self._xyz      = mids.reshape(-1, 3)
-        self._rotation = self.compute_edge_quats(edge_dirs)
-        # scaling keeps the same learnable bases; _scaling is cached form
-        self._scaling  = torch.cat([self._scaling_base[:, [0]],
-                                    self._scaling_base[:, [1]],
-                                    self._scaling_base[:, [0]]],
+    def _edge_dirs_to_quat(self, edge_dirs, eps=1e-6):
+        up = torch.tensor([0.0, 1.0, 0.0], device=edge_dirs.device)
+        up = up.expand_as(edge_dirs)
+        dirs_norm = edge_dirs / (edge_dirs.norm(dim=1, keepdim=True) + eps)
+        dot = (up * dirs_norm).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
+        axis = torch.cross(up, dirs_norm, dim=1)
+        axis = axis / (axis.norm(dim=1, keepdim=True) + eps)
+        angle = torch.acos(dot)
+        quat_w = torch.cos(angle * 0.5)
+        quat_xyz = axis * torch.sin(angle * 0.5)
+        return torch.cat([quat_w, quat_xyz], dim=1)
+
+    def _edge_lengths_to_scaling(self, edge_dirs):
+        sigma_y = edge_dirs.norm(dim=1, keepdim=True)  # shape (N, 1)
+        sigma_xz = sigma_y / SCALE_DIVISOR
+        raw_2d = torch.cat([sigma_xz, sigma_y], dim=1)  # (N, 2)
+        log_2d = self.scaling_inverse_activation(raw_2d)
+        # full_3d = torch.cat([sigma_xz, sigma_y, sigma_xz], dim=1)  # (N, 3)
+        return log_2d
+    
+    def update_xyz_rot_scale(self, strand_vertices, *_):
+        pts = strand_vertices.reshape(self.num_strands, STRAND_VERTEX_COUNT, 3)
+        mids, edges = self._mid_and_edge(pts)
+
+        self._xyz = mids
+        self._rotation = self._edge_dirs_to_quat(edges)
+
+        scales = self._edge_lengths_to_scaling(edges)
+        self._scaling  = torch.cat([scales[:, [0]],
+                                    scales[:, [1]],
+                                    scales[:, [0]]],
                                    dim=-1)

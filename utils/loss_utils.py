@@ -13,7 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp, pi
-from typing import Optional
+from typing import Optional, Tuple
+from pytorch3d.ops import knn_points 
 
 from utils.general_utils import project_to_screen, quaternion_to_rotation_matrix, convert_normal_to_camera_space
 
@@ -490,41 +491,147 @@ def neighbor_scale_smoothness_loss(strand_pts: torch.Tensor, perm) -> torch.Tens
     return (ds.pow(2).mean())
 
 def aligned_depth_loss(
-    D_pred      : torch.Tensor,   # (H,W) renderer depth in world units
-    D_gt        : torch.Tensor,   # (H,W) HairStep depth   (0‒1 float or 8‑bit) 
-    mask        : torch.Tensor,   # (H,W) bool / 0‑1 hair alpha
-    mode:str    = "si_rmse",      # "si_rmse"  or  "huber"
-    huber_beta : float = 0.01,    # only used when mode=="huber"
-    eps        : float = 1e-3     # numerical stabiliser for log
+    D_pred: torch.Tensor,      # (H,W) raw predicted depth (world units)
+    D_gt:   torch.Tensor,      # (H,W) ground-truth normalized depth [0,1]
+    mask:   torch.Tensor,      # (H,W) hair mask ∈{0,1}
+    low_pct:  float = 0.04,     # lower Windsor percentile
+    high_pct: float = 0.98,    # upper Windsor percentile
+    mode:     str   = "l2",    # "l2" or "l1"
+    eps:      float = 1e-6
 ):
     """
-    Aligns D_pred to D_gt with a per‑frame scale/shift and returns a scale‑invariant loss.
+    1) Clip D_pred[mask] to its [low_pct,high_pct] percentiles.
+    2) Rescale clipped D_pred to [0,1].
+    3) Compute loss vs D_gt over mask.
 
-    Returns
-    -------
-    loss : torch.Tensor  (scalar)
-    D_aligned : torch.Tensor  (H,W)  -- for visualisation/debug
+    Returns:
+        loss      : scalar tensor
+        D_normal  : (H,W) tensor in [0,1] for visualization/debug
     """
-    # -------- 1. fit a,b s.t. a*D_pred + b ≈ D_gt over hair pixels --------
-    # import pdb; pdb.set_trace()
-    P = D_pred[mask].view(-1)
-    G = D_gt  [mask].view(-1)
+    device = D_pred.device
 
+    # --- 1. extract only hair-pixels and compute percentiles ---
+    vals = D_pred[mask == 1]
+    vals = vals[vals != 0.0]
+    if vals.numel() < 2:
+        # fallback to zero loss if no hair pixels
+        D_norm = torch.zeros_like(D_pred)
+        return torch.tensor(0.0, device=device), D_norm
 
-    denom = (P*P).sum().clamp(min=1e-6)
-    a = (P*G).sum() / denom
-    b = G.mean() - a * P.mean()
+    p_lo = vals.quantile(low_pct)
+    p_hi = vals.max()
+    min_locs = D_pred == 0.0
 
-    D_align = a * D_pred + b
+    # --- 2. clip & normalize entire map ---
+    D_clip = torch.clamp(D_pred, p_lo, p_hi)
+    D_norm = (D_clip - p_lo) / ( (p_hi - p_lo) + eps )
+    D_norm = 1 - D_norm.clamp(0.0, 1.0)
+    D_norm[min_locs] = 0.0
 
-    # -------- 2. loss options --------------------------------------------
-    if mode.lower() == "huber":
-        loss = F.smooth_l1_loss(D_align[mask], G, beta=huber_beta)
-    elif mode.lower() == "si_rmse":
-        # scale‑invariant RMSE from Eigen et al. ’14 (log space)
-        log_d = torch.log(D_align[mask] + eps) - torch.log(G + eps)
-        loss = (log_d.pow(2).mean() - log_d.mean() ** 2).sqrt()
+    # --- 3. compute error on hair region ---
+    mask_h = mask > 0.5
+    if mode.lower() == "l2":
+        diff = D_norm[mask_h] - D_gt[mask_h]
+        loss = (diff * diff).mean()
+    elif mode.lower() == "l1":
+        loss = torch.abs(D_norm[mask_h] - D_gt[mask_h]).mean()
     else:
-        raise ValueError("mode must be 'si_rmse' or 'huber'")
+        raise ValueError("mode must be 'l2' or 'l1'")
 
-    return loss, D_align
+    return loss, D_norm
+
+def head_collision_loss(strand_pts, head_vertices, margin=0.002):
+    """
+    Penalise strand points that sit closer than `margin` metres to the scalp mesh.
+
+    Args
+    ----
+    strand_pts    : (S, V, 3) tensor - all strand vertices in scene space
+    head_vertices : (H, 3) tensor    - scalp/head vertices, same units
+    margin        : float            - safe clearance
+    """
+    S, V, _ = strand_pts.shape
+    pts  = strand_pts.reshape(-1, 3).unsqueeze(0)   # (1, S*V, 3)
+    head = head_vertices.unsqueeze(0)               # (1, H,   3)
+
+    knn_out = knn_points(pts, head, K=1, return_nn=False)  # KNNOutputs
+    dists   = knn_out.dists.squeeze()                      # (S*V,)
+
+    # hinge: zero loss when outside, linear penalty inside the margin
+    penetration = torch.relu(margin - dists)
+    return penetration.mean()
+
+def strand_repulsion_loss(
+    strand_pts: torch.Tensor,   # (S, V, 3)  all vertices in scene space
+    k:          int = 3,        # nearest neighbours to consider
+    step:       int = 4,        # subsample every `step` vertices along strand
+    safe_dist: float = 0.003    # metres; 3 mm tube radius
+) -> torch.Tensor:
+    """
+    Penalise strands whose *samples along the fibre* come closer than
+    `safe_dist` to another strand.
+
+    Strategy
+    --------
+    1. Take every `step`‑th vertex along each strand (mid‑points work too).
+    2. K‑NN in that sample cloud (pooled across all strands, self‑matches
+       ignored).
+    3. Hinge loss on distances below `safe_dist`.
+    """
+    device = strand_pts.device
+    S, V, _ = strand_pts.shape
+
+    # 1) subsample along each strand to reduce O(N^2)
+    sampled = strand_pts[:, ::step].reshape(-1, 3).unsqueeze(0)  # (1, P, 3)
+
+    # 2) KNN (returns squared distances)
+    d2, _ = knn_points(sampled, sampled, K=k + 1, return_nn=False)  # (1, P, k+1)
+    d2 = d2[:, :, 1:]  # drop self‑distance
+
+    # 3) hinge on safe distance
+    safe2 = safe_dist ** 2
+    loss = torch.relu(safe2 - d2).mean()
+    return loss
+
+def strand_repulsion_loss(
+    strand_pts: torch.Tensor,  # (S, V, 3)
+    k: int = 8,
+    step: int = 2,
+    safe_dist: float = 0.0025
+) -> torch.Tensor:
+    """
+    Repel nearby strand vertices from each other.
+    Samples every `step`-th point along each strand, finds its k nearest
+    neighbours (excluding itself) and applies a hinge loss if closer than
+    safe_dist.
+
+    Args:
+        strand_pts: (S, V, 3) all strand control points
+        k         : number of neighbours per sample
+        step      : sampling interval along each strand
+        safe_dist : minimum allowed distance
+
+    Returns:
+        scalar repulsion loss
+    """
+    S, V, _ = strand_pts.shape
+    # flatten and subsample
+    pts = strand_pts.reshape(-1, 3)                   # (S*V, 3)
+    sampled = pts[::step].unsqueeze(0)                # (1, P, 3)
+
+    # run knn (now returns a KNNOutputs object)
+    knn_out = knn_points(sampled, sampled, K=k+1, return_nn=False)
+    # distances shape: (1, P, k+1)
+    d2 = knn_out.dists.squeeze(0)                     # → (P, k+1)
+
+    # drop the first neighbour (self, distance=0)
+    neigh2 = d2[:, 1:]                                # (P, k)
+
+    # convert squared‐distance to euclidean
+    dist = torch.sqrt(neigh2 + 1e-12)
+
+    # hinge: zero when outside safe_dist, linear penalty when inside
+    penal = F.relu(safe_dist - dist)
+
+    # average over all samples & neighbours
+    return penal.mean()

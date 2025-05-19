@@ -21,6 +21,25 @@ import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 
+def export_strands_as_obj(strands: torch.Tensor, path: str):
+    """
+    strands: (S, V, 3) float32 tensor of your strand vertices
+    """
+    S, V, _ = strands.shape
+    verts = strands.reshape(-1,3).cpu().numpy()
+    with open(path, 'w') as f:
+        f.write("# hair strands as polylines\n")
+        # write all vertices
+        for x,y,z in verts:
+            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        # now write a polyline per strand
+        idx = 1
+        for s in range(S):
+            f.write(f"g strand_{s:04d}\n")           # new Blender object/group
+            indices = [str(i) for i in range(idx, idx+V)]
+            f.write("l " + " ".join(indices) + "\n")
+            idx += V
+
 def convert_normal_to_camera_space(normals, extrinsic_rot, intrinsics):
     # Use the inverse transpose of the extrinsic matrix for transforming the normals
     inverse_transpose_rotation = torch.inverse(extrinsic_rot).T

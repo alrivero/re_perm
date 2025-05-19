@@ -1,3 +1,6 @@
+*obj
+wandb
+
 dataset
 metrical-tracker
 **/__pycache__

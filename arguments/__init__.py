@@ -77,8 +77,8 @@ class OptimizationParams(ParamGroup):
         self.iterations = 600_000
         self.theta_warmup = 20000
 
-        self.perm_lr_init = 0.0075
-        self.perm_lr_final = 0.001
+        self.perm_lr_init = 0.001
+        self.perm_lr_final = 0.0005
         self.perm_lr_delay_mult = 0.01
         self.perm_lr_max_steps = 300_000
 
@@ -89,21 +89,18 @@ class OptimizationParams(ParamGroup):
 
         lr_coef = 1
         self.feature_lr = 0.0025*lr_coef
-        self.opacity_lr = 0.05*lr_coef
+        self.opacity_lr = 0.01*lr_coef
         self.scaling_lr = 0.0001*lr_coef
         self.rotation_lr = 0.005*lr_coef
         self.percent_dense = 0.01
 
-        self.lambda_huber = 1.0
-        self.lambda_orient = 1.0
-        self.lambda_length = 1.0
         self.lambda_neighbor_orient = 1.0
         self.max_strand_len = 0.22
         self.delta_strand_len = 0.01
         self.k_neigh = 8
 
-        self.lambda_huber = 10.0
-        self.lambda_seg = 1.0
+        self.lambda_huber = 400.0
+        self.lambda_seg = 1000.0
         self.lambda_orient = 10.0
         self.lambda_len = 100.0
         self.lambda_neigh = 50.0
@@ -111,9 +108,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_ori_match = 1e2
         self.lambda_oblong = 1e9
         self.lambda_len_consist = 1e11
-        self.lambda_bend = 1e7
+        self.lambda_bend = 5e7
         self.lambda_smooth_scale = 1e8
-        self.lambda_depth = 1.0
+        self.lambda_depth = 100.0
+        self.lambda_head_col = 0.0
+        self.lambda_strand_rep = 10.0
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000

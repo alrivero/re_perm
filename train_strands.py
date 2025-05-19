@@ -7,7 +7,7 @@ import datetime as dt
 
 try:
     import wandb
-    _use_wandb = False
+    _use_wandb = True
 except ModuleNotFoundError:
     print("[wandb] not found – continuing without online logging.")
     _use_wandb = False
@@ -21,7 +21,7 @@ from scene import Scene_mica
 from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.general_utils import save_tensor_to_ply
+from utils.general_utils import save_tensor_to_ply, export_strands_as_obj
 from utils.loss_utils import (
     huber_loss,
     orientation_loss,
@@ -34,7 +34,9 @@ from utils.loss_utils import (
     bending_loss,
     neighbor_scale_smoothness_loss,
     aligned_depth_loss,
-    orientation_loss_kernel
+    orientation_loss_kernel,
+    head_collision_loss,
+    strand_repulsion_loss
 )
 
 STRAND_VERTEX_COUNT = 50    # same as in GaussianPerm
@@ -120,7 +122,7 @@ if __name__ == "__main__":
         lpt.perm_path,
         lpt.obj_head_path,
         scalp_vertex_idxs=scalp_mask,
-        scalp_bounds=[0.1870 * sb, 0.8018 * (1 + (1 - sb)), 0.4011 * sb, 0.8047 * (1 + (1 - sb))],
+        scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047],
         mesh_scale=100.0
     ).to(args.device)
 
@@ -134,11 +136,10 @@ if __name__ == "__main__":
     gaussians.roots = gaussians.roots.to(args.device)
     gaussians.training_setup(opt)
 
-    # --- freeze theta during warm‑up -------------------------------------
-    gaussians.beta.requires_grad_(False)
-    for g in gaussians.optimizer.param_groups:
-        if g["name"] == "beta":
-            g["lr"] = 0.0
+    # --- freeze during warm‑up -------------------------------------
+    # for g in gaussians.optimizer.param_groups:
+    #     if g["name"] == "opacity" or g["name"] == "f_dc" or g["name"] == "f_rest":
+    #         g["lr"] = 0.0
 
     deform_model = PermDeformModel(perm, args.device).to(args.device)
     deform_model.training_setup()
@@ -169,11 +170,10 @@ if __name__ == "__main__":
         if it % 500 == 0:
             gaussians.oneupSHdegree()
 
-        if it == opt.theta_warmup + 1:
-            gaussians.beta.requires_grad_(True)
-            for g in gaussians.optimizer.param_groups:
-                if g["name"] == "beta":
-                    g["lr"] = opt.perm_lr_init      # restore normal LR
+        # if it == opt.theta_warmup + 1:
+        #     for g in gaussians.optimizer.param_groups:
+        #         if g["name"] == "opacity" or g["name"] == "f_dc" or g["name"] == "f_rest":
+        #             g["lr"] = 0.0
 
         if not viewpoint_stack:
             viewpoint_stack = scene.getCameras().copy()
@@ -206,51 +206,49 @@ if __name__ == "__main__":
         gt_img  = gt_img * alpha + bg_image * (1 - alpha)
 
         loss_h   = huber_loss(img_render, gt_img, alpha, delta=0.1, reduction="mean")
-        loss_seg = huber_loss(img_segment, alpha, torch.ones_like(alpha), delta=0.1, reduction="mean")
+        if it <= opt.theta_warmup:
+            loss_seg = huber_loss(img_segment, alpha, alpha, delta=0.1, reduction="mean")
+        else:
+            loss_seg = huber_loss(img_segment, (alpha == 1).float(), torch.ones_like(alpha), delta=0.1, reduction="mean")
 
         strand_pts = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
+
+
         loss_o             = orientation_loss(cam, gaussians, alpha, orient)
         loss_len           = strand_length_loss(strand_pts, L_max=opt.max_strand_len, delta=opt.delta_strand_len)
         loss_nei           = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], k=opt.k_neigh)
-        loss_out           = outside_opacity_loss(cam, gaussians, alpha)
-        loss_ori_match     = torch.tensor(0.0).to(args.device) # Not used
-        loss_oblong        = oblong_shape_loss_from_strands_loss(strand_pts, gaussians)
-        loss_len_consist   = length_consistency_loss_from_strands_loss(strand_pts, gaussians)
         loss_bend          = bending_loss(strand_pts)
-        loss_smooth_scale  = neighbor_scale_smoothness_loss(strand_pts, gaussians)
-        loss_depth, depth_rescaled = aligned_depth_loss(depth_pred, depth_gt, (alpha > 0.5)[0])
+        loss_depth, depth_rescaled = aligned_depth_loss(depth_pred, depth_gt, (depth_gt > 0.0).float())
+        loss_head_col      = torch.tensor(0.0).to(args.device) # head_collision_loss(strand_pts, gaussians.get_roots_xyz / 100, margin=0.0015)
+        loss_strand_rep    = torch.tensor(0.0).to(args.device) # strand_repulsion_loss(strand_pts, k=8, step=2, safe_dist=0.0025)
 
         if it <= opt.theta_warmup:
             lambda_huber        = 0.0
-            lambda_neigh        = 0.0
+            lambda_seg          = 30000.0
+            lambda_depth        = 420.0
         else:
             lambda_huber        = opt.lambda_huber
-            lambda_neigh        = opt.lambda_neigh
+            lambda_seg          = opt.lambda_seg
+            lambda_depth        = opt.lambda_depth
+
+        lambda_neigh        = opt.lambda_neigh
         lambda_orient       = opt.lambda_orient
-        lambda_seg           = opt.lambda_seg
-        lambda_len           = opt.lambda_len
-        lambda_out           = opt.lambda_out
-        lambda_ori_match     = opt.lambda_ori_match
-        lambda_oblong        = opt.lambda_oblong
-        lambda_len_consist   = opt.lambda_len_consist
-        lambda_bend          = opt.lambda_bend
-        lambda_smooth_scale  = opt.lambda_smooth_scale
-        lambda_depth         = opt.lambda_depth
+        lambda_len          = opt.lambda_len
+        lambda_bend         = opt.lambda_bend
+        lambda_head_col     = opt.lambda_head_col
+        lambda_strand_rep   = opt.lambda_strand_rep
 
         w_huber         = lambda_huber        * loss_h.item()
-        w_seg           = lambda_seg          * loss_seg.item()
-        w_orient        = lambda_orient       * loss_o.item()
-        w_len           = lambda_len          * loss_len.item()
         w_neigh         = lambda_neigh        * loss_nei.item()
-        w_out           = lambda_out          * loss_out.item()
-        w_ori_match     = lambda_ori_match    * loss_ori_match.item()
-        w_oblong        = lambda_oblong       * loss_oblong.item()
-        w_len_consist   = lambda_len_consist  * loss_len_consist.item()
+        w_orient        = lambda_orient       * loss_o.item()
+        w_seg           = lambda_seg          * loss_seg.item()
+        w_len           = lambda_len          * loss_len.item()
         w_bend          = lambda_bend         * loss_bend.item()
-        w_smooth_scale  = lambda_smooth_scale * loss_smooth_scale.item()
         w_depth         = lambda_depth        * loss_depth.item()
+        w_head_col      = lambda_head_col     * loss_head_col.item()
+        w_strand_rep    = lambda_strand_rep   * loss_strand_rep.item()
 
         loss = (
             lambda_huber        * loss_h +
@@ -258,13 +256,10 @@ if __name__ == "__main__":
             lambda_orient       * loss_o +
             lambda_len          * loss_len +
             lambda_neigh        * loss_nei +
-            lambda_out          * loss_out +
-            lambda_ori_match    * loss_ori_match +
-            lambda_oblong       * loss_oblong +
-            lambda_len_consist  * loss_len_consist +
             lambda_bend         * loss_bend +
-            lambda_smooth_scale * loss_smooth_scale +
-            lambda_depth        * loss_depth
+            lambda_depth        * loss_depth +
+            lambda_head_col     * loss_head_col +
+            lambda_strand_rep   * loss_strand_rep
         )
 
         loss.backward()
@@ -284,13 +279,10 @@ if __name__ == "__main__":
                 f"orient {loss_o:.4f} (w {w_orient:.4f})  "
                 f"len {loss_len:.4f} (w {w_len:.4f})  "
                 f"neigh {loss_nei:.4f} (w {w_neigh:.4f})  "
-                f"out {loss_out:.4f} (w {w_out:.4f})  "
-                f"ori_match {loss_ori_match:.4f} (w {w_ori_match:.4f})  "
-                f"oblong {loss_oblong:.4f} (w {w_oblong:.4f})  "
-                f"len_consist {loss_len_consist:.4f} (w {w_len_consist:.4f})  "
                 f"bend {loss_bend:.4f} (w {w_bend:.4f})  "
-                f"smooth_scale {loss_smooth_scale:.4f} (w {w_smooth_scale:.4f})  "
                 f"depth {loss_depth:.4f} (w {w_depth:.4f})  "
+                f"head_col {loss_head_col:.4f} (w {w_head_col:.4f})  "
+                f"strand_rep {loss_strand_rep:.4f} (w {w_strand_rep:.4f})  "
                 f"→ total {loss.item():.4f}"
             )
             if _use_wandb:
@@ -301,13 +293,10 @@ if __name__ == "__main__":
                     "loss/orient":       loss_o.item(),
                     "loss/len":          loss_len.item(),
                     "loss/neigh":        loss_nei.item(),
-                    "loss/out":          loss_out.item(),
-                    "loss/ori_match":    loss_ori_match.item(),
-                    "loss/oblong":       loss_oblong.item(),
-                    "loss/len_consist":  loss_len_consist.item(),
                     "loss/bend":         loss_bend.item(),
-                    "loss/smooth_scale": loss_smooth_scale.item(),
                     "loss/depth":        loss_depth.item(),
+                    "loss/head_col":     loss_head_col.item(),
+                    "loss/strand_rep":   loss_strand_rep.item(),
                     "iter":              it,
                 }, step=it)
 
@@ -316,11 +305,39 @@ if __name__ == "__main__":
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
-            depth_canvas = make_side_by_side(depth_gt[None].expand(3, -1, -1), depth_rescaled[None].expand(3, -1, -1), args.image_res)
+            depth_canvas = make_side_by_side(depth_gt[None].expand(3, -1, -1), (depth_rescaled * (depth_gt > 0.0).float())[None].expand(3, -1, -1), args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_depth.png"), depth_canvas[:, :, ::-1])
 
-            save_tensor_to_ply(verts_final, os.path.join(train_dir, f"{it:06d}.ply"))
-            save_tensor_to_ply(guide_final, os.path.join(train_dir, f"guide_{it:06d}.ply"))
+        if it % 2000 == 0 or it == 1:
+             # ----------------------------------------------------------- #
+            # 1. decide which strands are “opaque enough”
+            # ----------------------------------------------------------- #
+            opacity_seg = gaussians.get_opacity.squeeze(-1).detach()          # (M,)
+            seg_per_strand = opacity_seg.view(gaussians.num_strands,
+                                              STRAND_VERTEX_COUNT - 1)        # (S,V‑1)
+            strand_alpha = seg_per_strand.mean(dim=1)                         # (S,)
+
+            keep_thresh = 0.0          # keep strands with ≥ 60 % mean opacity
+            keep_mask   = strand_alpha > keep_thresh                         # (S,)
+
+            # ----------------------------------------------------------- #
+            # 2. build sparse copies *only* for the kept strands
+            # ----------------------------------------------------------- #
+            sparse_strands = strand_pts[keep_mask][:, ::3, :].detach()        # (S_keep, ⌈V/3⌉, 3)
+            sparse_guide = guide_pts[:, ::3, :].detach()
+
+            # guard against empty selections
+            if sparse_strands.numel() > 0:
+                export_strands_as_obj(
+                    sparse_strands,
+                    os.path.join(train_dir, f"{it:06d}.obj")
+                )
+            if sparse_guide.numel() > 0:
+                export_strands_as_obj(
+                    sparse_guide,
+                    os.path.join(train_dir, f"guide_{it:06d}.obj")
+                )
+
             if _use_wandb:
                 wandb.log({"preview": wandb.Image(canvas[:, :, ::-1])}, step=it)
 
