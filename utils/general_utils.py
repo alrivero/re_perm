@@ -21,6 +21,22 @@ import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 
+def to_image_np(t: torch.Tensor) -> np.ndarray:
+    """
+    Convert a (C,H,W) or (B,C,H,W) torch tensor in [0,1] to a uint8 H×W×3 array.
+    """
+    t = t.detach().clamp(0, 1)
+    if t.dim() == 4:                # (B,C,H,W) → take first
+        t = t[0]
+    if t.dim() == 3:                # (C,H,W)
+        arr = t.permute(1, 2, 0).cpu().numpy()          # → (H,W,C)
+    elif t.dim() == 2:              # (H,W) mono depth / mask
+        g = t.cpu().numpy()
+        arr = np.stack([g, g, g], axis=-1)
+    else:
+        raise RuntimeError(f"Unsupported tensor shape {tuple(t.shape)}")
+    return (arr * 255.0).astype(np.uint8)
+
 def export_strands_as_obj(strands: torch.Tensor, path: str):
     """
     strands: (S, V, 3) float32 tensor of your strand vertices
