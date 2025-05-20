@@ -58,7 +58,7 @@ class Scene_mica:
             range_down = self.N_frames - eval_num
             range_up = self.N_frames
 
-        for frame_id in tqdm(range(range_down, range_up)):
+        for frame_id in tqdm(range(0, 1435)):
             image_name_mica = str(frame_id).zfill(5) # obey mica tracking
             image_name_ori = str(frame_id+frame_delta).zfill(5)
             ckpt_path = os.path.join(mica_ckpt_dir, image_name_mica+'.frame')
