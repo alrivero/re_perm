@@ -213,7 +213,202 @@ def orientation_loss_kernel(
     finite = torch.isfinite(loss_per_edge)
     return loss_per_edge[finite].mean() if finite.any() else torch.tensor(0.0, device=device)
 
+import torch, math, random
+import torch.nn.functional as F
+import matplotlib
+import matplotlib.colors as mcolors
+import numpy as np
+
+# ─── tiny util ─────────────────────────────
+def _angle_to_rgb(dx, dy):
+    hue = (torch.atan2(dy, dx) + math.pi) / (2 * math.pi)
+    rgb = torch.tensor(mcolors.hsv_to_rgb(
+            torch.stack([hue, torch.ones_like(hue), torch.ones_like(hue)], 0)
+                  .permute(1, 2, 0).cpu().numpy()), device=dx.device)
+    return rgb.permute(2, 0, 1)          # (3,H,W)
+
+def _draw_line(canvas, x0, y0, x1, y1, color):
+    H, W = canvas.shape[1:]
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        if 0 <= x0 < W and 0 <= y0 < H:
+            canvas[0, y0, x0] = color[0]
+            canvas[1, y0, x0] = color[1]
+            canvas[2, y0, x0] = color[2]
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy; x0 += sx
+        if e2 < dx:
+            err += dx; y0 += sy
+
+# ─── debug-capable loss ────────────────────
+def orientation_loss_v2_debug(
+        viewpoint_cam,
+        gaussians,
+        hair_mask: torch.Tensor,      # (1,H,W)
+        orient_map:  torch.Tensor,    # (C,H,W) or (H,W,C)
+        mask_thresh: float = 0.5,
+        debug: bool = False,
+        max_arrows: int = 300):
+
+    device = gaussians.get_xyz.device
+
+    # channel split ------------------------------------------------------
+    if orient_map.dim() == 3 and orient_map.size(0) == 3:      # (C,H,W)
+        m, g, b = orient_map[0], orient_map[1], orient_map[2]
+    elif orient_map.dim() == 3 and orient_map.size(2) == 3:    # (H,W,C)
+        m, g, b = orient_map[..., 0], orient_map[..., 1], orient_map[..., 2]
+    else:
+        return (torch.tensor(0., device=device), None) if debug else torch.tensor(0., device=device)
+
+    dx = g * 2.0 - 1.0
+    dy = b * 2.0 - 1.0
+    mask_pix = m > mask_thresh
+    H, W = m.shape[-2:]
+
+    # project ------------------------------------------------------------
+    u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
+    if u.numel() == 0:
+        return (torch.tensor(0., device=device), None) if debug else torch.tensor(0., device=device)
+    idx_g = in_view.nonzero(as_tuple=False).squeeze(1)
+
+    on_hair = mask_pix[v, u]
+    if on_hair.sum() == 0:
+        return (torch.tensor(0., device=device), None) if debug else torch.tensor(0., device=device)
+
+    u, v  = u[on_hair], v[on_hair]
+    idx_g = idx_g[on_hair]
+
+    # gt / pred dirs -----------------------------------------------------
+    gt_vec2d = F.normalize(torch.stack([dx[v, u], dy[v, u]], -1), dim=-1)
+
+    R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation)
+    y_world  = R_local[:, :, 1]
+    dirs_cam = convert_normal_to_camera_space(
+                  y_world[idx_g],
+                  viewpoint_cam.w2c[:3, :3],
+                  viewpoint_cam.projection_matrix[:3, :3])[:, :2]
+    dirs_2d  = F.normalize(dirs_cam, dim=-1)
+
+    # cosine loss --------------------------------------------------------
+    inv_dot = 1.0 - (dirs_2d * gt_vec2d).sum(-1).clamp(-1., 1.)
+    scales   = gaussians.get_scaling
+    weight   = torch.exp(-(scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6))
+    loss = (weight * inv_dot).mean()
+
+    # fast exit if no debug ---------------------------------------------
+    if not debug:
+        return loss
+
+    # ---- build overlay -------------------------------------------------
+    canvas = torch.zeros(3, H, W, device=device)
+    canvas[0] = 0.2; canvas[1] = 0.1; canvas[2] = 0.3   # purple bg
+    canvas = canvas * (1 - hair_mask[0]) + hair_mask[0] * 0.15
+
+    orient_rgb = _angle_to_rgb(dx, dy) * hair_mask[0]
+    canvas = (canvas + orient_rgb).clamp(0, 1)
+
+    # white dots: vectorised assignment
+    canvas[:, v.long(), u.long()] = 1.0
+
+    # arrow subset -------------------------------------------------------
+    M = u.numel()
+    if M > max_arrows:
+        keep_idx = torch.randperm(M, device=device)[:max_arrows]
+        u_draw   = u[keep_idx]; v_draw = v[keep_idx]
+        g_sub    = gt_vec2d[keep_idx]; p_sub = dirs_2d[keep_idx]
+    else:
+        u_draw, v_draw, g_sub, p_sub = u, v, gt_vec2d, dirs_2d
+
+    step = 4
+    for uu_t, vv_t, gvec, pvec in zip(u_draw, v_draw, g_sub, p_sub):
+        uu, vv = int(uu_t.item()), int(vv_t.item())
+        # GT arrow (green)
+        _draw_line(canvas, uu, vv,
+                   int(round(uu + gvec[0].item()*step)),
+                   int(round(vv + gvec[1].item()*step)),
+                   color=(0,1,0))
+        # Pred arrow (cyan)
+        _draw_line(canvas, uu, vv,
+                   int(round(uu + pvec[0].item()*step)),
+                   int(round(vv + pvec[1].item()*step)),
+                   color=(0,1,1))
+
+    debug_np = (canvas.permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
+    return loss, debug_np
+
+
 def orientation_loss(
+        viewpoint_cam,
+        gaussians,
+        hair_mask: torch.Tensor,      # (1,H,W) float 0-1
+        orient_map:  torch.Tensor,    # (C,H,W) or (H,W,C) in HairStep format
+        mask_thresh: float = 0.5):
+    """
+    HairStep strand-map:
+        R = mask  M(x)
+        G = (dx + 1)/2
+        B = (dy + 1)/2
+
+    Loss: 1 − cosΔ over pixels where mask > mask_thresh.
+    """
+
+    device = gaussians.get_xyz.device
+
+    # 1) arrange channels ------------------------------------------------
+    if orient_map.dim() == 3 and orient_map.size(0) == 3:      # (C,H,W)
+        m, g, b = orient_map[0], orient_map[1], orient_map[2]
+    elif orient_map.dim() == 3 and orient_map.size(2) == 3:    # (H,W,C)
+        m, g, b = orient_map[..., 0], orient_map[..., 1], orient_map[..., 2]
+    else:
+        return torch.tensor(0., device=device)
+
+    dx = g * 2.0 - 1.0
+    dy = b * 2.0 - 1.0
+    mask_pix = m > mask_thresh
+
+    H, W = m.shape[-2:]
+
+    # 2) project Gaussians ----------------------------------------------
+    u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
+    if u.numel() == 0:
+        return torch.tensor(0., device=device)
+    idx_g = in_view.nonzero(as_tuple=False).squeeze(1)
+
+    on_hair = mask_pix[v, u]
+    if on_hair.sum() == 0:
+        return torch.tensor(0., device=device)
+
+    u, v    = u[on_hair], v[on_hair]
+    idx_g   = idx_g[on_hair]
+
+    # 3) GT 2-D unit vectors --------------------------------------------
+    gt_vec2d = F.normalize(torch.stack([dx[v, u], dy[v, u]], -1), dim=-1)
+
+    # 4) predicted dir ---------------------------------------------------
+    R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (N,3,3)
+    y_world  = R_local[:, :, 1]                                       # (N,3)
+    dirs_cam = convert_normal_to_camera_space(
+                   y_world[idx_g],
+                   viewpoint_cam.w2c[:3, :3],
+                   viewpoint_cam.projection_matrix[:3, :3])[:, :2]
+    dirs_2d  = F.normalize(dirs_cam, dim=-1)
+
+    # 5) cosine loss, optional scale weight -----------------------------
+    inv_dot = 1.0 - (dirs_2d * gt_vec2d).sum(-1).clamp(-1., 1.)  # (M,)
+
+    scales      = gaussians.get_scaling
+    scale_ratio = (scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6)
+    weight      = torch.exp(-scale_ratio)
+
+    return (weight * inv_dot).mean()
+
+def orientation_loss_old(
         viewpoint_cam,
         gaussians,
         hair_mask,          # (1,H,W) float {0,1}
@@ -491,6 +686,51 @@ def neighbor_scale_smoothness_loss(strand_pts: torch.Tensor, perm) -> torch.Tens
     return (ds.pow(2).mean())
 
 def aligned_depth_loss(
+    D_pred: torch.Tensor,      # (H,W) inverted depth, 0 = bg
+    D_gt:   torch.Tensor,      # (H,W) GT depth [0,1] (near→0, far→1)
+    mask:   torch.Tensor,      # (H,W) soft mask 0-1
+    shrink_thr:float = 0.9,
+    q_lo: float = 0.02, q_hi: float = 0.98,
+    halo_kernel: int = 11,
+    mode: str = "l2"):
+
+    device = D_pred.device
+
+    # A) build *core* mask (eroded) via average-pool  --------------------
+    if mask.dim() == 3:
+        m = (mask > shrink_thr).any(0).float()   # (H,W)
+    else:
+        m = (mask > shrink_thr).float()
+
+    pad = halo_kernel // 2
+    m_core = (F.avg_pool2d(m[None,None], halo_kernel, 1, pad)[0,0] > 0.99)
+    if m_core.sum() < 10:
+        return torch.tensor(0., device=device), torch.zeros_like(D_pred)
+
+    # B) robust percentiles on core mask --------------------------------
+    vals = D_pred[m_core & (D_pred != 0)]
+    near = torch.quantile(vals, q_lo)
+    far  = torch.quantile(vals, q_hi)
+
+    D_norm = (D_pred - near) / (far - near + 1e-6)
+    D_norm = 1.0 - D_norm.clamp(0,1)             # invert (near=0)
+
+    # C) loss over *weighted* region ------------------------------------
+    #   core pixels weight 1, halo fades linearly with avg_pool
+    halo_conf = F.avg_pool2d(m[None,None], halo_kernel, 1, pad)[0,0]
+    weights = halo_conf.clamp(0,1)
+
+    if mode.lower() == "l2":
+        diff = (D_norm - D_gt)**2
+    elif mode.lower() == "l1":
+        diff = torch.abs(D_norm - D_gt)
+    else:
+        raise ValueError("mode must be 'l1' or 'l2'")
+
+    loss = (weights * diff).sum() / weights.sum()
+    return loss, D_norm
+
+def aligned_depth_loss_old(
     D_pred: torch.Tensor,      # (H,W) raw predicted depth (world units)
     D_gt:   torch.Tensor,      # (H,W) ground-truth normalized depth [0,1]
     mask:   torch.Tensor,      # (H,W) hair mask ∈{0,1}

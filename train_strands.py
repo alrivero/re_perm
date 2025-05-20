@@ -24,7 +24,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils import save_tensor_to_ply, export_strands_as_obj
 from utils.loss_utils import (
     huber_loss,
-    orientation_loss,
+    orientation_loss_v2_debug,
     strand_length_loss,
     neighbour_orientation_loss,
     outside_opacity_loss,
@@ -214,9 +214,7 @@ if __name__ == "__main__":
         strand_pts = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
-
-
-        loss_o             = orientation_loss(cam, gaussians, alpha, orient)
+        loss_o             = orientation_loss_v2_debug(cam, gaussians, alpha, orient)
         loss_len           = strand_length_loss(strand_pts, L_max=opt.max_strand_len, delta=opt.delta_strand_len)
         loss_nei           = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], k=opt.k_neigh)
         loss_bend          = bending_loss(strand_pts)

@@ -56,17 +56,26 @@ def export_strands_as_obj(strands: torch.Tensor, path: str):
             f.write("l " + " ".join(indices) + "\n")
             idx += V
 
-def convert_normal_to_camera_space(normals, extrinsic_rot, intrinsics):
-    # Use the inverse transpose of the extrinsic matrix for transforming the normals
-    inverse_transpose_rotation = torch.inverse(extrinsic_rot).T
+def convert_normal_to_camera_space(
+        normals:        torch.Tensor,   # (N,3) world-space normals
+        extrinsic_rot:  torch.Tensor,   # (3,3) world→cam rotation  R_wc
+        intrinsics:     torch.Tensor,   # (3,3) K
+        eps: float = 1e-8):
+    """
+    Returns 2-D directions (d_u, d_v) in pixel units.
+    Works with autograd (no in-place ops).
+    """
+    # 1. rotate normal into camera coords
+    n_cam = normals @ extrinsic_rot.T             # (N,3)
 
-    # Transform the normals using the inverse transpose of the rotational part
-    transformed_normals = torch.matmul(normals, inverse_transpose_rotation.T)
-    transformed_normals /= transformed_normals[:, [2]]
+    # 2. divide by z (keep grads, avoid zero-div)
+    z = n_cam[:, 2:3].clamp_min(eps)
+    n_cam = n_cam / z                             # (N,3)   out-of-place
 
-    screen_normals = torch.matmul(transformed_normals, intrinsics.T)[:, :2]
+    # 3. apply intrinsics  (row-vector convention)  & keep x,y
+    d_uv = (n_cam @ intrinsics.T)[:, :2]          # (N,2)
 
-    return screen_normals
+    return d_uv
 
 def quaternion_to_rotation_matrix(quaternions):
     # Ensure quaternions tensor has the correct shape (n x 4)

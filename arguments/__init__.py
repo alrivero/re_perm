@@ -75,7 +75,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 600_000
-        self.theta_warmup = 20000
+        self.theta_warmup = 2
 
         self.perm_lr_init = 0.001
         self.perm_lr_final = 0.0005
@@ -110,7 +110,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_len_consist = 1e11
         self.lambda_bend = 5e7
         self.lambda_smooth_scale = 1e8
-        self.lambda_depth = 100.0
+        self.lambda_depth = 0.0
         self.lambda_head_col = 0.0
         self.lambda_strand_rep = 10.0
 
