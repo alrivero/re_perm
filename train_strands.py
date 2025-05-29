@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import lpips
 import datetime as dt
+import debug
 
 try:
     import wandb
@@ -21,7 +22,7 @@ from scene import Scene_mica
 from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.general_utils import save_tensor_to_ply, export_strands_as_obj
+from utils.general_utils import save_tensor_to_ply, export_strands_as_obj, export_strands_to_usd
 from utils.loss_utils import (
     huber_loss,
     orientation_loss_v2_debug,
@@ -36,10 +37,12 @@ from utils.loss_utils import (
     aligned_depth_loss,
     orientation_loss_kernel,
     head_collision_loss,
-    strand_repulsion_loss
+    strand_repulsion_loss,
+    sobel_loss,
+    filtered_opacity_penalty
 )
 
-STRAND_VERTEX_COUNT = 50    # same as in GaussianPerm
+STRAND_VERTEX_COUNT = 100    # same as in GaussianPerm
 
 
 # --------------------------------------------------------------------- #
@@ -72,6 +75,17 @@ def make_side_by_side(left: torch.Tensor, right: torch.Tensor, image_res: int) -
     canvas[:, :image_res] = left_np
     canvas[:, image_res:] = right_np
     return canvas
+
+def toggle_beta_trainable(gaussians, trainable: bool):
+    """
+    Sets β’s learning-rate to 0 and disables gradients when
+    `trainable=False`; restores both when `True`.
+    """
+    for pg in gaussians.optimizer.param_groups:
+        if pg.get("name") == "beta":
+            pg["lr"] = gaussians._beta_base_lr if trainable else 0.0
+
+    gaussians.beta.requires_grad_(trainable)
 
 # --------------------------------------------------------------------- #
 # main
@@ -125,6 +139,7 @@ if __name__ == "__main__":
         scalp_bounds=[0.1870, 0.8018, 0.4011, 0.8047],
         mesh_scale=100.0
     ).to(args.device)
+    perm = perm.eval()
 
     pseudo_roots = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0]
 
@@ -137,9 +152,7 @@ if __name__ == "__main__":
     gaussians.training_setup(opt)
 
     # --- freeze during warm‑up -------------------------------------
-    # for g in gaussians.optimizer.param_groups:
-    #     if g["name"] == "opacity" or g["name"] == "f_dc" or g["name"] == "f_rest":
-    #         g["lr"] = 0.0
+    toggle_beta_trainable(gaussians, trainable=False)   # lr = 0
 
     deform_model = PermDeformModel(perm, args.device).to(args.device)
     deform_model.training_setup()
@@ -165,21 +178,18 @@ if __name__ == "__main__":
         device=args.device
     )
 
+    all_cameras = scene.getCameras().copy()
     viewpoint_stack = None
     for it in range(first_iter + 1, opt.iterations + 1):
         if it % 500 == 0:
             gaussians.oneupSHdegree()
 
-        # if it == opt.theta_warmup + 1:
-        #     for g in gaussians.optimizer.param_groups:
-        #         if g["name"] == "opacity" or g["name"] == "f_dc" or g["name"] == "f_rest":
-        #             g["lr"] = 0.0
+        if it == opt.theta_warmup + 1:
+            toggle_beta_trainable(gaussians, trainable=True)   # lr = 0
 
         if not viewpoint_stack:
             viewpoint_stack = scene.getCameras().copy()
             random.shuffle(viewpoint_stack)
-            if len(viewpoint_stack) > 2000:
-                viewpoint_stack = viewpoint_stack[:2000]
         cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack) - 1))
         cam.load2device(args.device)
 
@@ -192,12 +202,16 @@ if __name__ == "__main__":
         }
 
         verts_final, guide_final, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
-        gaussians.update_xyz_rot_scale(verts_final, rot_delta, scale_coef)
+        strand_pts = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
+        gaussians.update_xyz_rot_scale(strand_pts, rot_delta, scale_coef)
 
-        render_pkg = render(cam, gaussians, ppt, background)
+        if it == first_iter + 1:
+            gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
+
+        render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size)
         img_render   = render_pkg["render"]
         img_segment  = render_pkg["segment"]
-        depth_pred   = render_pkg["depth"][0]
+        # depth_pred   = render_pkg["depth"][0]
 
         gt_img  = cam.original_image
         alpha   = cam.hair_mask
@@ -211,32 +225,32 @@ if __name__ == "__main__":
         else:
             loss_seg = huber_loss(img_segment, (alpha == 1).float(), torch.ones_like(alpha), delta=0.1, reduction="mean")
 
-        strand_pts = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
         loss_o             = orientation_loss_v2_debug(cam, gaussians, alpha, orient)
         loss_len           = strand_length_loss(strand_pts, L_max=opt.max_strand_len, delta=opt.delta_strand_len)
         loss_nei           = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], k=opt.k_neigh)
         loss_bend          = bending_loss(strand_pts)
-        loss_depth, depth_rescaled = aligned_depth_loss(depth_pred, depth_gt, (depth_gt > 0.0).float())
-        loss_head_col      = torch.tensor(0.0).to(args.device) # head_collision_loss(strand_pts, gaussians.get_roots_xyz / 100, margin=0.0015)
-        loss_strand_rep    = torch.tensor(0.0).to(args.device) # strand_repulsion_loss(strand_pts, k=8, step=2, safe_dist=0.0025)
+        loss_depth         = torch.tensor(0.0).to(args.device) # No depth
+        loss_head_col      = sobel_loss(img_render, gt_img, alpha) # head_collision_loss(strand_pts, gaussians.get_roots_xyz / 100, margin=0.0015)
+        loss_strand_rep    = filtered_opacity_penalty(gaussians) # strand_repulsion_loss(strand_pts, k=8, step=2, safe_dist=0.0025)
 
-        if it <= opt.theta_warmup:
-            lambda_huber        = 0.0
-            lambda_seg          = 30000.0
-            lambda_depth        = 420.0
-        else:
-            lambda_huber        = opt.lambda_huber
-            lambda_seg          = opt.lambda_seg
-            lambda_depth        = opt.lambda_depth
+        mu_theta = gaussians.theta_start.clone().to(args.device)  # no grad
+        mu_beta  = gaussians.beta_start.clone().to(args.device)
+        loss_theta_l2 = (gaussians.theta - mu_theta).pow(2).sum()
+        loss_beta_l2  = (gaussians.beta  - mu_beta).pow(2).sum()
 
+        lambda_huber        = opt.lambda_huber
+        lambda_seg          = opt.lambda_seg
+        lambda_depth        = opt.lambda_depth
         lambda_neigh        = opt.lambda_neigh
         lambda_orient       = opt.lambda_orient
         lambda_len          = opt.lambda_len
         lambda_bend         = opt.lambda_bend
         lambda_head_col     = opt.lambda_head_col
         lambda_strand_rep   = opt.lambda_strand_rep
+        lambda_theta_l2     = opt.lambda_theta_l2
+        lambda_beta_l2      = opt.lambda_beta_l2
 
         w_huber         = lambda_huber        * loss_h.item()
         w_neigh         = lambda_neigh        * loss_nei.item()
@@ -247,6 +261,8 @@ if __name__ == "__main__":
         w_depth         = lambda_depth        * loss_depth.item()
         w_head_col      = lambda_head_col     * loss_head_col.item()
         w_strand_rep    = lambda_strand_rep   * loss_strand_rep.item()
+        w_theta_l2      = lambda_theta_l2     * loss_theta_l2.item()
+        w_beta_l2       = lambda_beta_l2      * loss_beta_l2.item()
 
         loss = (
             lambda_huber        * loss_h +
@@ -257,10 +273,44 @@ if __name__ == "__main__":
             lambda_bend         * loss_bend +
             lambda_depth        * loss_depth +
             lambda_head_col     * loss_head_col +
-            lambda_strand_rep   * loss_strand_rep
+            lambda_strand_rep   * loss_strand_rep +
+            lambda_theta_l2     * loss_theta_l2 +
+            lambda_beta_l2      * loss_beta_l2
         )
 
+        gaussians.update_learning_rate(it)
         loss.backward()
+
+        # Densification
+        radii             = render_pkg["radii"]            #  (M,)  – add to renderer
+        visibility_filter = render_pkg["visibility_filter"]       #  (M,)  – add to renderer
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+
+        # track running ∥∇xy∥ statistics
+        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+        # densify / prune as long as we’re in the schedule window
+        if it < opt.densify_until_iter and it > opt.densify_from_iter \
+                                        and it % opt.densification_interval == 0:
+            size_threshold = 20 if it > opt.opacity_reset_interval else None
+            gaussians.densify_and_prune(
+                opt.densify_grad_threshold,           # gradient criterion
+                0.005,                                # min-opacity for pruning
+                scene.cameras_extent,                 # scene extent
+                size_threshold,                       # screen-size pruning
+                radii                                  # 2-D radii per Gaussian
+            )
+            gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
+
+        # periodic global opacity reset
+        # if it < opt.densify_until_iter and \
+        #     (it % opt.opacity_reset_interval == 0 or
+        #         (lpt.white_background and it == opt.densify_from_iter)):
+        #         gaussians.reset_opacity()
+
+        if it % 100 == 0 and it > opt.densify_until_iter:
+            if it < opt.iterations - 100:
+                gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
         with torch.no_grad():
             if it < opt.iterations:
@@ -281,7 +331,10 @@ if __name__ == "__main__":
                 f"depth {loss_depth:.4f} (w {w_depth:.4f})  "
                 f"head_col {loss_head_col:.4f} (w {w_head_col:.4f})  "
                 f"strand_rep {loss_strand_rep:.4f} (w {w_strand_rep:.4f})  "
-                f"→ total {loss.item():.4f}"
+                f"theta_l2 {loss_theta_l2:.4f} (w {w_theta_l2:.4f})  "
+                f"beta_l2 {loss_beta_l2:.4f} (w {w_beta_l2:.4f})  "
+                f"→ total {loss.item():.4f}     "
+                f"→ Gaussian Count {gaussians.num_gaussians}     "
             )
             if _use_wandb:
                 wandb.log({
@@ -295,7 +348,10 @@ if __name__ == "__main__":
                     "loss/depth":        loss_depth.item(),
                     "loss/head_col":     loss_head_col.item(),
                     "loss/strand_rep":   loss_strand_rep.item(),
+                    "loss/theta_l2":     loss_theta_l2.item(),
+                    "loss/beta_l2":      loss_beta_l2.item(),
                     "iter":              it,
+                    "num_gaussians": gaussians.num_gaussians
                 }, step=it)
 
         if it % 1000 == 0 or it == 1:
@@ -303,26 +359,17 @@ if __name__ == "__main__":
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
-            depth_canvas = make_side_by_side(depth_gt[None].expand(3, -1, -1), (depth_rescaled * (depth_gt > 0.0).float())[None].expand(3, -1, -1), args.image_res)
-            cv2.imwrite(os.path.join(train_dir, f"{it:06d}_depth.png"), depth_canvas[:, :, ::-1])
+            # depth_canvas = make_side_by_side(depth_gt[None].expand(3, -1, -1), (depth_rescaled * (depth_gt > 0.0).float())[None].expand(3, -1, -1), args.image_res)
+            # cv2.imwrite(os.path.join(train_dir, f"{it:06d}_depth.png"), depth_canvas[:, :, ::-1])
 
         if it % 2000 == 0 or it == 1:
-             # ----------------------------------------------------------- #
-            # 1. decide which strands are “opaque enough”
-            # ----------------------------------------------------------- #
-            opacity_seg = gaussians.get_opacity.squeeze(-1).detach()          # (M,)
-            seg_per_strand = opacity_seg.view(gaussians.num_strands,
-                                              STRAND_VERTEX_COUNT - 1)        # (S,V‑1)
-            strand_alpha = seg_per_strand.mean(dim=1)                         # (S,)
+            with torch.no_grad():
+                dense_roots = perm.hair_roots.sample_scalp_mesh(10000, pseudo_roots).to(args.device)
+                perm_out = perm(roots=dense_roots[None], theta=gaussians.theta, beta=gaussians.beta)
 
-            keep_thresh = 0.0          # keep strands with ≥ 60 % mean opacity
-            keep_mask   = strand_alpha > keep_thresh                         # (S,)
-
-            # ----------------------------------------------------------- #
-            # 2. build sparse copies *only* for the kept strands
-            # ----------------------------------------------------------- #
-            sparse_strands = strand_pts[keep_mask][:, ::3, :].detach()        # (S_keep, ⌈V/3⌉, 3)
-            sparse_guide = guide_pts[:, ::3, :].detach()
+                strands = perm_out["strands"].position[0]
+                sparse_strands = strands / 100.0
+                sparse_guide = guide_pts.detach()
 
             # guard against empty selections
             if sparse_strands.numel() > 0:
@@ -335,11 +382,12 @@ if __name__ == "__main__":
                     sparse_guide,
                     os.path.join(train_dir, f"guide_{it:06d}.obj")
                 )
+            # export_strands_to_usd(f"{train_dir}/{it:06d}.usda", strand_pts, gaussians)
 
             if _use_wandb:
                 wandb.log({"preview": wandb.Image(canvas[:, :, ::-1])}, step=it)
 
-        if it % 5000 == 0:
+        if it % 5000 == 0 or it == 1:
             torch.save((deform_model.capture(), gaussians.capture(), it),
                        os.path.join(model_dir, f"chkpnt_{it:06d}.pth"))
             print(f"\n[ITER {it}] Checkpoint saved.\n")

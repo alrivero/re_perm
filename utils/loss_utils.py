@@ -19,6 +19,77 @@ from pytorch3d.ops import knn_points
 from utils.general_utils import project_to_screen, quaternion_to_rotation_matrix, convert_normal_to_camera_space
 
 
+def filtered_opacity_penalty(gaussians):
+    """
+    Penalize Gaussians whose *effective* opacity (after the 3D mip filter)
+    falls below `thresh`.
+    """
+    # (M,1) tensor of α̃ = α * coef
+    eff_opacity = gaussians.get_opacity_with_3D_filter
+    
+    return ((1.0 - eff_opacity)**2).mean()
+
+# predefine on CPU; we’ll move to the right device at runtime
+_sobel_x = torch.tensor([[[[-1., 0., 1.],
+                           [-2., 0., 2.],
+                           [-1., 0., 1.]]]], dtype=torch.float32)
+_sobel_y = _sobel_x.transpose(2,3)
+
+def sobel_loss(render, gt, hair_mask=None, reduction="mean"):
+    """
+    render, gt: either [3,H,W] or [1,3,H,W] in [0..1]
+    hair_mask: [H,W] or [1,H,W] or [1,1,H,W]
+    """
+    # --- make batch+channel dims consistent ---
+    if render.dim() == 3:
+        render = render.unsqueeze(0)    # [1,3,H,W]
+    if gt.dim()     == 3:
+        gt     = gt.unsqueeze(0)
+    B, C, H, W = render.shape
+
+    # --- convert to grayscale luminance ---
+    # you can tweak these weights if you like
+    r = render[:,0:1]
+    g = render[:,1:2]
+    b = render[:,2:3]
+    render_gray = 0.299*r + 0.587*g + 0.114*b  # [1,1,H,W]
+
+    r = gt[:,0:1]
+    g = gt[:,1:2]
+    b = gt[:,2:3]
+    gt_gray     = 0.299*r + 0.587*g + 0.114*b
+
+    # --- move kernels to the right device/dtype ---
+    sobel_x = _sobel_x.to(render_gray.device).to(render_gray.dtype)
+    sobel_y = _sobel_y.to(render_gray.device).to(render_gray.dtype)
+
+    # --- convolve ---
+    rx = F.conv2d(render_gray, sobel_x, padding=1)  # [1,1,H,W]
+    ry = F.conv2d(render_gray, sobel_y, padding=1)
+    gx = F.conv2d(gt_gray,     sobel_x, padding=1)
+    gy = F.conv2d(gt_gray,     sobel_y, padding=1)
+
+    # --- gradient‐difference ‖G(render) − G(gt)‖₁ ---
+    diff = torch.abs(rx - gx) + torch.abs(ry - gy)   # [1,1,H,W]
+
+    # --- optionally mask to hair pixels ---
+    if hair_mask is not None:
+        # bring mask to [1,1,H,W]
+        m = hair_mask
+        if m.dim() == 2:
+            m = m.unsqueeze(0).unsqueeze(0)
+        elif m.dim() == 3:
+            m = m.unsqueeze(1)
+        diff = diff * m
+
+    # --- reduce ---
+    if reduction == "mean":
+        return diff.mean()
+    elif reduction == "sum":
+        return diff.sum()
+    else:
+        return diff
+
 def huber_loss(network_output, gt, mask, delta, reduction='mean'):
     """
     delta: the Huber‐transition point
@@ -296,10 +367,15 @@ def orientation_loss_v2_debug(
     dirs_2d  = F.normalize(dirs_cam, dim=-1)
 
     # cosine loss --------------------------------------------------------
-    inv_dot = 1.0 - (dirs_2d * gt_vec2d).sum(-1).clamp(-1., 1.)
-    scales   = gaussians.get_scaling
-    weight   = torch.exp(-(scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6))
-    loss = (weight * inv_dot).mean()
+    dot = (dirs_2d * gt_vec2d).sum(-1).clamp(-1., 1.)
+
+    # now collapse opposite directions by taking abs()
+    inv_dot = 1.0 - dot.abs()
+    loss = inv_dot.mean()
+
+    # scales   = gaussians.get_scaling
+    # weight   = torch.exp(-(scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6))
+    # loss = (weight * inv_dot).mean()
 
     # fast exit if no debug ---------------------------------------------
     if not debug:
@@ -690,7 +766,7 @@ def aligned_depth_loss(
     D_gt:   torch.Tensor,      # (H,W) GT depth [0,1] (near→0, far→1)
     mask:   torch.Tensor,      # (H,W) soft mask 0-1
     shrink_thr:float = 0.9,
-    q_lo: float = 0.02, q_hi: float = 0.98,
+    q_lo: float = 0.4, q_hi: float = 1.0,
     halo_kernel: int = 11,
     mode: str = "l2"):
 

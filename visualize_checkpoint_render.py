@@ -15,6 +15,7 @@ import torch, imageio
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib
+import debug
 
 from hair.hair_models          import Perm
 from scene.gaussian_perm       import GaussianPerm
@@ -23,6 +24,8 @@ from src.perm_deform_model     import PermDeformModel
 from gaussian_renderer         import render
 from arguments                 import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils       import to_image_np
+
+STRAND_VERTEX_COUNT = 100
 
 # ───────────────── depth normalisation ──────────────────
 def soft_percentile(x: torch.Tensor, mask: torch.Tensor,
@@ -36,8 +39,8 @@ def soft_percentile(x: torch.Tensor, mask: torch.Tensor,
 def depth_norm_shrink(d_pred: torch.Tensor,
                       mask:  torch.Tensor,
                       thr:   float = 0.9,
-                      q_lo:  float = 0.02,
-                      q_hi:  float = 0.98) -> torch.Tensor:
+                      q_lo:  float = 0.6,
+                      q_hi:  float = 1.0) -> torch.Tensor:
     if mask.dim() == 3:
         hard = (mask > thr).any(dim=0)
     else:
@@ -63,7 +66,39 @@ def depth_to_rgb(d_pred: torch.Tensor,
     return (rgb * 255).astype(np.uint8)
 
 # ───────────── orientation visualisation ───────────────
+
 def orient_to_rgb(orient: torch.Tensor) -> np.ndarray:
+    """
+    Collapse 360°→180°: treat θ and θ+180° as identical,
+    and map that half-circle to the first 180° of the HSV wheel.
+    """
+    if orient.dim() == 3 and orient.size(0) == 3:          
+        mask, g, b = orient
+    elif orient.dim() == 3 and orient.size(2) == 3:        
+        mask, g, b = orient[..., 0], orient[..., 1], orient[..., 2]
+    else:
+        return to_image_np(orient.mean(0, keepdim=True).expand(3, -1, -1))
+
+    dx = g * 2.0 - 1.0
+    dy = b * 2.0 - 1.0
+
+    # raw angle in [0,2π)
+    raw = torch.atan2(dy, dx) + math.pi
+
+    # fold into [0,π)
+    folded = torch.remainder(raw, math.pi)
+
+    # map to [0,0.5] for 180° of hue
+    hue = folded / (2 * math.pi)
+
+    sat = val = mask.clamp(0, 1)
+
+    hsv = torch.stack([hue, sat, val], 0)                 # (3,H,W)
+    hsv_np = hsv.permute(1, 2, 0).cpu().numpy()            # (H,W,3)
+    rgb   = matplotlib.colors.hsv_to_rgb(hsv_np)          # (H,W,3)
+    return (rgb * 255).astype(np.uint8)
+
+def orient_to_rgb_360(orient: torch.Tensor) -> np.ndarray:
     if orient.dim() == 3 and orient.size(0) == 3:          # (C,H,W)
         mask, g, b = orient
     elif orient.dim() == 3 and orient.size(2) == 3:        # (H,W,C)
@@ -114,6 +149,7 @@ def main():
     start_hair = np.load(lpt.emp_hair_path) if lpt.emp_hair_path else None
     gauss = GaussianPerm(perm, pseudo, start_hair, lpt.sh_degree).to(args.device)
     deform= PermDeformModel(perm, args.device).to(args.device)
+    
 
     m,g,_ = torch.load(args.start_checkpoint, map_location=args.device)
     deform.restore(m); gauss.restore(g,opt); gauss.eval(); deform.eval()
@@ -128,6 +164,7 @@ def main():
 
     vr, vs, vd, vcmp = [], [], [], []
 
+    load_filter = True
     for cam in tqdm(cams, desc="rendering"):
         cam.load2device(args.device)
 
@@ -135,29 +172,32 @@ def main():
                   T=torch.tensor(cam.T,device=args.device),
                   roots=gauss.get_roots_xyz[None],
                   theta=gauss.theta, beta=gauss.beta)
+        
         verts,_,rot_d,sc_c = deform.decode(gauss, cd)
-        gauss.update_xyz_rot_scale(verts, rot_d, sc_c)
+        strand_pts = verts.reshape(gauss.num_strands, STRAND_VERTEX_COUNT, 3)
+        gauss.update_xyz_rot_scale(strand_pts, rot_d, sc_c)
 
-        pkg = render(cam, gauss, ppt, bg)
+        if load_filter:
+            gauss.compute_3D_filter(cams, args.device)
+            load_filter = False
+
+        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size)
 
         pred_rgb = to_image_np(pkg["render"])
         pred_seg = to_image_np(pkg["segment"])
-        pred_d   = depth_to_rgb(pkg["depth"][0], cam.hair_mask, invert=True)  # ← invert
 
         gt_full = to_image_np(cam.original_image)
         mask_np = (cam.hair_mask[0].cpu().numpy() > 0.5)
         gt_rgb  = gt_full * mask_np[..., None]
         gt_seg  = to_image_np(cam.hair_mask.float())
-        gt_d    = depth_to_rgb(cam.depth_map, cam.hair_mask, invert=False)
 
         orient  = orient_to_rgb(cam.hair_orient) if hasattr(cam,"hair_orient") else gt_seg
 
-        vr.append(pred_rgb); vs.append(pred_seg); vd.append(pred_d)
+        vr.append(pred_rgb); vs.append(pred_seg)
 
         strip = np.concatenate([
             rgbify(gt_rgb),  rgbify(pred_rgb),
             rgbify(gt_seg),  rgbify(pred_seg),
-            rgbify(gt_d),    rgbify(pred_d),
             rgbify(orient)
         ], axis=1)
         vcmp.append(strip)

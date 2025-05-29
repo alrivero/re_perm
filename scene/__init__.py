@@ -24,6 +24,8 @@ class Scene_mica:
         alpha_folder = os.path.join(datadir, "alpha")
         hair_mask_folder = os.path.join(datadir, "hair_mask")
         hair_orient_folder = os.path.join(datadir, "hairstep")
+
+        self.cameras_extent = 0.547 # 3 times bouding sphere of flame mesh
         
         self.bg_image = torch.zeros((3, 512, 512))
         if white_background:
@@ -58,7 +60,7 @@ class Scene_mica:
             range_down = self.N_frames - eval_num
             range_up = self.N_frames
 
-        for frame_id in tqdm(range(0, 1435)):
+        for frame_id in tqdm(range(range_down, 1881)):
             image_name_mica = str(frame_id).zfill(5) # obey mica tracking
             image_name_ori = str(frame_id+frame_delta).zfill(5)
             ckpt_path = os.path.join(mica_ckpt_dir, image_name_mica+'.frame')

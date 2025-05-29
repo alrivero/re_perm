@@ -383,7 +383,8 @@ class HairRoots(nn.Module):
 
         # 3a) deduplicate and clip the snapped roots
         unique_roots = np.unique(snapped_pts, axis=0).astype(np.float32)
-        clipped      = unique_roots[:num_samples]
+        np.random.shuffle(unique_roots)
+        clipped = unique_roots[:num_samples]
         pts_list     = [clipped]
 
         # 3b) if we need more, sample uniformly on that submesh

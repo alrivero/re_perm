@@ -15,12 +15,16 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_perm import GaussianPerm
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
+
+    if subpixel_offset is None:
+        subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device=pc.roots.device)
+    kernel_size = torch.tensor(kernel_size).to(pc.roots.device)
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -38,6 +42,8 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        subpixel_offset=subpixel_offset,
         bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
@@ -52,7 +58,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = pc.get_opacity_with_3D_filter
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -62,7 +68,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
+        scales = pc.get_scaling_with_3D_filter
         rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
@@ -75,7 +81,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb, 0.0)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             shs = pc.get_features
     else:
@@ -85,7 +91,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     # opacity = torch.ones_like(opacity)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii= rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -101,6 +107,8 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        subpixel_offset=subpixel_offset,
         bg=torch.zeros_like(bg_color).to(bg_color.device),
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
@@ -113,7 +121,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     colors_precomp = torch.ones_like(means3D)
-    seg_image, _, _ = rasterizer(
+    seg_image, _= rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,
@@ -130,4 +138,4 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "depth": depth}
+            "depth": None}

@@ -56,7 +56,6 @@ class PermDeformModel(nn.Module):
         perm_out = self.perm(roots=roots, theta=theta, beta=beta)
 
         strands = perm_out["strands"].position[0]
-        strands = strands[:, ::2]
         N, C, _ = strands.shape
         strands = strands.reshape(N * C, -1)
         strands = gaussians.perm2scene(strands)
@@ -75,7 +74,6 @@ class PermDeformModel(nn.Module):
         strands_final = strands
 
         guide_strands = perm_out["guide_strands"].position[0]
-        guide_strands = guide_strands[:, ::2]
         guide_strands = guide_strands.reshape(-1, 3)
         guide_strands = gaussians.perm2scene(guide_strands)
 

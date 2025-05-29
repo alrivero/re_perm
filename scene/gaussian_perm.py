@@ -6,292 +6,1050 @@ import torch.nn as nn
 
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, strip_symmetric, build_scaling_rotation, quatProduct_batch
 
-STRAND_VERTEX_COUNT = 50
-SCALE_DIVISOR = 1e4
+STRAND_VERTEX_COUNT = 100
+SCALE_DIVISOR = 1
 
 class GaussianPerm(nn.Module):
-    def __init__(self, perm, pseudo_roots, start_hair_style, sh_degree, num_strands=20000):
-        super(GaussianPerm, self).__init__()
+    def __init__(self, perm, pseudo_roots,
+                 start_hair_style, sh_degree,
+                 num_strands: int = 25000):
+        super().__init__()
 
-        self.optimizer = None
-
+        self.perm          = perm
+        self.num_strands   = num_strands
         self.max_sh_degree = sh_degree
-        self.num_strands = num_strands
 
-        self.perm = perm
-        self.roots = self.perm.hair_roots.sample_scalp_mesh(num_strands, pseudo_roots)
+        # sample scalp roots once
+        self.roots = self.perm.hair_roots.sample_scalp_mesh(
+                         num_strands, pseudo_roots).to(self.perm.device)
 
-        self.scaling_activation = torch.exp
+        # activations / helpers
+        self.scaling_activation         = torch.exp
         self.scaling_inverse_activation = torch.log
-
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
-
-        self.covariance_activation = build_covariance_from_scaling_rotation
-        self.opacity_activation = torch.sigmoid
+        def _cov_from_scale_rot(s, mod, R):
+            L = build_scaling_rotation(mod * s, R)
+            return strip_symmetric(L @ L.transpose(1, 2))
+        self.covariance_activation      = _cov_from_scale_rot
+        self.opacity_activation         = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
-        self.rotation_activation = torch.nn.functional.normalize
-        self.segmentation_activation = torch.sigmoid
+        self.rotation_activation        = torch.nn.functional.normalize
 
-
+        # build all tensors
         self.init_parameters(start_hair_style)
 
-    def init_parameters(self, start_hair_style):
-        # --- initialize perm parameters (theta, beta) ---
-        if start_hair_style is not None:
-            self.theta = nn.Parameter(torch.tensor(start_hair_style["theta"])[None]
-                                    .requires_grad_(True))
-            self.beta  = nn.Parameter(torch.tensor(start_hair_style["beta"])[None]
-                                    .requires_grad_(True))
-            # self.beta  = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
+    def init_parameters(self, start_hair_style, density_factor: float = 3.0):
+        """
+        Initialise PERM latents, per‐Gaussian tensors and bookkeeping.
+
+        start_hair_style : optional seed style
+        density_factor   : >1 ⇒ sparser, <1 ⇒ denser initial Gaussians
+        """
+        device = self.roots.device
+
+        # 0) PERM latent codes (θ, β) are still part of the graph
+        if start_hair_style:
+            self.theta = nn.Parameter(
+                torch.as_tensor(start_hair_style["theta"], device=device)[None],
+                requires_grad=True)
+            self.beta  = nn.Parameter(
+                torch.as_tensor(start_hair_style["beta"], device=device)[None],
+                requires_grad=True)
         else:
-            self.theta = nn.Parameter(self.perm.theta_avg().requires_grad_(True))
-            self.beta  = nn.Parameter(self.perm.beta_avg().requires_grad_(True))
+            self.theta = nn.Parameter(self.perm.theta_avg().to(device), requires_grad=True)
+            self.beta  = nn.Parameter(self.perm.beta_avg().to(device),  requires_grad=True)
 
-        full_strands = self.perm(
-            roots=self.get_roots_xyz[None].cuda(),
-            theta=self.theta.cuda(),
-            beta=self.beta.cuda()
-        )["strands"].position[0]
-        base_strands = full_strands[:, ::2, :] / 100.0
+        # — everything below is purely initialization, no grads wanted —
+        with torch.no_grad():
+            # 0) Save the starting values for both theta and beta
+            self.theta_start = self.theta.detach().clone()
+            self.beta_start = self.beta.detach().clone()
 
-        # import pdb; pdb.set_trace()
+            # 1) Decode reference strands (in metres) and measure their lengths
+            strands = self.perm(
+                roots=self.get_roots_xyz[None],
+                theta=self.theta,
+                beta=self.beta
+            )["strands"].position[0] / 100.0   # (S, V, 3)
+            S, V, _ = strands.shape
 
-        S, N_ds, _ = base_strands.shape
-        gaussian_count = S * (N_ds - 1)
-        self.active_sh_degree = 0
+            seg_len   = (strands[:, 1:] - strands[:, :-1]).norm(dim=-1)  # (S, V-1)
+            strand_L  = seg_len.sum(dim=1)                                # (S,)
 
-        # --- compute segment directions and lengths ---
-        # edges: (S, N_ds-1, 3)
-        edges = base_strands[:, 1:, :] - base_strands[:, :-1, :]
-        # flatten to (M, 3)
-        edge_dirs = edges.reshape(-1, 3)
-        # lengths: (M, 1)
-        edge_lens = edge_dirs.norm(dim=1, keepdim=True)
-        M = edge_dirs.shape[0]
-        device = edge_dirs.device
-        eps = 1e-6
+            # store each strand’s length so we can clamp σ∥ later
+            self.register_buffer("strand_length", strand_L, persistent=False)
 
-        # --- initialize spherical-harmonic features: (M,3,n_sh) ---
-        avg_color = torch.tensor([0.0, 0.0, 0.0], device=device)
+            # axial spacing target
+            m = torch.median(strand_L / (V - 1)).item() * density_factor
+
+            # 2) build per‐strand axial positions & strand‐ID
+            s_list, sid_list, K_list = [], [], []
+            for sid, L in enumerate(strand_L):
+                K = int(torch.ceil(L / m).item())
+                s_list.append(torch.linspace(0, 1, K, device=device))
+                sid_list.append(torch.full((K,), sid, device=device, dtype=torch.long))
+                K_list.append(K)
+
+            offsets = torch.zeros(self.num_strands + 1, dtype=torch.long, device=device)
+            offsets[1:] = torch.cumsum(torch.tensor(K_list, device=device), dim=0)
+            M = int(offsets[-1])
+
+            # register all the “frozen” buffers immediately
+            self.register_buffer("_strand_id",    torch.cat(sid_list),    persistent=False)
+            self.register_buffer("_gauss_offset", offsets,                persistent=False)
+            self.num_gaussians = M
+
+            # radial‐cage limit
+            self.register_buffer("_max_radius", torch.tensor(6 * m, device=device))
+
+            # gradient accumulators & 2D radii
+            self.xyz_gradient_accum = torch.zeros((M, 1), device=device)
+            self.denom              = torch.zeros_like(self.xyz_gradient_accum)
+            self.register_buffer("max_radii2D", torch.zeros((M,), device=device), persistent=False)
+
+            # 3) precompute centres & quaternions at uniform s
+            centres, quats = [], []
+            for sid in range(self.num_strands):
+                start, end = offsets[sid].item(), offsets[sid+1].item()
+                # uniform samples on [0,1]
+                s_uniform = torch.linspace(0, 1, end - start, device=device)
+                c, t = self._center_tangent_normal(strands[sid], s_uniform)
+                centres.append(c)
+                quats.append(self._edge_dirs_to_quat(t))
+            self._xyz      = torch.cat(centres, 0)   # (M,3)
+            self._rotation = torch.cat(quats,   0)   # (M,4)
+
+        # — now set up all the *learnable* parameters —  
+        # 4) axial weights
+        self._s = nn.Parameter(torch.cat(s_list), requires_grad=True)
+
+        # 5) radial‐cage learnables
+        self._rho_hat = nn.Parameter(torch.zeros((M, 1), device=device), requires_grad=True)
+        self._phi     = nn.Parameter(self._max_radius * torch.rand((M, 1), device=device), requires_grad=True)
+
+        # 6) SH colours & opacity
         n_sh = (self.max_sh_degree + 1) ** 2
         feats = torch.zeros((M, 3, n_sh), device=device)
-        feats[:, :, 0] = avg_color.unsqueeze(0)
+        feats += (torch.rand_like(feats[:, [0]]) - 0.5) * 2
 
-        # split into DC and rest
-        dc = feats[:, :, 0:1].transpose(1, 2).contiguous()   # (M,1,3)
-        rest = feats[:, :, 1:].transpose(1, 2).contiguous()  # (M,n_sh-1,3)
-        self._features_dc   = nn.Parameter(dc.requires_grad_(True))
-        self._features_rest = nn.Parameter(rest.requires_grad_(True))
+        self._features_dc   = nn.Parameter(feats[:, :, :1].transpose(1, 2).contiguous(), requires_grad=True)
+        self._features_rest = nn.Parameter(feats[:, :, 1:].transpose(1, 2).contiguous(), requires_grad=True)
+        self._opacity       = nn.Parameter(self.inverse_opacity_activation(torch.ones((M, 1),  device=device)),
+                                           requires_grad=True)
 
-        # --- initialize opacity: (M,1) ---
-        opacs = inverse_sigmoid(
-            1.0 * torch.ones((M, 1), dtype=torch.float, device=device)
-        )
-        self._opacity = nn.Parameter(opacs.requires_grad_(True))
-        
-        # self._seg_logit = nn.Parameter(torch.ones((M, 1), device=device))
+        # 7) initial log‐scales (σ⊥, σ‖, σ⊥)
+        thick_perp = 1.25
+        par_ratio  = 30.0
+        sigma_perp = (torch.median(seg_len).item() / 5.0) / 2.0 * thick_perp
+        sigma_par  = max(sigma_perp * par_ratio, m)
+        log_scale  = torch.tensor([sigma_perp, sigma_par, sigma_perp], device=device).log()
+        self._scaling_base = nn.Parameter(log_scale.expand(M, 3).clone(), requires_grad=True)
+        self._scaling = None
 
-        # --- placeholder for Gaussian centers/rotations ---
-        self._xyz = None
-        self._rotation = None
+        # 8) housekeeping
+        self.active_sh_degree  = 0
+        self.spatial_lr_scale  = 1.0
 
+    def _center_tangent_normal(self, pts: torch.Tensor, s: torch.Tensor):
+        """
+        Given one strand’s vertices `pts` (V, 3) and axial weights `s` (K,),
+        return the interpolated centres and *unit* tangents at those points.
+        """
+        V   = pts.shape[0]
+        t   = s * (V - 1)
+        idx0 = torch.clamp(t.floor().long(), 0, V - 2)
+        idx1 = idx0 + 1
+
+        w    = (t - idx0.float()).unsqueeze(1)            # (K, 1)
+        P0, P1 = pts[idx0], pts[idx1]
+
+        center  = (1 - w) * P0 + w * P1                   # linear interp.
+        tangent = torch.nn.functional.normalize(P1 - P0,  # **was .normalize()**
+                                                dim=1,
+                                                eps=1e-9)
+        return center, tangent
+    
+    def gidx_of_strand(self, k: int):
+        """Return tensor of Gaussian indices belonging to strand k"""
+        a, b = self._gauss_offset[k:k+2].tolist()
+        return torch.arange(a, b, device=self._s.device)
+
+    def slice_of_strand(self, k: int):
+        """Return slice(start,end) so big tensors can be indexed directly"""
+        a, b = self._gauss_offset[k:k+2].tolist()
+        return slice(a, b)
 
     def capture(self):
+        """
+        Pack everything required to resume training later.
+        (Now also stores the running gradient statistics.)
+        """
         return (
+            # 0‒1  train-time state
             self.active_sh_degree,
+            self.spatial_lr_scale,
+
+            # 2‒8  learnable per-Gaussian tensors
+            self._s,
+            self._rho_hat,
+            self._phi,
             self._features_dc,
             self._features_rest,
             self._opacity,
+            self._scaling_base,
+
+            # 9    optimiser
             self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-            self.roots,
+
+            # 10‒13  PERM latents + roots
             self.theta,
-            self.beta
+            self.beta,
+            self.roots,
+
+            # 14‒15 lookup buffers
+            self._strand_id,
+            self._gauss_offset,
+
+            # 16   cage radius limit
+            self._max_radius,
+
+            # 17‒18  gradient statistics  (NEW)
+            self.xyz_gradient_accum,
+            self.denom,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._features_dc, 
+        """
+        Re-create all learnable tensors and optimiser state.
+        Works with both *new* and *old* checkpoints: if the two
+        statistics were not stored, they are reset to zeros.
+        """
+        # ------------- unpack compulsory fields --------------------------
+        ( self.active_sh_degree,
+        self.spatial_lr_scale,
+        self._s,
+        self._rho_hat,
+        self._phi,
+        self._features_dc,
         self._features_rest,
         self._opacity,
-        opt_dict, 
-        self.spatial_lr_scale,
-        self.roots,
+        self._scaling_base,
+        opt_state_dict,
         self.theta,
-        self.beta) = model_args
+        self.beta,
+        self.roots,
+        strand_id_buf,
+        gauss_offset_buf,
+        max_radius_buf,
+        *rest ) = model_args          # everything else (len 0 or 2)
+
+        # ------------- optional gradient statistics ----------------------
+        if len(rest) == 2:             # new-format checkpoint
+            self.xyz_gradient_accum, self.denom = rest
+        else:                           # old checkpoint → start fresh
+            M = int(gauss_offset_buf[-1])
+            device = self._s.device
+            self.xyz_gradient_accum = torch.zeros((M,1), device=device)
+            self.denom              = torch.zeros_like(self.xyz_gradient_accum)
+
+        # ------------- re-register buffers -------------------------------
+        self.register_buffer("_strand_id",   strand_id_buf,   persistent=False)
+        self.register_buffer("_gauss_offset", gauss_offset_buf, persistent=False)
+        self._max_radius = max_radius_buf
+        self.num_gaussians = int(self._gauss_offset[-1])
+
+        # ------------- rebuild optimiser & load state --------------------
         self.training_setup(training_args)
-        # self.optimizer.load_state_dict(opt_dict)
+        self.optimizer.load_state_dict(opt_state_dict)
 
     @property
     def get_roots_xyz(self):
+        """Scalp-root locations (S,3) in metres."""
         return self.roots
 
     @property
     def get_xyz(self):
+        """Current centres (M,3) – recomputed every frame."""
         return self._xyz
 
     @property
-    def get_scaling(self):
-        return self.scaling_activation(self._scaling)
-
-    @property
     def get_rotation(self):
+        """Unit quaternions (M,4) that align +Y with the strand tangent."""
         return self.rotation_activation(self._rotation)
 
     @property
+    def get_scaling(self):
+        """
+        Positive σ values (M,3) in world units,
+        with the longitudinal σ‖ clamped to half the strand’s length.
+        """
+        raw = self.scaling_activation(self._scaling_base)  # (M,3)
+        # half-length for each Gaussian’s strand:
+        half_len = 0.5 * self.strand_length[self._strand_id]  # (M,)
+
+        perp = raw[:, 0]
+        paral = torch.minimum(raw[:, 1], half_len)  # clamp σ‖
+        return torch.stack((perp, paral, perp), dim=1)
+
+    @property
+    def get_scaling_with_3D_filter(self):
+        scales = self.get_scaling
+        
+        scales = torch.square(scales) + torch.square(self.filter_3D)
+        scales = torch.sqrt(scales)
+        return scales
+
+    @property
     def get_features(self):
-        features_dc = self._features_dc
-        features_rest = self._features_rest
-        return torch.cat((features_dc, features_rest), dim=1)
+        """
+        Spherical-harmonic colour coefficients, concatenated
+        to shape (M, 3 × ( (L+1)² ) ).
+        """
+        return torch.cat((self._features_dc, self._features_rest), dim=1)
 
     @property
     def get_opacity(self):
+        """Alpha of each Gaussian after sigmoid – shape (M,1)."""
         return self.opacity_activation(self._opacity)
     
-    # @property
-    # def get_seg_logit(self):
-    #     return self.segmentation_activation(self._seg_logit)
+    @property
+    def get_opacity_with_3D_filter(self):
+        opacity = self.opacity_activation(self._opacity)
+        # apply 3D filter
+        scales = self.get_scaling
+        
+        scales_square = torch.square(scales)
+        det1 = scales_square.prod(dim=1)
+        
+        scales_after_square = scales_square + torch.square(self.filter_3D) 
+        det2 = scales_after_square.prod(dim=1) 
+        coef = torch.sqrt(det1 / det2)
+        return opacity * coef[..., None]
 
-    def get_covariance(self, scaling_modifier=1):
-        return self.covariance_activation(
-            self.get_scaling, scaling_modifier, self._rotation
-        )
+    @property
+    def get_axial_weight(self):           # s in [0,1]
+        return self._s
+
+    @property
+    def get_radial_uv(self):
+        """
+        Return (u,v) offsets in metres – already clamped to max_radius (= m/2).
+        """
+        rho = torch.sigmoid(self._rho_hat)
+        return self._max_radius * torch.cat([rho * torch.cos(self._phi),
+                                            rho * torch.sin(self._phi)], dim=1)
+
+    # ------------------ full 3×3 covariance -------------------------
+    def get_covariance(self, scaling_modifier=1.0):
+        """
+        Return the symmetric 3×3 covariance matrix for each Gaussian,
+        ready for the renderer.  The optional `scaling_modifier`
+        is used by the mip-map style coarse-to-fine schedule.
+        """
+        return self.covariance_activation(self.get_scaling,
+                                        scaling_modifier,
+                                        self._rotation)
 
     def oneupSHdegree(self):
+        """Unlock the next SH band (same rule as 3D-GS)."""
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def training_setup(self, training_args):
-        self.spatial_lr_scale = 5
 
+    def training_setup(self, training_args):
+        """
+        Build the Adam optimiser with separate groups for every learnable
+        tensor, assign sensible learning-rates, and create per-latent LR
+        schedules for θ and β.
+        """
+        self.spatial_lr_scale = 5.0            # keep same scaling factor
+        self.percent_dense    = training_args.percent_dense
+
+        # ------------------------------------------------------------
+        # param-groups with individual learning rates
         l = [
-            {
-                "params": [self.theta],
-                "lr": training_args.perm_lr_init,
-                "name": "theta",
-            },
-            {
-                "params": [self.beta],
-                "lr": training_args.perm_lr_init,
-                "name": "beta",
-            },
-            {
-                "params": [self._features_dc],
-                "lr": training_args.feature_lr,
-                "name": "f_dc",
-            },
-            {
-                "params": [self._features_rest],
-                "lr": training_args.feature_lr / 20.0,
-                "name": "f_rest",
-            },
-            {
-                "params": [self._opacity],
-                "lr": training_args.opacity_lr,
-                "name": "opacity",
-            },
+            # PERM latents
+            {"params": [self.theta], "lr": training_args.theta_lr_init, "name": "theta"},
+            {"params": [self.beta],  "lr": training_args.beta_lr_init,  "name": "beta" },
+
+            # Gaussian appearance
+            {"params": [self._features_dc],   "lr": training_args.feature_lr,           "name": "f_dc"},
+            {"params": [self._features_rest], "lr": training_args.feature_lr / 20.0,    "name": "f_rest"},
+            {"params": [self._opacity],       "lr": training_args.opacity_lr,           "name": "opacity"},
+
+            # Gaussian shape
+            {"params": [self._scaling_base],  "lr": training_args.scaling_lr,           "name": "scaling"},
+            {"params": [self._s],             "lr": training_args.scaling_lr,           "name": "axial"},
+            # radial cage stored as (ρ̂, φ)
+            {"params": [self._rho_hat],       "lr": 0.5 * training_args.scaling_lr,     "name": "rho"},
+            {"params": [self._phi],           "lr": 0.5 * training_args.scaling_lr,     "name": "phi"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.perm_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.perm_lr_final * self.spatial_lr_scale,
-            lr_delay_mult=training_args.perm_lr_delay_mult,
-            max_steps=training_args.perm_lr_max_steps,
+
+        # cache β’s base LR so warm-up code can zero / restore it
+        for pg in self.optimizer.param_groups:
+            if pg["name"] == "beta":
+                self._beta_base_lr = pg["lr"]
+
+        # LR schedules for θ and β (others keep constant LR)
+        self._theta_scheduler = get_expon_lr_func(
+            lr_init  = training_args.theta_lr_init  * self.spatial_lr_scale,
+            lr_final = training_args.theta_lr_final * self.spatial_lr_scale,
+            lr_delay_mult = training_args.perm_lr_delay_mult,
+            max_steps     = training_args.perm_lr_max_steps,
+        )
+        self._beta_scheduler = get_expon_lr_func(
+            lr_init  = training_args.beta_lr_init   * self.spatial_lr_scale,
+            lr_final = training_args.beta_lr_final  * self.spatial_lr_scale,
+            lr_delay_mult = training_args.perm_lr_delay_mult,
+            max_steps     = training_args.perm_lr_max_steps,
         )
 
-    def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "beta" or param_group["name"] == "theta":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
-    
-    def replace_tensor_to_optimizer(self, tensor, name):
-        optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+    def update_learning_rate(self, iteration: int):
+        """
+        Apply per-step LR schedule to θ and β only.  All other groups keep
+        their fixed learning-rate.
+        """
+        lr_theta = self._theta_scheduler(iteration)
+        lr_beta  = self._beta_scheduler (iteration)
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-        return optimizable_tensors
-    
-    def reset_opacity(self):
-        opacities_new = inverse_sigmoid(
-            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
-        )
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self._opacity = optimizable_tensors["opacity"]
+        for pg in self.optimizer.param_groups:
+            if pg["name"] == "theta" and pg["lr"] > 0.0:
+                pg["lr"] = lr_theta
+            elif pg["name"] == "beta" and pg["lr"] > 0.0:
+                pg["lr"] = lr_beta
 
     def perm2scene(self, points):
-        x = points[:, 0]
-        y = points[:, 1]
-        z = points[:, 2]
-        points_corr = torch.stack([x, y, z], dim=1) / 100.0
+        """Convert centimetre vertices coming from PERM to metres."""
+        return points / 100.0
 
-        return points_corr
-    
-    def compute_edge_quats(self, edge_dirs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+
+    @staticmethod
+    def _edge_dirs_to_quat(edge_dirs: torch.Tensor, eps=1e-6):
         """
-        Given edge direction vectors (M,3) return unit quaternions (M,4)
-        which rotate the world +Y axis to each edge direction.
+        Convert direction vectors (M,3) to unit quaternions (M,4)
+        that rotate +Y onto each direction.
         """
-        up   = torch.tensor([0.0, 1.0, 0.0], device=edge_dirs.device).expand_as(edge_dirs)
-        b    = edge_dirs / (edge_dirs.norm(dim=1, keepdim=True) + eps)
-        dot  = (up * b).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
-        axis = torch.cross(up, b, dim=1)
+        up   = torch.tensor([0.0, 1.0, 0.0], device=edge_dirs.device)
+        up   = up.expand_as(edge_dirs)
+        v    = edge_dirs / (edge_dirs.norm(dim=1, keepdim=True) + eps)
+        dot  = (up * v).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
+        axis = torch.cross(up, v, dim=1)
         axis = axis / (axis.norm(dim=1, keepdim=True) + eps)
         ang  = torch.acos(dot)
         qw   = torch.cos(ang * 0.5)
         qxyz = axis * torch.sin(ang * 0.5)
-        return torch.cat([qw, qxyz], dim=1)  # (M,4)
-    
-    @staticmethod
-    def _mid_and_edge(strands):
-        mids = 0.5 * (strands[:, :-1] + strands[:, 1:]).reshape(-1, 3)
-        edges = (strands[:, 1:] - strands[:, :-1]).reshape(-1, 3)
-        return mids, edges
+        return torch.cat([qw, qxyz], dim=1)
 
-    def _edge_dirs_to_quat(self, edge_dirs, eps=1e-6):
-        up = torch.tensor([0.0, 1.0, 0.0], device=edge_dirs.device)
-        up = up.expand_as(edge_dirs)
-        dirs_norm = edge_dirs / (edge_dirs.norm(dim=1, keepdim=True) + eps)
-        dot = (up * dirs_norm).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
-        axis = torch.cross(up, dirs_norm, dim=1)
-        axis = axis / (axis.norm(dim=1, keepdim=True) + eps)
-        angle = torch.acos(dot)
-        quat_w = torch.cos(angle * 0.5)
-        quat_xyz = axis * torch.sin(angle * 0.5)
-        return torch.cat([quat_w, quat_xyz], dim=1)
 
-    def _edge_lengths_to_scaling(self, edge_dirs):
-        sigma_y = edge_dirs.norm(dim=1, keepdim=True)  # shape (N, 1)
-        sigma_xz = sigma_y / SCALE_DIVISOR
-        raw_2d = torch.cat([sigma_xz, sigma_y], dim=1)  # (N, 2)
-        log_2d = self.scaling_inverse_activation(raw_2d)
-        # full_3d = torch.cat([sigma_xz, sigma_y, sigma_xz], dim=1)  # (N, 3)
-        return log_2d
-    
+    def _center_tangent(self, pts: torch.Tensor, s: torch.Tensor, eps: float = 1e-9):
+        """
+        Interpolate centre positions and unit tangents along one strand.
+
+        pts : (V, 3)  – strand vertices in metres
+        s   : (K,)    – axial weights ∈ [0, 1]
+
+        Returns
+        -------
+        centre  : (K, 3)
+        tangent : (K, 3)  – already L2-normalised
+        """
+        if s.numel() == 0:                             # nothing to do
+            z = pts.new_zeros((0, 3))
+            return z, z
+
+        V   = pts.shape[0]
+        t   = s * (V - 1)
+        idx0 = torch.clamp(t.floor().long(), 0, V - 2)
+        idx1 = idx0 + 1
+
+        w = (t - idx0.float()).unsqueeze(-1)           # (K, 1)
+
+        P0, P1 = pts[idx0], pts[idx1]
+        centre = (1.0 - w) * P0 + w * P1
+
+        T_raw  = P1 - P0                               # (K, 3) *or* (3,)
+        tangent = torch.nn.functional.normalize(T_raw, dim=-1, eps=eps)
+
+        return centre, tangent
+
     def update_xyz_rot_scale(self, strand_vertices, *_):
-        pts = strand_vertices.reshape(self.num_strands, STRAND_VERTEX_COUNT, 3)
-        mids, edges = self._mid_and_edge(pts)
+        """
+        Vectorised update of centres, rotations and σ.
+        """
+        if strand_vertices.dim() != 3:
+            raise RuntimeError("strand_vertices must be (S,V,3)")
+        if strand_vertices.shape[-1] != 3:
+            strand_vertices = strand_vertices.permute(0,2,1)
+        S, V, _ = strand_vertices.shape
+        M = self._s.shape[0]
 
-        self._xyz = mids
-        self._rotation = self._edge_dirs_to_quat(edges)
+        # ensure our buffers exist
+        assert hasattr(self, "_max_radius"), "You must register `_max_radius` in init_parameters!"
+        assert hasattr(self, "active_sh_degree"), "You must set `active_sh_degree` in init_parameters!"
 
-        scales = self._edge_lengths_to_scaling(edges)
-        self._scaling  = torch.cat([scales[:, [0]],
-                                    scales[:, [1]],
-                                    scales[:, [0]]],
-                                   dim=-1)
+        sid  = self._strand_id               # (M,)
+        t    = self._s * (V - 1)             # (M,)
+        idx0 = t.floor().long().clamp_max(V-2)
+        idx1 = idx0 + 1
+        w    = (t - idx0.float()).unsqueeze(1)
+
+        P0 = strand_vertices[sid, idx0]
+        P1 = strand_vertices[sid, idx1]
+
+        centres = (1-w)*P0 + w*P1
+        tangent = torch.nn.functional.normalize(P1 - P0, dim=1, eps=1e-9)
+
+        # radial offsets clamped by current max_radius
+        rho = torch.sigmoid(self._rho_hat)               # (M,1)
+        u   = self._max_radius * rho * torch.cos(self._phi)
+        v   = self._max_radius * rho * torch.sin(self._phi)
+
+        # build orthonormal frame
+        up  = tangent.new_tensor([0.,0.,1.]).expand_as(tangent)
+        n1  = torch.cross(tangent, up, dim=1)
+        bad = n1.norm(dim=1) < 1e-5
+        if bad.any():
+            alt = tangent.new_tensor([0.,1.,0.]).expand_as(tangent)
+            n1[bad] = torch.cross(tangent[bad], alt[bad], dim=1)
+        n1 = torch.nn.functional.normalize(n1, dim=1)
+        n2 = torch.cross(tangent, n1, dim=1)
+
+        self._xyz      = centres + u*n1 + v*n2
+        self._rotation = self._edge_dirs_to_quat(tangent)
+
+        # re-build σ with constraint σ∥ ≥ σ⊥
+        sigma = self._scaling_base
+        perp  = sigma[:,[0]]
+        paral = torch.maximum(sigma[:,[1]], perp + 1e-6)
+        self._scaling = torch.cat([perp, paral, perp], dim=1)
+
+        # sanity
+        assert self._xyz.shape[0] == M, f"Wrong M after update: got {self._xyz.shape[0]}"
+
+    @torch.no_grad()
+    def compute_3D_filter(self, cameras, device="cuda"):
+        #TODO consider focal length and image width
+        xyz = self.get_xyz
+        distance = torch.ones((xyz.shape[0]), device=xyz.device) * 100000.0
+        valid_points = torch.zeros((xyz.shape[0]), device=xyz.device, dtype=torch.bool)
+        
+        # we should use the focal length of the highest resolution camera
+        focal_length = 0.
+        for camera in cameras:
+            old_device = camera.device if camera.device is not None else "cpu"
+            camera.load2device(device)
+
+            # transform points to camera space
+            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
+            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
+             # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
+            xyz_cam = xyz @ R + T[None, :]
+            
+            xyz_to_cam = torch.norm(xyz_cam, dim=1)
+            
+            # project to screen space
+            valid_depth = xyz_cam[:, 2] > 0.2
+            
+            
+            x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
+            z = torch.clamp(z, min=0.001)
+            
+            x = x / z * camera.focal_x + camera.image_width / 2.0
+            y = y / z * camera.focal_y + camera.image_height / 2.0
+            
+            # in_screen = torch.logical_and(torch.logical_and(x >= 0, x < camera.image_width), torch.logical_and(y >= 0, y < camera.image_height))
+            
+            # use similar tangent space filtering as in the paper
+            in_screen = torch.logical_and(torch.logical_and(x >= -0.15 * camera.image_width, x <= camera.image_width * 1.15), torch.logical_and(y >= -0.15 * camera.image_height, y <= 1.15 * camera.image_height))
+            
+        
+            valid = torch.logical_and(valid_depth, in_screen)
+            
+            # distance[valid] = torch.min(distance[valid], xyz_to_cam[valid])
+            distance[valid] = torch.min(distance[valid], z[valid])
+            valid_points = torch.logical_or(valid_points, valid)
+            if focal_length < camera.focal_x:
+                focal_length = camera.focal_x
+            
+            camera.load2device(old_device)
+        
+        distance[~valid_points] = distance[valid_points].max()
+        
+        #TODO remove hard coded value
+        #TODO box to gaussian transform
+        filter_3D = distance / focal_length * (0.2 ** 0.5)
+        self.filter_3D = filter_3D[..., None]
+
+    # ================================================================
+    #  ----  DENSIFICATION / PRUNE HELPERS  ---------------------------
+    # ================================================================
+    def _cat_to_optimizer(self, new_tensors: dict):
+        """
+        Concatenate rows from `new_tensors` onto each stored tensor, extending
+        Adam moments where necessary.  Gradient accumulators and max_radii2D
+        are kept in sync. Returns a dict of the *updated* tensors for easy re-binding.
+        """
+        out = {}
+        added = 0  # how many new Gaussians were appended to xyz
+
+        for name, ext in new_tensors.items():
+            pg = next((g for g in self.optimizer.param_groups if g["name"] == name), None)
+            if pg is not None:
+                # — optimised tensor —
+                old = pg["params"][0]
+                state = self.optimizer.state.get(old, None)
+
+                # extend Adam moments
+                if state is not None:
+                    z = torch.zeros_like(ext)
+                    state["exp_avg"]    = torch.cat((state["exp_avg"],    z), 0)
+                    state["exp_avg_sq"] = torch.cat((state["exp_avg_sq"], z), 0)
+
+                # build new Parameter with old+ext
+                new_p = nn.Parameter(torch.cat((old, ext), 0), requires_grad=True)
+                if state is not None:
+                    del self.optimizer.state[old]
+                    self.optimizer.state[new_p] = state
+                pg["params"][0] = new_p
+                out[name] = new_p
+
+            else:
+                # — frozen tensor (xyz, rotation) —
+                cur = getattr(self, f"_{name}")
+                new = torch.cat((cur, ext), 0)
+                setattr(self, f"_{name}", new)
+                out[name] = new
+                if name == "xyz":
+                    added = ext.shape[0]
+
+        # keep gradient statistics the same length as xyz
+        if added > 0:
+            z = torch.zeros((added, 1), device=self._s.device)
+            self.xyz_gradient_accum = torch.cat((self.xyz_gradient_accum, z), 0)
+            self.denom              = torch.cat((self.denom,              z), 0)
+            # **also** extend max_radii2D buffer by zeros
+            zeros_r = torch.zeros((added,), device=self.max_radii2D.device)
+            self.max_radii2D = torch.cat((self.max_radii2D, zeros_r), 0)
+
+        return out
+
+    # ================================================================
+    #  ----  CLONE (vanilla 3D-GS)  -----------------------------------
+    # ================================================================
+    @torch.no_grad()
+    def densify_clone(self, grads: torch.Tensor,
+                    grad_thresh: float,
+                    scene_extent: float):
+        """
+        Duplicate Gaussians whose full-norm grads exceed grad_thresh and
+        whose σ⊥ is still *larger* than percent_dense × extent (same rule
+        as vanilla GS).  Radial cage is copied unchanged.
+        """
+        g_norm = grads.norm(dim=-1)               # (M,)
+        sel = (g_norm >= grad_thresh) & \
+            (self.get_scaling.max(dim=1).values
+                <= self.percent_dense * scene_extent)
+        if sel.sum() == 0:
+            return                                # nothing to clone
+
+        # tensors to append ------------------------------------------------
+        new_xyz      = self._xyz[sel]
+        new_features_dc   = self._features_dc  [sel]
+        new_features_rest = self._features_rest[sel]
+        new_opacity  = self._opacity[sel]
+        new_scaling  = self._scaling_base[sel]
+        new_rotation = self._rotation[sel]
+
+        new_s        = self._s[sel]
+        new_rho_hat  = self._rho_hat[sel]
+        new_phi      = self._phi[sel]
+        new_sid      = self._strand_id[sel]
+
+        # extend all learnable tensors + Adam state
+        ext = self._cat_to_optimizer({
+            "xyz":       new_xyz,
+            "f_dc":      new_features_dc,
+            "f_rest":    new_features_rest,
+            "opacity":   new_opacity,
+            "scaling":   new_scaling,
+            "rotation":  new_rotation,
+            "axial":     new_s,
+            "rho":       new_rho_hat,
+            "phi":       new_phi,
+        })
+
+        # re-bind class attributes to fresh Parameter handles
+        self._xyz            = ext["xyz"]
+        self._features_dc    = ext["f_dc"]
+        self._features_rest  = ext["f_rest"]
+        self._opacity        = ext["opacity"]
+        self._scaling_base   = ext["scaling"]
+        self._rotation       = ext["rotation"]
+        self._s              = ext["axial"]
+        self._rho_hat        = ext["rho"]
+        self._phi            = ext["phi"]
+
+        # bookkeeping for strand look-ups
+        self._strand_id = torch.cat((self._strand_id, new_sid), 0)
+        self.num_gaussians = int(self._xyz.shape[0])
+
+        # update prefix sums: +1 for each new entry in its strand
+        add_per_strand = torch.bincount(new_sid,
+                                        minlength=self.num_strands)
+        self._gauss_offset[1:] += add_per_strand.cumsum(0)
+
+        # reset accumulators
+        self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1),
+                                            device=self._xyz.device)
+        self.denom = torch.zeros_like(self.xyz_gradient_accum)
+
+
+    # ================================================================
+    #  ----  AXIAL SPLIT (strand-aware)  -------------------------------
+    # ================================================================
+    @torch.no_grad()
+    def densify_split(self, grads: torch.Tensor,
+                    grad_thresh: float,
+                    eps_axial: float = 0.04):
+        """
+        Split Gaussians with large **view-space gradient** into two children
+        displaced ± eps_axial along the strand *axis* (s parameter).
+        σ∥ is halved; σ⊥ unchanged.  Radial cage is copied.
+        """
+        g_val = grads.squeeze()
+        sel   = g_val >= grad_thresh
+        if sel.sum() == 0:
+            return
+
+        # child A (+eps)  and  child B ( –eps)
+        s_parent   = self._s[sel]
+        sid_parent = self._strand_id[sel]
+
+        s_a = torch.clamp(s_parent + eps_axial, 0.0, 1.0)
+        s_b = torch.clamp(s_parent - eps_axial, 0.0, 1.0)
+
+        new_s        = torch.cat([s_a, s_b], 0)
+        new_sid      = torch.cat([sid_parent, sid_parent], 0)
+
+        # scales: halve σ∥  (log-space subtract ln2)
+        log_scale_parent = self._scaling_base[sel]
+        log_scale_child  = log_scale_parent.clone()
+        log_scale_child[:, 1] -= np.log(2.0)      # σ∥ /2
+        new_scaling = torch.cat([log_scale_child, log_scale_child], 0)
+
+        # duplicate all other attrs
+        dup = lambda x: torch.cat([x[sel], x[sel]], 0)
+        ext = self._cat_to_optimizer({
+            "xyz":       dup(self._xyz),          # dummy, will be recomputed next frame
+            "f_dc":      dup(self._features_dc),
+            "f_rest":    dup(self._features_rest),
+            "opacity":   dup(self._opacity),
+            "scaling":   new_scaling,
+            "rotation":  dup(self._rotation),
+            "axial":     new_s,
+            "rho":       dup(self._rho_hat),
+            "phi":       dup(self._phi),
+        })
+
+        # re-bind
+        self._xyz            = ext["xyz"]
+        self._features_dc    = ext["f_dc"]
+        self._features_rest  = ext["f_rest"]
+        self._opacity        = ext["opacity"]
+        self._scaling_base   = ext["scaling"]
+        self._rotation       = ext["rotation"]
+        self._s              = ext["axial"]
+        self._rho_hat        = ext["rho"]
+        self._phi            = ext["phi"]
+
+        # update strand id / prefix sums
+        self._strand_id = torch.cat((self._strand_id, new_sid), 0)
+        add_per_strand  = torch.bincount(new_sid,
+                                        minlength=self.num_strands)
+        self._gauss_offset[1:] += add_per_strand.cumsum(0)
+        self.num_gaussians = int(self._xyz.shape[0])
+
+        # reset accumulators
+        self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1),
+                                            device=self._xyz.device)
+        self.denom = torch.zeros_like(self.xyz_gradient_accum)
+
+
+    # ================================================================
+    #  ----  PRUNE by opacity  ----------------------------------------
+    # ================================================================
+    def replace_tensor_to_optimizer(self, tensor: torch.Tensor, name: str):
+        """
+        Replace the parameter named `name` in Adam with a fresh tensor,
+        preserving its optimizer-state (exp_avg, exp_avg_sq).
+        """
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if group["name"] == name:
+                # grab and reattach optimizer buffers
+                state = self.optimizer.state.pop(group["params"][0], {})
+                state["exp_avg"]    = torch.zeros_like(tensor)
+                state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+                # replace the Parameter
+                new_p = nn.Parameter(tensor.clone().requires_grad_(True))
+                group["params"][0] = new_p
+                self.optimizer.state[new_p] = state
+
+                optimizable_tensors[name] = new_p
+        return optimizable_tensors
+
+    def reset_opacity(self):
+        """
+        Clamp all current opacities to ≤0.01, then re-insert into optimizer
+        so they’ll start optimizing again from that “low” value.
+        """
+        # inverse-sigmoid of min(current alpha, 0.01)
+        alpha = self.get_opacity
+        clipped = torch.min(alpha, torch.ones_like(alpha) * 0.01)
+        new_logits = self.inverse_opacity_activation(clipped)
+
+        # swap into optimizer
+        tensors = self.replace_tensor_to_optimizer(new_logits, "opacity")
+        self._opacity = tensors["opacity"]
+
+    @torch.no_grad()
+    def _prune_optimizer_rows(self, keep_mask: torch.BoolTensor):
+        """
+        Remove rows (dim0) where keep_mask==False from every per-Gaussian
+        optimizer parameter (those whose first dim==M), re-attaching Adam state.
+        Returns a dict name→new_parameter for re-binding on self.
+        """
+        out = {}
+        for pg in self.optimizer.param_groups:
+            name = pg["name"]
+            old_p = pg["params"][0]
+            # only prune if shape matches
+            if old_p.dim() > 0 and old_p.shape[0] == keep_mask.shape[0]:
+                kept = old_p[keep_mask]
+                new_p = nn.Parameter(kept, requires_grad=True)
+                # re-attach Adam stats
+                state = self.optimizer.state.pop(old_p, None)
+                if state is not None:
+                    state["exp_avg"]    = state["exp_avg"][keep_mask]
+                    state["exp_avg_sq"] = state["exp_avg_sq"][keep_mask]
+                    self.optimizer.state[new_p] = state
+                pg["params"][0] = new_p
+                out[name] = new_p
+            else:
+                out[name] = old_p
+        return out
+
+    @torch.no_grad()
+    def prune_inactive(self, alpha_thresh: float = 0.01):
+        """
+        Remove Gaussians whose opacity < alpha_thresh.  All per-Gaussian
+        buffers (optimizer tensors, _xyz, _rotation, _strand_id, max_radii2D)
+        get the exact same mask.
+        """
+        # build the keep-mask once
+        mask = (self.get_opacity.squeeze() >= alpha_thresh)
+        if mask.all():
+            return
+
+        # 1) prune every optimizer-managed parameter
+        new_params = self._prune_optimizer_rows(mask)
+
+        # re-bind those back onto self (names match your training_setup groups)
+        self._s             = new_params["axial"]
+        self._rho_hat       = new_params["rho"]
+        self._phi           = new_params["phi"]
+        self._features_dc   = new_params["f_dc"]
+        self._features_rest = new_params["f_rest"]
+        self._opacity       = new_params["opacity"]
+        self._scaling_base  = new_params["scaling"]
+        # (θ and β live in different groups, they get returned but we ignore them)
+
+        # 2) prune the frozen buffers with the *same* mask
+        self._xyz        = self._xyz[mask]
+        self._rotation   = self._rotation[mask]
+        self._strand_id  = self._strand_id[mask]
+        self.max_radii2D = self.max_radii2D[mask]
+
+        # 3) rebuild your offset lookup
+        counts = torch.bincount(self._strand_id, minlength=self.num_strands)
+        self._gauss_offset[0] = 0
+        self._gauss_offset[1:] = counts.cumsum(0)
+
+        # 4) reset counters & gradient stats to the new M
+        M = int(self._xyz.shape[0])
+        self.num_gaussians       = M
+        device = self._xyz.device
+        self.xyz_gradient_accum  = torch.zeros((M,1), device=device)
+        self.denom               = torch.zeros_like(self.xyz_gradient_accum)
+
+    @torch.no_grad()
+    def add_densification_stats(self, viewspace_pts: torch.Tensor,
+                                visible: torch.BoolTensor):
+        """
+        Accumulate ‖∇_xy‖ for every Gaussian that was rendered in the current
+        frame.  These statistics drive clone / split decisions later on.
+
+        viewspace_pts.grad  : (M,3)  gradient wrt view-space coords
+        visible             : (M,)   bool mask – True for Gaussians in frame
+        """
+        g = torch.norm(viewspace_pts.grad[visible, :2], dim=-1, keepdim=True)  # |∇xy|
+        self.xyz_gradient_accum[visible] += g
+        self.denom[visible]              += 1
+
+    @torch.no_grad()
+    def densify_and_prune(self, grad_thr, min_opac, extent, max_screen=None, radii=None):
+        # 1) average gradient
+        grads = self.xyz_gradient_accum / torch.clamp_min(self.denom, 1e-9)
+        grads[torch.isnan(grads)] = 0.0
+        g_norm = grads.squeeze()  # (M,)
+
+        # 2) record original M₀ before cloning/splitting
+        M0 = self._s.shape[0]
+        scaling0 = self.get_scaling[:M0].max(dim=1).values
+        clone_mask = (g_norm[:M0] >= grad_thr) & (scaling0 <= self.percent_dense * extent)
+        split_mask = (g_norm[:M0] >= grad_thr)
+
+        # 3) densify
+        self._densify_clone_mask(grads, clone_mask, extent)
+        self._densify_split_mask(split_mask, grad_thr, original_M=M0)
+
+        # 4) optional radius update _only_ on the ORIGINAL M₀
+        if radii is not None:
+            if radii.shape[0] != M0:
+                raise RuntimeError(f"radii must have length {M0}, got {radii.shape[0]}")
+            self.max_radii2D[:M0] = torch.maximum(self.max_radii2D[:M0], radii)
+
+        # 5) single-pass prune — this will slice _every_ per-Gaussian buffer
+        self.prune_inactive(min_opac)
+
+        # 6) Sanity check
+        M1 = self._s.shape[0]
+        assert (
+            self._strand_id.shape[0] == M1
+            == self._xyz.shape[0]
+            == self.max_radii2D.shape[0]
+        ), f"Post‐prune mismatch: s={M1}, id={self._strand_id.shape[0]}, xyz={self._xyz.shape[0]}, radii={self.max_radii2D.shape[0]}"
+
+    @torch.no_grad()
+    def _densify_clone_mask(self, grads, sel_mask, scene_extent):
+        """
+        Clone only those Gaussians where sel_mask==True.
+        Mirrors your old densify_clone, but uses the externally-computed sel_mask.
+        """
+        sel = sel_mask
+        if sel.sum() == 0:
+            return
+
+        # gather existing rows to duplicate
+        new_xyz           = self._xyz[sel]
+        new_features_dc   = self._features_dc[sel]
+        new_features_rest = self._features_rest[sel]
+        new_opacity       = self._opacity[sel]
+        new_scaling_base  = self._scaling_base[sel]
+        new_rotation      = self._rotation[sel]
+        new_s             = self._s[sel]
+        new_rho_hat       = self._rho_hat[sel]
+        new_phi           = self._phi[sel]
+        new_strand_id     = self._strand_id[sel]
+
+        # extend all learnables + Adam state
+        ext = self._cat_to_optimizer({
+            "xyz":      new_xyz,
+            "f_dc":     new_features_dc,
+            "f_rest":   new_features_rest,
+            "opacity":  new_opacity,
+            "scaling":  new_scaling_base,
+            "rotation": new_rotation,
+            "axial":    new_s,
+            "rho":      new_rho_hat,
+            "phi":      new_phi,
+        })
+
+        # re-bind to class
+        self._xyz           = ext["xyz"]
+        self._features_dc   = ext["f_dc"]
+        self._features_rest = ext["f_rest"]
+        self._opacity       = ext["opacity"]
+        self._scaling_base  = ext["scaling"]
+        self._rotation      = ext["rotation"]
+        self._s             = ext["axial"]
+        self._rho_hat       = ext["rho"]
+        self._phi           = ext["phi"]
+
+        # update strand IDs & prefix sums
+        self._strand_id = torch.cat([self._strand_id, new_strand_id], dim=0)
+        add_per_strand  = torch.bincount(new_strand_id, minlength=self.num_strands)
+        self._gauss_offset[1:] += add_per_strand.cumsum(0)
+        self.num_gaussians = int(self._xyz.shape[0])
+
+        # reset accumulators
+        self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1), device=self._xyz.device)
+        self.denom              = torch.zeros_like(self.xyz_gradient_accum)
+    
+    @torch.no_grad()
+    def _densify_split_mask(self, sel_mask, grad_thresh, original_M):
+        """
+        Split only the ORIGINAL_M Gaussians indicated by sel_mask.
+        Any clones added in between are untouched.
+        """
+        sel = sel_mask
+        if sel.sum() == 0:
+            return
+
+        # work on first original_M rows
+        s_parent    = self._s[:original_M][sel]
+        strand_ids  = self._strand_id[:original_M][sel]
+        log_base    = self._scaling_base[:original_M][sel]
+
+        # two child positions along s
+        eps_axial   = 0.04
+        s_a = torch.clamp(s_parent + eps_axial, 0.0, 1.0)
+        s_b = torch.clamp(s_parent - eps_axial, 0.0, 1.0)
+        new_s      = torch.cat([s_a, s_b], dim=0)
+        new_ids    = torch.cat([strand_ids, strand_ids], dim=0)
+
+        # half the parallel σ in log-space
+        log_child     = log_base.clone()
+        log_child[:, 1] -= np.log(2.0)
+        new_scalings  = torch.cat([log_child, log_child], dim=0)
+
+        # duplicate all other attrs from the original slice
+        def dup(x):
+            chunk = x[:original_M][sel]
+            return torch.cat([chunk, chunk], dim=0)
+
+        ext = self._cat_to_optimizer({
+            "xyz":      dup(self._xyz),
+            "f_dc":     dup(self._features_dc),
+            "f_rest":   dup(self._features_rest),
+            "opacity":  dup(self._opacity),
+            "scaling":  new_scalings,
+            "rotation": dup(self._rotation),
+            "axial":    new_s,
+            "rho":      dup(self._rho_hat),
+            "phi":      dup(self._phi),
+        })
+
+        # re-bind attributes
+        self._xyz           = ext["xyz"]
+        self._features_dc   = ext["f_dc"]
+        self._features_rest = ext["f_rest"]
+        self._opacity       = ext["opacity"]
+        self._scaling_base  = ext["scaling"]
+        self._rotation      = ext["rotation"]
+        self._s             = ext["axial"]
+        self._rho_hat       = ext["rho"]
+        self._phi           = ext["phi"]
+
+        # append new strand IDs & update offsets
+        self._strand_id = torch.cat([self._strand_id, new_ids], dim=0)
+        add_per_strand  = torch.bincount(new_ids, minlength=self.num_strands)
+        self._gauss_offset[1:] += add_per_strand.cumsum(0)
+        self.num_gaussians = int(self._xyz.shape[0])
+
+        # reset accumulators
+        self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1), device=self._xyz.device)
+        self.denom              = torch.zeros_like(self.xyz_gradient_accum)

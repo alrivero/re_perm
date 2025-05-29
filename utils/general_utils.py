@@ -20,6 +20,24 @@ import rff
 import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
+from pxr import Usd, UsdGeom, Gf
+
+def compute_pixel_footprint(K, depth):
+    """
+    Given camera intrinsics K (3x3) and a per-pixel depth map (H x W),
+    compute the isotropic blur sigma each Gaussian should be
+    pre-blurred by to match its screen-space footprint.
+    """
+    fx = K[0, 0]
+    fy = K[1, 1]
+
+    # world‐space blur needed to cover one pixel ∼ depth / focal_length
+    sigma_x = depth / fx    # (H,W)
+    sigma_y = depth / fy    # (H,W)
+
+    # average to get one isotropic sigma per pixel
+    sigma = 0.5 * (sigma_x + sigma_y)
+    return sigma
 
 def to_image_np(t: torch.Tensor) -> np.ndarray:
     """
@@ -36,6 +54,36 @@ def to_image_np(t: torch.Tensor) -> np.ndarray:
     else:
         raise RuntimeError(f"Unsupported tensor shape {tuple(t.shape)}")
     return (arr * 255.0).astype(np.uint8)
+
+def export_strands_to_usd(filename, strand_vertices, gaussians):
+    S, V, _ = strand_vertices.shape
+
+    # ---------- per-vertex width from Gaussian scales -----------------
+    scales       = gaussians.get_scaling.detach()        # (M,3)
+    sigma_perp   = scales[:, 0] * 100                          # use x-axis σ
+    seg_radius   = 2.0 * sigma_perp                      # diameter
+    seg_radius   = seg_radius.view(S, V-1)               # (S, V-1)
+    width_tensor = torch.cat([seg_radius[:, :1], seg_radius], dim=1)
+    widths_np    = width_tensor.cpu().numpy()            # (S, V)
+
+    # ---------- write USD --------------------------------------------
+    stage = Usd.Stage.CreateNew(filename)
+    UsdGeom.Scope.Define(stage, "/hair")                 # container prim
+
+    for sid in range(S):
+        pts_np  = strand_vertices[sid].detach().cpu().numpy() * 100
+        pts     = [Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in pts_np]
+        w       = [float(r) for r in widths_np[sid]]
+
+        curve   = UsdGeom.BasisCurves.Define(stage, f"/hair/strand_{sid}")
+        curve.CreatePointsAttr(pts)
+        curve.CreateWidthsAttr(w)
+        curve.CreateCurveVertexCountsAttr([V])
+        curve.CreateTypeAttr("linear")
+        curve.CreateWrapAttr("nonperiodic")
+
+    stage.Save()
+    print(f"Saved {S} strands with variable widths → {filename}")
 
 def export_strands_as_obj(strands: torch.Tensor, path: str):
     """
