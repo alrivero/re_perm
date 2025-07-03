@@ -15,9 +15,194 @@ from torch.autograd import Variable
 from math import exp, pi
 from typing import Optional, Tuple
 from pytorch3d.ops import knn_points 
+from pytorch3d.structures import Meshes
 
 from utils.general_utils import project_to_screen, quaternion_to_rotation_matrix, convert_normal_to_camera_space
 
+def sdf_contain_and_flow(
+        nphm_grid,
+        gaussians,
+        strand_vertices,           # (S,V,3) canonical strands
+        outside_tol = 0.04,       # 3 mm: allowed outward slack
+        tau         = 0.4,         # |g·t| tolerance (~66°)
+        k_radius    = 2.8,         # 95 % mass shell
+        chunk_size  = 2_000_000,
+        phys_scale  = 1.0,
+):
+    """Returns (loss_contain, loss_flow)."""
+
+    centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
+    scales            = gaussians.get_scaling
+    sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
+
+    M        = centers.shape[0]
+    device   = centers.device
+    depth_all = torch.empty(M, device=device)
+    dot_pen   = torch.empty(M, device=device)   # (|g·t| - tau)+
+
+    for s in range(0, M, chunk_size):
+        e   = min(s + chunk_size, M)
+        pts = centers[s:e].unsqueeze(0)
+        dist, grad = nphm_grid.sample(pts, phys_scale=phys_scale)
+        dist  = dist[0]                                # (N,)
+        g     = torch.nn.functional.normalize(grad[0], dim=1, eps=1e-9)
+
+        cos_a = (g * tangents[s:e]).sum(dim=1)
+        num   = k_radius * sigma_perp[s:e] * sigma_par[s:e]
+        denom = torch.sqrt(cos_a**2 * sigma_perp[s:e]**2 +
+                           (1 - cos_a**2) * sigma_par[s:e]**2) + 1e-9
+        r_star = num / denom
+
+        depth_all[s:e] = dist - r_star                # (+) outside
+        dot_pen  [s:e] = torch.clamp(cos_a.abs() - tau, min=0.0)
+
+    # -------- containment: only if depth > outside_tol ---------------
+    loss_contain = torch.clamp(depth_all - outside_tol,
+                               min=0.0).pow(2).mean()
+
+    # -------- flow: only if depth ≤ 0 (inside or on) -----------------
+    inside_mask = depth_all <= 0.0
+    loss_flow = (dot_pen[inside_mask]**2).mean() if inside_mask.any() \
+                else depth_all.new_tensor(0.0)
+
+    return loss_contain, loss_flow
+
+def sdf_containment_loss(
+        nphm_grid,           # NPHMOctree
+        gaussians,           # GaussianPerm
+        strand_vertices,     # (S,V,3) canonical strands
+        k_radius    = 2.8,   # 95 % mass shell
+        chunk_size  = 200_000,
+        phys_scale  = 1.0,   # 1 ⇒ canonical metres
+):
+    """
+    Penalises Gaussians that lie OUTSIDE the SDF zero-surface.
+    Returns a single scalar loss with gradients.
+    """
+
+    centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
+    scales           = gaussians.get_scaling
+    sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
+
+    M        = centers.shape[0]
+    device   = centers.device
+    depth_all = torch.empty(M, device=device)
+
+    for s in range(0, M, chunk_size):
+        e    = min(s + chunk_size, M)
+        pts  = centers[s:e].unsqueeze(0)                 # (1,N,3)
+        dist, grad = nphm_grid.sample(pts, phys_scale=phys_scale)
+        dist   = dist[0]                                 # (N,)
+        normal = torch.nn.functional.normalize(grad[0], dim=1, eps=1e-9)
+
+        cos_a = (normal * tangents[s:e]).sum(dim=1)
+        num   = k_radius * sigma_perp[s:e] * sigma_par[s:e]
+        denom = torch.sqrt(cos_a**2 * sigma_perp[s:e]**2 +
+                           (1 - cos_a**2) * sigma_par[s:e]**2) + 1e-9
+        r_star = num / denom
+
+        depth_all[s:e] = dist - r_star                   # +ve ⇒ outside
+
+    loss_contain = torch.clamp(depth_all, min=0.0).pow(2).mean()
+    return loss_contain
+
+def sdf_hair_band_loss(
+        nphm_grid,            # NPHMOctree
+        gaussians,            # GaussianPerm
+        strand_vertices,      # (S,V,3) canonical strands
+        eps_band     = 0.004, # 4 mm half-width of the “free” zone
+        k_radius     = 2.8,   # 95 % mass shell
+        chunk_size   = 200_000,
+        phys_scale   = 1.0,
+):
+    """
+    Returns a single scalar loss  L_band  with gradients.
+    Inside |depth| <= eps_band there is *no* penalty.
+
+       depth_i = dist_i - r*_i
+       L_band  = mean( clamp(|depth_i| - eps_band, 0)² )
+    """
+
+    # ---------- centers & tangents from canonical strands --------------
+    centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
+    scales            = gaussians.get_scaling           # (M,3)
+    sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
+
+    M        = centers.shape[0]
+    device   = centers.device
+    depth_all = torch.empty(M, device=device)
+
+    # ---------- chunked SDF queries ------------------------------------
+    for s in range(0, M, chunk_size):
+        e    = min(s + chunk_size, M)
+        pts  = centers[s:e].unsqueeze(0)                 # (1,N,3)
+        dist, grad = nphm_grid.sample(pts, phys_scale=phys_scale)
+        dist   = dist[0]                                 # (N,)
+        normal = F.normalize(grad[0], dim=1, eps=1e-9)   # (N,3)
+
+        # anisotropic support radius
+        cos_a = (normal * tangents[s:e]).sum(dim=1)
+        num   = k_radius * sigma_perp[s:e] * sigma_par[s:e]
+        denom = torch.sqrt(cos_a**2 * sigma_perp[s:e]**2 +
+                           (1 - cos_a**2) * sigma_par[s:e]**2) + 1e-9
+        r_star = num / denom
+
+        depth_all[s:e] = dist - r_star                   # signed depth
+
+    # ---------- band-pass hinge ----------------------------------------
+    loss_band = torch.clamp(depth_all.abs() - eps_band,
+                            min=0.0).pow(2).mean()
+    return loss_band
+
+def sdf_hair_losses(
+        nphm_grid,            # NPHMOctree
+        gaussians,            # GaussianPerm
+        strand_vertices,      # (S,V,3) canonical strands
+        k_radius      = 2.8,  # 95 % mass shell
+        tol_inside    = 0.01,  # no inward tolerance
+        outside_limit = 0.060, # 3 cm leash (set as you like)
+        chunk_size    = 2000_000,
+        phys_scale    = 1.00,  # canonical metres
+):
+    """
+    Returns (loss_in, loss_out) – both keep gradients.
+    """
+    # --- centers & tangents computed fresh from canonical strands ----
+    centers, tangents = gaussians.world_centers_and_tangents(
+                            strand_vertices)
+
+    scales      = gaussians.get_scaling
+    sigma_perp  = scales[:, 0]
+    sigma_par   = scales[:, 1]
+
+    M = centers.shape[0]
+    device = centers.device
+    depth_all = torch.empty(M, device=device)
+
+    # ------------- chunked SDF queries -------------------------------
+    for s in range(0, M, chunk_size):
+        e = min(s + chunk_size, M)
+        pts = centers[s:e].unsqueeze(0)              # (1,N,3)
+        dist, grad = nphm_grid.sample(pts,
+                                      phys_scale=phys_scale)
+        dist = dist[0]                               # (N,)
+        grad = grad[0]
+        normal = torch.nn.functional.normalize(grad, dim=1, eps=1e-9)
+
+        cos_ang = (normal * tangents[s:e]).sum(dim=1)
+        num   = k_radius * sigma_perp[s:e] * sigma_par[s:e]
+        denom = torch.sqrt(cos_ang**2 * sigma_perp[s:e]**2 +
+                           (1-cos_ang**2) * sigma_par[s:e]**2) + 1e-9
+        r_star = num / denom
+        depth_all[s:e] = dist - r_star               # signed depth
+
+    # ---------------- hinge losses -----------------------------------
+    loss_in  = torch.clamp(-depth_all + tol_inside,
+                           min=0.0).pow(2).mean()
+    loss_out = torch.clamp( depth_all - outside_limit,
+                           min=0.0).pow(2).mean()
+
+    return loss_in, loss_out
 
 def filtered_opacity_penalty(gaussians):
     """
@@ -191,7 +376,7 @@ def _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W):
 
     u, v = uv[:, 0], uv[:, 1]
     in_view = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-    return u[in_view], v[in_view], in_view          # filtered u,v and mask
+    return u, v, in_view          # filtered u,v and mask
 
 
 def orientation_loss_kernel(
@@ -323,6 +508,7 @@ def orientation_loss_v2_debug(
         gaussians,
         hair_mask: torch.Tensor,      # (1,H,W)
         orient_map:  torch.Tensor,    # (C,H,W) or (H,W,C)
+        occ_mask: torch.Tensor,
         mask_thresh: float = 0.5,
         debug: bool = False,
         max_arrows: int = 300):
@@ -336,14 +522,24 @@ def orientation_loss_v2_debug(
         m, g, b = orient_map[..., 0], orient_map[..., 1], orient_map[..., 2]
     else:
         return (torch.tensor(0., device=device), None) if debug else torch.tensor(0., device=device)
-
-    dx = g * 2.0 - 1.0
-    dy = b * 2.0 - 1.0
+    
+    dx = b * 2.0 - 1.0
+    dy = g * 2.0 - 1.0
     mask_pix = m > mask_thresh
     H, W = m.shape[-2:]
 
+    _, hm, wm = hair_mask.shape
+    if hm != H:
+        hair_mask = F.interpolate(hair_mask.unsqueeze(1),                     
+                                size=(H, W),                         
+                                mode='bilinear', align_corners=False)[0]
+
     # project ------------------------------------------------------------
     u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
+    in_view = in_view & occ_mask
+    u = u[in_view]
+    v = v[in_view]
+
     if u.numel() == 0:
         return (torch.tensor(0., device=device), None) if debug else torch.tensor(0., device=device)
     idx_g = in_view.nonzero(as_tuple=False).squeeze(1)
@@ -357,6 +553,7 @@ def orientation_loss_v2_debug(
 
     # gt / pred dirs -----------------------------------------------------
     gt_vec2d = F.normalize(torch.stack([dx[v, u], dy[v, u]], -1), dim=-1)
+    gt_vec2d *= -1
 
     R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation)
     y_world  = R_local[:, :, 1]
@@ -587,48 +784,42 @@ def strand_length_loss(strand_points,
                        excess - 0.5 * delta)
     return loss.mean()
 
-def neighbour_orientation_loss(strand_points,
-                               k             = 8,      # how many neighbours per strand
-                               eps           = 1e-6):  # numerical safety
+def neighbour_orientation_loss(
+    strand_points: torch.Tensor,
+    neighbor_idx: torch.LongTensor,
+    k: int = 6
+) -> torch.Tensor:
     """
-    strand_points : (S,V,3)  tensor  (S = num_strands, V = STRAND_VERTEX_COUNT)
-                     *must* contain the root at index‑0 and the first off‑root
-                     vertex at index‑1 so we can define an orientation vector
-                     along the strand.
-
-    Returns a scalar loss in [0,2].
+    Encourage neighbouring strands to have similar orientations,
+    using a precomputed neighbour‐list (no O(S^2) cdist).
+    Args:
+        strand_points: (S, V, 3) tensor of strand vertices in scene space.
+        neighbor_idx:  (S, K_MAX) LongTensor of neighbour‐indices per strand.
+        k:             how many of those precomputed neighbours to use.
+    Returns:
+        Scalar loss.
     """
-    S = strand_points.size(0)
+    device = strand_points.device
+    S = strand_points.shape[0]
+    if S < 2:
+        return torch.tensor(0.0, device=device)
 
-    # ------------------------------------------------------------------ #
-    # 1 ) orientation vector of every strand (root → vertex‑1)           #
-    # ------------------------------------------------------------------ #
-    orient = strand_points[:, 1] - strand_points[:, 0]         # (S,3)
-    orient = F.normalize(orient, dim=-1, eps=eps)              # (S,3)
+    # effective neighbour count
+    k_eff = min(k, neighbor_idx.size(1))
 
-    # ------------------------------------------------------------------ #
-    # 2 ) find spatial neighbours using root positions                  #
-    # ------------------------------------------------------------------ #
-    roots = strand_points[:, 0]                                # (S,3)
-    # pairwise squared distance matrix  (S,S)
-    d2 = torch.cdist(roots, roots, p=2)**2                     # (S,S)
+    # 1) extract tangents at root
+    tangents = strand_points[:, 1] - strand_points[:, 0]            # (S,3)
+    tangents = F.normalize(tangents, dim=1, eps=1e-6)               # (S,3)
 
-    # k+1 because distance to itself == 0
-    _, idx_knn = torch.topk(d2, k=k+1, largest=False)          # (S,k+1)
-    idx_knn = idx_knn[:, 1:]                                   # drop self → (S,k)
+    # 2) gather each strand's k_eff neighbours
+    idx_knn = neighbor_idx[:, :k_eff]                               # (S, k_eff)
+    nbr_tangs = tangents[idx_knn]                                   # (S, k_eff, 3)
 
-    # ------------------------------------------------------------------ #
-    # 3 ) cosine similarity with each neighbour                         #
-    # ------------------------------------------------------------------ #
-    v_i   = orient.unsqueeze(1).expand(-1, k, -1)              # (S,k,3)
-    v_j   = orient[idx_knn]                                    # (S,k,3)
+    # 3) cosine similarity
+    cos_sim = (tangents.unsqueeze(1) * nbr_tangs).sum(dim=2)        # (S, k_eff)
 
-    cos_ij = (v_i * v_j).sum(dim=-1).clamp(-1.0, 1.0)          # (S,k)
-
-    # ------------------------------------------------------------------ #
-    # 4 ) loss  = 1 – cosθ   (0 when perfectly aligned, ↑ as they diverge)
-    # ------------------------------------------------------------------ #
-    loss = (1.0 - cos_ij).mean()                               # scalar
+    # 4) hinge‐style penalty: mean(1 - cos_sim)
+    loss = (1.0 - cos_sim).clamp(min=0).mean()
     return loss
 
 def outside_opacity_loss(viewpoint_cam, gaussians, hair_mask):
@@ -647,7 +838,7 @@ def outside_opacity_loss(viewpoint_cam, gaussians, hair_mask):
     device = gaussians.get_xyz.device
     H, W = hair_mask.shape[1:]
 
-    # 1) project every Gaussian’s centre into pixel coords
+    # 1) project every Gaussian’s center into pixel coords
     u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
     if u.numel() == 0:
         return torch.tensor(0.0, device=device)
@@ -856,98 +1047,354 @@ def aligned_depth_loss_old(
 
     return loss, D_norm
 
-def head_collision_loss(strand_pts, head_vertices, margin=0.002):
-    """
-    Penalise strand points that sit closer than `margin` metres to the scalp mesh.
 
-    Args
-    ----
-    strand_pts    : (S, V, 3) tensor - all strand vertices in scene space
-    head_vertices : (H, 3) tensor    - scalp/head vertices, same units
-    margin        : float            - safe clearance
-    """
-    S, V, _ = strand_pts.shape
-    pts  = strand_pts.reshape(-1, 3).unsqueeze(0)   # (1, S*V, 3)
-    head = head_vertices.unsqueeze(0)               # (1, H,   3)
-
-    knn_out = knn_points(pts, head, K=1, return_nn=False)  # KNNOutputs
-    dists   = knn_out.dists.squeeze()                      # (S*V,)
-
-    # hinge: zero loss when outside, linear penalty inside the margin
-    penetration = torch.relu(margin - dists)
-    return penetration.mean()
-
-def strand_repulsion_loss(
-    strand_pts: torch.Tensor,   # (S, V, 3)  all vertices in scene space
-    k:          int = 3,        # nearest neighbours to consider
-    step:       int = 4,        # subsample every `step` vertices along strand
-    safe_dist: float = 0.003    # metres; 3 mm tube radius
+def head_collision_loss(
+    strand_pts: torch.Tensor,     # (S, V, 3)
+    head_pts:   torch.Tensor,     # (H, 3)
+    head_nmls:  torch.Tensor,     # (H, 3)
+    margin:     float = 0.001,    # metres
+    reduction:  str = "mean"      # "none"|"sum"|"mean"
 ) -> torch.Tensor:
     """
-    Penalise strands whose *samples along the fibre* come closer than
-    `safe_dist` to another strand.
+    strand_pts : (S,V,3) hair‐vertex positions
+    head_pts   : (H,3)   sampled head‐point positions
+    head_nmls  : (H,3)   corresponding unit normals (pointing outward)
+    """
+    # 1) flatten hair points → (1, N, 3)
+    N = strand_pts.shape[0] * strand_pts.shape[1]
+    pts = strand_pts.reshape(1, N, 3)
 
-    Strategy
-    --------
-    1. Take every `step`‑th vertex along each strand (mid‑points work too).
-    2. K‑NN in that sample cloud (pooled across all strands, self‑matches
-       ignored).
-    3. Hinge loss on distances below `safe_dist`.
+    # 2) head pointcloud → (1, H, 3)
+    head = head_pts.unsqueeze(0)
+
+    # 3) knn search (returns squared dists & indices)
+    knn = knn_points(pts, head, K=1, return_nn=False)
+    idx = knn.idx.squeeze(0).squeeze(-1)         # (N,)
+
+    # 4) gather closest head point + normal
+    closest = head_pts[idx]                      # (N,3)
+    nrm     = head_nmls[idx]                     # (N,3)
+
+    # 5) signed distance = dot( p - closest, normal )
+    delta = pts.squeeze(0) - closest             # (N,3)
+    d_signed = (delta * nrm).sum(dim=1)          # (N,)
+
+    # 6) hinge‐violation: margin – d_signed
+    viol = F.relu(margin - d_signed)             # (N,)
+
+    loss = viol.pow(2)                           # quadratic
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Unknown reduction {reduction!r}")
+
+def gaussian_head_collision_loss(
+    gaussians,                   # your GaussianPerm instance
+    head_pts: torch.Tensor,      # (H,3) mesh.vertices as torch.Tensor
+    head_nmls: torch.Tensor,     # (H,3) mesh.vertex_normals as torch.Tensor
+    margin: float = 0.001,       # metres of clearance
+    reduction: str = "mean"      # "none" | "sum" | "mean"
+) -> torch.Tensor:
+    """
+    Ensure no Gaussian center lies inside the head mesh (or closer than margin).
+
+    We take:
+      p_i     = gaussians.get_xyz (M,3)
+      head    = head_pts           (H,3)
+      normals = head_nmls          (H,3)
+
+    1) For each p_i, find nearest head point p_h via knn_points.
+    2) Compute signed‐distance = (p_i - p_h) · n_h.
+    3) Penalize margin - signed_distance if signed_distance < margin.
+    """
+    # 1) collect Gaussian centers → (1, M, 3)
+    pts = gaussians.get_xyz.unsqueeze(0)     # (1, M, 3)
+
+    # 2) head point‐cloud → (1, H, 3)
+    head = head_pts.unsqueeze(0)             # (1, H, 3)
+
+    # 3) KNN query for nearest head‐point
+    knn = knn_points(pts, head, K=1, return_nn=False)
+    idx = knn.idx.squeeze(0).squeeze(-1)     # (M,)
+
+    # 4) gather the matched head‐points + normals
+    closest = head_pts[idx]                  # (M,3)
+    normals = head_nmls[idx]                 # (M,3)
+
+    # 5) signed distance along the normal
+    delta = pts.squeeze(0) - closest         # (M,3)
+    d_signed = (delta * normals).sum(dim=1)  # (M,)
+
+    # 6) hinge on margin
+    viol = F.relu(margin - d_signed)         # (M,)
+    loss = viol.pow(2)                       # (M,)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Unknown reduction: {reduction!r}")
+
+def strand_repulsion_loss(
+    strand_pts: torch.Tensor,     # (S, V, 3) all strand vertices
+    gaussians,                    # GaussianPerm instance (has _strand_radius, roots)
+    k_strand:    int = 18,         # how many neighbour-strands to consider per strand
+    step:        int = 1,         # subsample every `step` vertices
+    safe_dist:   float = 0.000    # metres
+) -> torch.Tensor:
+    """
+    Vectorized strand repulsion that only checks between strands whose roots
+    are k_strand-nearest neighbours.
+
+    Returns a scalar hinge loss.
     """
     device = strand_pts.device
     S, V, _ = strand_pts.shape
+    if S < 2:
+        return torch.tensor(0.0, device=device)
 
-    # 1) subsample along each strand to reduce O(N^2)
-    sampled = strand_pts[:, ::step].reshape(-1, 3).unsqueeze(0)  # (1, P, 3)
+    # 1) subsample each strand’s points
+    sampled = strand_pts[:, ::step]          # (S, P_each, 3)
+    P_each = sampled.shape[1]
 
-    # 2) KNN (returns squared distances)
-    d2, _ = knn_points(sampled, sampled, K=k + 1, return_nn=False)  # (1, P, k+1)
-    d2 = d2[:, :, 1:]  # drop self‑distance
+    # 2) find k_strand nearest-neighbour strands by root positions
+    roots = gaussians.roots                   # (S, 3)
+    dist_roots = torch.cdist(roots, roots, p=2)  # (S, S)
+    _, nbrs_all = dist_roots.topk(k=k_strand+1, dim=1, largest=False)
+    nbrs = nbrs_all[:, 1:]                    # (S, k_strand)
 
-    # 3) hinge on safe distance
-    safe2 = safe_dist ** 2
-    loss = torch.relu(safe2 - d2).mean()
-    return loss
+    # 3) build all unordered (s < t) neighbour pairs
+    s_idx = torch.arange(S, device=device).unsqueeze(1).expand(-1, k_strand)  # (S, k_strand)
+    mask = nbrs > s_idx                       # only keep t > s
+    pair_s = s_idx[mask]                      # (P,)
+    pair_t = nbrs[mask]                       # (P,)
+    P = pair_s.shape[0]
+    if P == 0:
+        return torch.tensor(0.0, device=device)
 
-def strand_repulsion_loss(
-    strand_pts: torch.Tensor,  # (S, V, 3)
-    k: int = 8,
-    step: int = 2,
-    safe_dist: float = 0.0025
+    # 4) gather sampled points for each pair
+    pts_s = sampled[pair_s]  # (P, P_each, 3)
+    pts_t = sampled[pair_t]  # (P, P_each, 3)
+
+    # 5) compute batched squared distances: (P, P_each, P_each)
+    d_mat = torch.cdist(pts_s, pts_t, p=2.0)  # (P, P_each, P_each)
+    d2 = d_mat.pow(2)
+
+    # 6) compute hinge threshold per pair: (r_s + r_t + safe_dist)^2 → (P,)
+    r = gaussians._strand_radius  # (S,)
+    r_s = r[pair_s]               # (P,)
+    r_t = r[pair_t]               # (P,)
+    thresh2 = (r_s + r_t + safe_dist).pow(2).view(P, 1, 1)
+
+    # 7) hinge loss: ReLU(thresh2 - d2), mean over each (P_each × P_each) block
+    loss_mat = torch.relu(thresh2 - d2)        # (P, P_each, P_each)
+    loss_pairs = loss_mat.mean(dim=(1, 2))     # (P,)
+
+    # 8) final scalar: mean over all P neighbour-pairs
+    return loss_pairs.mean()
+
+def gaussian_scale_regularization_loss(
+    gaussians,
+    max_ratio: float = 30.0,
+    eps: float = 1e-6
 ) -> torch.Tensor:
     """
-    Repel nearby strand vertices from each other.
-    Samples every `step`-th point along each strand, finds its k nearest
-    neighbours (excluding itself) and applies a hinge loss if closer than
-    safe_dist.
+    Hinge‐style penalty if any Gaussian’s tangential scale σ∥
+    exceeds max_ratio × its perpendicular scale σ⊥.
 
     Args:
-        strand_pts: (S, V, 3) all strand control points
-        k         : number of neighbours per sample
-        step      : sampling interval along each strand
-        safe_dist : minimum allowed distance
-
+        gaussians: your GaussianPerm instance
+        max_ratio: allowed σ∥/σ⊥ before penalty kicks in
+        eps:       small value to avoid division by zero
     Returns:
-        scalar repulsion loss
+        scalar loss
     """
-    S, V, _ = strand_pts.shape
-    # flatten and subsample
-    pts = strand_pts.reshape(-1, 3)                   # (S*V, 3)
-    sampled = pts[::step].unsqueeze(0)                # (1, P, 3)
+    # (M,3): (σ⊥, σ∥, σ⊥)
+    scales = gaussians.get_scaling
+    perp   = scales[:, 0]              # (M,)
+    para   = scales[:, 1]              # (M,)
 
-    # run knn (now returns a KNNOutputs object)
-    knn_out = knn_points(sampled, sampled, K=k+1, return_nn=False)
-    # distances shape: (1, P, k+1)
-    d2 = knn_out.dists.squeeze(0)                     # → (P, k+1)
+    # current ratio
+    cur_ratio = para / (perp + eps)    # (M,)
 
-    # drop the first neighbour (self, distance=0)
-    neigh2 = d2[:, 1:]                                # (P, k)
+    # hinge: excess ratio
+    excess = (cur_ratio - max_ratio).clamp(min=0.0)
 
-    # convert squared‐distance to euclidean
-    dist = torch.sqrt(neigh2 + 1e-12)
+    # quadratic penalty
+    return (excess ** 2).mean()
 
-    # hinge: zero when outside safe_dist, linear penalty when inside
-    penal = F.relu(safe_dist - dist)
+def local_length_consistency_loss(
+    gaussians,
+    k: int = 6
+) -> torch.Tensor:
+    """
+    Enforce that nearby strands (by root position) have similar total lengths,
+    using a precomputed neighbour‐list (no O(S^2) cdist).
+    """
+    device = gaussians.roots.device
+    S = gaussians.num_strands
+    if S < 2:
+        return torch.tensor(0.0, device=device)
 
-    # average over all samples & neighbours
-    return penal.mean()
+    # effective neighbourhood size
+    k_eff = min(k, gaussians.neighbor_idx.size(1))
+
+    # get neighbour indices
+    neighbors = gaussians.neighbor_idx[:, :k_eff]                   # (S, k_eff)
+
+    # strand lengths
+    lengths = gaussians.strand_length                               # (S,)
+
+    # gather the neighbour‐lengths
+    nbr_lengths = lengths[neighbors]                                # (S, k_eff)
+
+    # squared differences
+    diff = lengths.unsqueeze(1) - nbr_lengths                       # (S, k_eff)
+    return (diff ** 2).mean()
+
+
+def color_variance_loss_sh(gaussians) -> torch.Tensor:
+    """
+    Compute the mean variance of SH color features across Gaussians on each strand.
+    """
+    feat_all = gaussians.get_features           # (M, n_sh, 3)
+    M, n_sh, _ = feat_all.shape
+    D = n_sh * 3
+    feat_flat = feat_all.view(M, D)             # (M, D)
+
+    strand_id = gaussians._strand_id            # (M,)
+    S = gaussians.num_strands
+    device = feat_flat.device
+
+    # Count Gaussians per strand
+    counts = torch.bincount(strand_id, minlength=S).unsqueeze(1).float()  # (S,1)
+    counts_clamped = counts.clamp_min(1.0)
+
+    # Sum of features per strand: (S, D)
+    sum_feats = torch.zeros((S, D), device=device)
+    sum_feats = sum_feats.index_add(0, strand_id, feat_flat)
+
+    # Sum of squares per strand: (S, D)
+    sum_feats_sq = torch.zeros((S, D), device=device)
+    sum_feats_sq = sum_feats_sq.index_add(0, strand_id, feat_flat * feat_flat)
+
+    # Variance per feature: E[x^2] - (E[x])^2
+    mean_feats = sum_feats / counts_clamped       # (S, D)
+    mean_feats_sq = sum_feats_sq / counts_clamped # (S, D)
+    var_feats = mean_feats_sq - mean_feats * mean_feats  # (S, D)
+
+    # Collapse each strand's D-dimensional variance to a scalar, then average
+    strand_var = var_feats.mean(dim=1)             # (S,)
+    return strand_var.mean()
+
+def opacity_variance_loss(gaussians) -> torch.Tensor:
+    """
+    Compute the mean variance of per‐Gaussian opacity across all Gaussians on each strand,
+    in a memory‐efficient way and clamped to ≥0.
+    """
+    # 1) Fetch each Gaussian’s opacity as a 1-D tensor (M,)
+    opac_all  = gaussians.get_opacity_with_3D_filter.squeeze(-1)  # (M,)
+
+    # 2) Strand‐ID mapping
+    strand_id = gaussians._strand_id                               # (M,)
+    S         = gaussians.num_strands
+    device    = opac_all.device
+
+    # 3) Count Gaussians per strand → (S,)
+    counts = torch.bincount(strand_id, minlength=S).float()       # (S,)
+    counts = counts.clamp_min(1.0)                                # avoid div by zero
+
+    # 4) Sum of opacities per strand → (S,)
+    sum_op    = torch.zeros(S, device=device)
+    sum_op    = sum_op.index_add_(0, strand_id, opac_all)
+
+    # 5) Sum of squared opacities per strand → (S,)
+    sum_op_sq = torch.zeros(S, device=device)
+    sum_op_sq = sum_op_sq.index_add_(0, strand_id, opac_all * opac_all)
+
+    # 6) Compute per‐strand means
+    mean_op    = sum_op    / counts   # (S,)
+    mean_op_sq = sum_op_sq / counts   # (S,)
+
+    # 7) Variance per strand and clamp to ≥0
+    var_per_strand = mean_op_sq - mean_op * mean_op  # (S,)
+    var_per_strand = torch.clamp(var_per_strand, min=0.0)
+
+    # 8) Return the average variance across strands
+    return var_per_strand.mean()
+
+def triangle_scale_area_loss(gaussians,
+                             beta: float = 2e6,
+                             lam: float = 0.0) -> torch.Tensor:
+    """
+    Robust triangle-area loss with soft‐max outlier penalty.
+
+    For each Gaussian, build the triangle whose vertices are:
+      • P0      : center
+      • P1      : P0 + 0.5 * sigma_para * tangent
+      • P_close : projection of P1 onto the local strand
+
+    area = 0.5 * ||P1−P0|| * ||P_close−P0||
+
+    Loss = mean(area) + lam * (1/beta) * log_mean_exp(beta * area)
+
+    where (1/beta) * log_mean_exp(beta * a) is a smooth approximation of max(a).
+    """
+
+    # 1) compute half‐scale area per Gaussian (as before) …
+    scales     = gaussians.get_scaling                 # (M,3)
+    sigma_para = scales[:,1] * 0.5                     # (M,)
+
+    P0 = gaussians.get_xyz                              # (M,3)
+
+    R_local = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (M,3,3)
+    tangent = R_local[:,:,1]                                         # (M,3)
+
+    v  = tangent * sigma_para.unsqueeze(1)      # (M,3)
+    P1 = P0 + v                                  # (M,3)
+
+    # local‐segment projection (vectorized, O(M))
+    sid     = gaussians._strand_id
+    s_param = gaussians.get_axial_weight
+    strands = gaussians.strands                  # (S,V,3)
+    S, V, _  = strands.shape
+
+    idx = (s_param*(V-1)).floor().long().clamp(0, V-2)  # (M,)
+    segs = torch.stack([idx,
+                        (idx-1).clamp(0,V-2),
+                        (idx+1).clamp(0,V-2)],
+                       dim=1)                       # (M,3)
+    flat = strands.view(-1,3)                         # (S*V,3)
+    base = sid * V                                    # (M,)
+    idx_flat = base.unsqueeze(1) + segs               # (M,3)
+    A = flat[idx_flat]                                # (M,3,3)
+    B = flat[idx_flat+1]                              # (M,3,3)
+
+    AB  = B - A                                       # (M,3,3)
+    AB2 = (AB*AB).sum(dim=2).clamp(min=1e-8)           # (M,3)
+    AP  = P1.unsqueeze(1) - A                         # (M,3,3)
+    t   = (AP*AB).sum(dim=2) / AB2                    # (M,3)
+    t_cl= t.clamp(0,1).unsqueeze(2)                   # (M,3,1)
+    P_proj = A + AB*t_cl                              # (M,3,3)
+
+    d2    = ((P1.unsqueeze(1) - P_proj)**2).sum(dim=2)  # (M,3)
+    best  = d2.argmin(dim=1)                           # (M,)
+    P_close = P_proj[torch.arange(P_proj.size(0)), best]  # (M,3)
+
+    u     = P_close - P0                               # (M,3)
+    area  = 0.5 * v.norm(dim=1) * u.norm(dim=1)        # (M,)
+
+    # # 2) soft‐max outlier penalty via log‐mean‐exp
+    # #    log_mean_exp = log( mean(exp(beta*area)) )
+    # lme  = (area * beta).exp().mean().log()
+    # soft_max = lme / beta
+
+    # 3) combined loss
+    return (area ** 4).mean()

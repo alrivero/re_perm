@@ -16,11 +16,173 @@ from datetime import datetime
 import numpy as np
 import random
 import rff
-
+import trimesh
 import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 from pxr import Usd, UsdGeom, Gf
+
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+    PerspectiveCameras,
+    RasterizationSettings,
+    MeshRasterizer
+)
+
+import torch
+from pytorch3d.renderer import PerspectiveCameras, RasterizationSettings, MeshRasterizer
+from pytorch3d.structures import Meshes
+
+def get_linear_noise_func(
+        lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
+):
+    """
+    Copied from Plenoxels
+
+    Continuous learning rate decay function. Adapted from JaxNeRF
+    The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
+    is log-linearly interpolated elsewhere (equivalent to exponential decay).
+    If lr_delay_steps>0 then the learning rate will be scaled by some smooth
+    function of lr_delay_mult, such that the initial learning rate is
+    lr_init*lr_delay_mult at the beginning of optimization but will be eased back
+    to the normal learning rate when steps>lr_delay_steps.
+    :param conf: config subtree 'lr' or similar
+    :param max_steps: int, the number of steps during optimization.
+    :return HoF which takes step as input
+    """
+
+    def helper(step):
+        if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+            # Disable this parameter
+            return 0.0
+        if lr_delay_steps > 0:
+            # A kind of reverse cosine decay.
+            delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
+                0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
+            )
+        else:
+            delay_rate = 1.0
+        t = np.clip(step / max_steps, 0, 1)
+        log_lerp = lr_init * (1 - t) + lr_final * t
+        return delay_rate * log_lerp
+
+    return helper
+
+def make_p3d_camera(cam, device):
+    """
+    Build a PyTorch3D PerspectiveCameras from your MiniCam/Camera,
+    using focal_x, focal_y (pixels) and image center as principal point.
+    """
+    H, W = int(cam.image_height), int(cam.image_width)
+    # Extrinsics: world->camera
+    C2W   = cam.world_view_transform.to(device).float()   # camera→world (4×4)
+    R_c2w = C2W[:3, :3]                                   # (3×3)
+    t_c2w = C2W[3, :3]                                    # (3,)
+    R     = R_c2w.unsqueeze(0)             # (1,3,3)
+    T     = t_c2w.unsqueeze(0)   # (1,3)
+
+    # Intrinsics: focal lengths and principal point
+    fx, fy = cam.focal_x, cam.focal_y
+    px, py = W * 0.5, H * 0.5
+
+    return PerspectiveCameras(
+        focal_length    = ((fx, fy),),       # batch of one
+        principal_point = ((px, py),),
+        R               = R,
+        T               = T,
+        in_ndc          = False,             # pixel units
+        image_size      = [[H, W]],
+        device          = device
+    )
+
+def compute_occlusion_mask(pc, cam, verts, faces, eps=1e-3):
+    device = pc.get_xyz.device
+    H, W   = int(cam.image_height), int(cam.image_width)
+
+    # Build the camera
+    cameras = make_p3d_camera(cam, device)
+
+    # 1) Rasterize mesh → camera‐space depth_map
+    mesh     = Meshes(verts=verts, faces=faces)
+    fragments= MeshRasterizer(
+                  cameras=cameras,
+                  raster_settings=RasterizationSettings(
+                      image_size=(H, W),
+                      blur_radius=0.0,
+                      faces_per_pixel=1
+                  )
+              )(mesh)
+    depth_map = fragments.zbuf[0, ..., 0]
+    depth_map = depth_map.flip(0).flip(1)
+
+    # 2) Compute camera‐space Z for each Gaussian
+    world_to_view = cameras.get_world_to_view_transform()
+    pts_cam_h     = world_to_view.transform_points(pc.get_xyz.unsqueeze(0))  # (1, M, 3)
+    z_cam         = pts_cam_h[0, :, 2]                                        # (M,)
+
+    # 3) Project only for pixel coords (u, v)
+    screen_pts    = cameras.transform_points_screen(
+                        pc.get_xyz.unsqueeze(0),
+                        image_size=(H, W)
+                    )[0]
+    u, v, _       = screen_pts.unbind(-1)
+    u_pix         = u.round().long().clamp(0, W-1)
+    v_pix         = v.round().long().clamp(0, H-1)
+    u_pix = (W - 1) - u_pix
+    v_pix = (H - 1) - v_pix
+
+    # 4) Occlusion: same camera‐space depth domain
+    in_front     = z_cam > eps
+    depth_at_pix = depth_map[v_pix, u_pix]            # (M,)
+    back_at_pix   = depth_at_pix == -1
+    visible      = in_front & ((z_cam <= depth_at_pix + eps) | back_at_pix)
+
+    depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
+    return visible, depth_map
+
+def average_opacity_per_strand(gaussians):
+    """
+    Compute the average opacity of all Gaussians grouped by strand.
+
+    Returns:
+      avg_op: Tensor of shape (S,) where S = gaussians.num_strands,
+              and avg_op[i] is the mean opacity of strand i.
+    """
+    # 1) fetch per-Gaussian opacities: (M,)
+    #    you can swap get_opacity_with_3D_filter for get_opacity if you prefer
+    opac = gaussians.get_opacity_with_3D_filter.squeeze(-1)  
+
+    # 2) strand IDs for each Gaussian: (M,)
+    strand_id = gaussians._strand_id  
+
+    # 3) prepare accumulator & counts
+    S = gaussians.num_strands
+    device = opac.device
+    sum_op = torch.zeros(S, device=device)
+    count = torch.zeros(S, device=device)
+
+    # 4) accumulate sums and counts
+    sum_op  = sum_op.index_add_(0, strand_id, opac)
+    count   = count.index_add_(0, strand_id, torch.ones_like(opac))
+
+    # 5) avoid division by zero, then compute mean
+    count = count.clamp(min=1.0)
+    avg_op = sum_op / count
+
+    return avg_op
+
+
+def average_opacity_for_strand(gaussians, strand_idx):
+    """
+    Compute the average opacity of all Gaussians attached to strand `strand_idx`.
+    """
+    opac       = gaussians.get_opacity_with_3D_filter.squeeze(-1)
+    strand_id  = gaussians._strand_id
+    mask       = (strand_id == strand_idx)
+
+    if mask.sum() == 0:
+        raise ValueError(f"No Gaussians found for strand {strand_idx}")
+    return opac[mask].mean()
 
 def compute_pixel_footprint(K, depth):
     """
@@ -108,22 +270,29 @@ def convert_normal_to_camera_space(
         normals:        torch.Tensor,   # (N,3) world-space normals
         extrinsic_rot:  torch.Tensor,   # (3,3) world→cam rotation  R_wc
         intrinsics:     torch.Tensor,   # (3,3) K
-        eps: float = 1e-8):
+        eps: float = 1e-6):
     """
-    Returns 2-D directions (d_u, d_v) in pixel units.
-    Works with autograd (no in-place ops).
+    Returns 2-D unit directions (+X→right, +Y→up) for each world-space normal,
+    safely handling zeros or negatives in the depth (z) channel.
     """
-    # 1. rotate normal into camera coords
-    n_cam = normals @ extrinsic_rot.T             # (N,3)
+    # 1) rotate into camera coords
+    n_cam = normals @ extrinsic_rot.T           # (N,3)
 
-    # 2. divide by z (keep grads, avoid zero-div)
-    z = n_cam[:, 2:3].clamp_min(eps)
-    n_cam = n_cam / z                             # (N,3)   out-of-place
+    # 2) extract z
+    z = n_cam[:, 2:3]                           # (N,1)
 
-    # 3. apply intrinsics  (row-vector convention)  & keep x,y
-    d_uv = (n_cam @ intrinsics.T)[:, :2]          # (N,2)
+    # 3) compute raw slopes; allow true negatives (they’ll get zeroed soon)
+    slopes = n_cam[:, :2] / (z + eps)           # (N,2)  small eps only to avoid div-by-zero
 
-    return d_uv
+    # 4) apply intrinsics *sans* principal-point
+    #    (we only care about direction, so we skip c_x/c_y entirely)
+    fx, fy = intrinsics[0,0], intrinsics[1,1]
+    slopes = slopes * torch.tensor([fx, fy], device=slopes.device)  # pixel‐scale slopes
+
+    # 5) flip v if +v is down in your convention
+    slopes[:,1] = -slopes[:,1]
+
+    return slopes
 
 def quaternion_to_rotation_matrix(quaternions):
     # Ensure quaternions tensor has the correct shape (n x 4)
@@ -183,6 +352,20 @@ def save_tensor_to_ply(points: torch.Tensor, path: str):
         f.write(header)
         for p in points:
             f.write(f"{p[0]} {p[1]} {p[2]}\n")
+
+def save_tensor_to_obj(points: torch.Tensor, filename: str):
+    """
+    Save an (N,3) torch.Tensor point cloud to an OBJ file via trimesh.
+
+    Args:
+        points:   torch.Tensor of shape (N,3)
+        filename: Path to the output .obj file (should end in .obj)
+    """
+    # 1) detach and move to CPU, convert to (N,3) numpy
+    pts = points.detach().cpu().numpy()
+    # 2) build a PointCloud and export by extension
+    pc = trimesh.PointCloud(pts)
+    pc.export(filename)  # trimesh infers OBJ from .obj extension
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))

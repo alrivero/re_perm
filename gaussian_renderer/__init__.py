@@ -11,11 +11,14 @@
 
 import torch
 import math
+import trimesh
+import numpy as np
+
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_perm import GaussianPerm
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None):
+def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None, occ_mask=None):
     """
     Render the scene. 
     
@@ -27,7 +30,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     kernel_size = torch.tensor(kernel_size).to(pc.roots.device)
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(pc.get_xyz[occ_mask], dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -90,6 +93,18 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     # scales = torch.ones_like(scales) * 0.001
     # opacity = torch.ones_like(opacity)
 
+    if occ_mask is not None:
+        vis_mask = occ_mask
+
+        # filter out occluded Gaussians
+        means3D = means3D[vis_mask]
+        opacity = opacity[vis_mask]
+        if scales        is not None: scales        = scales[vis_mask]
+        if rotations     is not None: rotations     = rotations[vis_mask]
+        if cov3D_precomp is not None: cov3D_precomp = cov3D_precomp[vis_mask]
+        if shs           is not None: shs           = shs[vis_mask]
+        if colors_precomp is not None: colors_precomp = colors_precomp[vis_mask]
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii= rasterizer(
         means3D = means3D,
@@ -119,8 +134,8 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
         debug=pipe.debug
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
     colors_precomp = torch.ones_like(means3D)
+
     seg_image, _= rasterizer(
         means3D = means3D,
         means2D = means2D,

@@ -3,10 +3,11 @@ import torch.nn.functional as F
 
 from torch import nn
 from utils.general_utils import get_embedder
+from flame.flame import FlameHead
 
 
 class PermDeformModel(nn.Module):
-    def __init__(self, perm, device):
+    def __init__(self, perm, flame, device):
         super().__init__()
 
         self.perm = perm
@@ -20,6 +21,8 @@ class PermDeformModel(nn.Module):
             gauss_sigma=1.0,
         )
         self.init_networks()
+
+        self.flame = flame
 
     def init_networks(self):       
         self.deformNet = MLP(
@@ -59,7 +62,7 @@ class PermDeformModel(nn.Module):
         N, C, _ = strands.shape
         strands = strands.reshape(N * C, -1)
         strands = gaussians.perm2scene(strands)
-        strands_enc = self.pts_embedder(strands)
+        # strands_enc = self.pts_embedder(strands)
 
         coef = perm_out["coef"][0].unsqueeze(1).expand(-1, C, -1).reshape(N * C, -1)
         rotation = codedict['R'].flatten()[None].expand(N * C, -1)
@@ -77,7 +80,24 @@ class PermDeformModel(nn.Module):
         guide_strands = guide_strands.reshape(-1, 3)
         guide_strands = gaussians.perm2scene(guide_strands)
 
-        return strands_final, guide_strands, None, None
+        expr = codedict['expr']
+        shape = codedict['shape']
+        neck_pose = codedict['neck_pose']
+
+        strands_final_def = self.flame.apply_neck_rotation(
+            strands_final,           # (N,3)  or (B,N,3)  – canonical coordinates
+            shape,            # (B, n_shape)
+            expr,             # (B, n_expr)
+            neck_pose,        # (B, 3)  – axis-angle for the neck joint ONLY
+        )
+        guide_strands_def = self.flame.apply_neck_rotation(
+            guide_strands,           # (N,3)  or (B,N,3)  – canonical coordinates
+            shape,            # (B, n_shape)
+            expr,             # (B, n_expr)
+            neck_pose,        # (B, 3)  – axis-angle for the neck joint ONLY
+        )
+
+        return strands_final, guide_strands, strands_final_def, guide_strands_def, None, None
     
     def capture(self):
         return (

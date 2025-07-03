@@ -16,7 +16,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getWorld2V
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, head_mask, mouth_mask, hair_mask, hair_orient, depth_map,
-                 exp_param, eyes_pose, eyelids, jaw_pose,
+                 exp_param, shape_param, eyes_pose, jaw_pose, neck_pose,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
@@ -45,10 +45,12 @@ class Camera(nn.Module):
         self.hair_mask = hair_mask
         self.hair_orient = hair_orient
         self.depth_map = depth_map
+
         self.exp_param = exp_param
+        self.shape_param = shape_param
         self.eyes_pose = eyes_pose
-        self.eyelids = eyelids
         self.jaw_pose = jaw_pose
+        self.neck_pose = neck_pose
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -76,10 +78,12 @@ class Camera(nn.Module):
         self.hair_mask = self.hair_mask.to(data_device)
         self.hair_orient = self.hair_orient.to(data_device)
         self.depth_map = self.depth_map.to(data_device)
+
         self.exp_param = self.exp_param.to(data_device)
+        self.shape_param = self.shape_param.to(data_device)
         self.eyes_pose = self.eyes_pose.to(data_device)
-        self.eyelids = self.eyelids.to(data_device)
         self.jaw_pose = self.jaw_pose.to(data_device)
+        self.neck_pose = self.neck_pose.to(data_device)
 
         self.w2c = self.w2c.to(data_device)
         self.world_view_transform = self.world_view_transform.to(data_device)

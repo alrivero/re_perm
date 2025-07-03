@@ -11,7 +11,104 @@ from typing import List, Optional, Tuple
 from utils.misc import EPSILON
 from utils.misc import copy2cpu as c2c
 from torch import nn
+import scipy.spatial as b
+from shapely.geometry import Polygon, Point
+from typing import Union, Optional
+from scipy.spatial import Delaunay
+import math
 
+
+def save_pc_as_obj(pts, fpath="debug_points.obj", rgb=None):
+    """
+    Dump a point cloud to an .obj file - readable by Meshlab / Blender.
+    
+    pts  : (N,3) torch.Tensor | np.ndarray  – xyz in world units
+    rgb  : (N,3) torch.Tensor | np.ndarray  – 0-1 or 0-255 colours  (optional)
+
+    Usage (inside pdb):
+        >>> save_pc_as_obj(my_tensor, "/tmp/pc.obj")
+    """
+    import numpy as np, torch
+
+    # --- bring everything to CPU-numpy ---------------------------------
+    if isinstance(pts, torch.Tensor):
+        pts = pts.detach().cpu().float().numpy()
+    if rgb is not None and isinstance(rgb, torch.Tensor):
+        rgb = rgb.detach().cpu().float().numpy()
+
+    with open(fpath, "w") as f:
+        if rgb is None:
+            for x, y, z in pts:
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        else:
+            # .obj stores colours after xyz ⇒ many viewers pick them up
+            if rgb.max() > 1.0:         # allow either 0-1 or 0-255
+                rgb = rgb / 255.0
+            for (x, y, z), (r, g, b) in zip(pts, rgb):
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f} {r:.6f} {g:.6f} {b:.6f}\n")
+
+    print(f"✔ wrote {len(pts)} vertices -> {fpath}")
+
+
+def _sample_uv_delaunay(uv_bounds, num_samples, max_iters=10000, tol=1e-6):
+    """
+    Helper: sample num_samples UVs *inside* [u0,u1]×[v0,v1]
+    by incremental largest‐circumcircle insertion, always maintaining
+    a valid Delaunay on the unit-square domain.
+    Returns an (num_samples,2) array in the *original* UV coords.
+    """
+    u0, u1, v0, v1 = uv_bounds
+    # forward/back mappings between original UV and [0,1]^2
+    def to_unit(uv):
+        return np.stack([(uv[:,0]-u0)/(u1-u0),
+                         (uv[:,1]-v0)/(v1-v0)], axis=1)
+    def from_unit(xy):
+        return np.stack([u0 + xy[:,0]*(u1-u0),
+                         v0 + xy[:,1]*(v1-v0)], axis=1)
+
+    eps = 1e-3
+    # seed the *corners* of your scalp_bounds (in original UV)
+    corners_raw = np.array([
+        [u0 + eps*(u1-u0), v0 + eps*(v1-v0)],
+        [u1 - eps*(u1-u0), v0 + eps*(v1-v0)],
+        [u1 - eps*(u1-u0), v1 - eps*(v1-v0)],
+        [u0 + eps*(u1-u0), v1 - eps*(v1-v0)],
+    ], dtype=np.float64)
+    uv = list(to_unit(corners_raw))  # now in [0,1]^2
+
+    def circumcentres_and_radii(pts, tris):
+        A = pts[tris[:,0]]; B = pts[tris[:,1]]; C = pts[tris[:,2]]
+        a = B - A; b = C - A
+        a2 = (a*a).sum(axis=1); b2 = (b*b).sum(axis=1)
+        cross = a[:,0]*b[:,1] - a[:,1]*b[:,0]
+        mask = np.abs(cross) > 1e-12
+        centres = np.zeros_like(A); radii = np.zeros(len(tris))
+        if mask.any():
+            fac = 0.5 / cross[mask]
+            cx = ( b[mask,1]*a2[mask] - a[mask,1]*b2[mask] ) * fac + A[mask,0]
+            cy = ( a[mask,0]*b2[mask] - b[mask,0]*a2[mask] ) * fac + A[mask,1]
+            centres[mask] = np.stack([cx, cy],1)
+            radii[mask]   = np.linalg.norm(centres[mask]-A[mask], axis=1)
+        return centres, radii
+
+    it = 0
+    while len(uv) < num_samples and it < max_iters:
+        it += 1
+        pts = np.vstack(uv)
+        tri = Delaunay(pts)
+        centres, radii = circumcentres_and_radii(pts, tri.simplices)
+        idx = np.argmax(radii)
+        c   = centres[idx].clip(eps, 1-eps)
+        # reject too-close in unit space
+        if np.min(np.linalg.norm(pts - c[None], axis=1)) < tol:
+            continue
+        uv.append(c)
+
+    if len(uv) < num_samples:
+        print(f"[WARN] only got {len(uv)}/{num_samples} UVs after {it} iters")
+
+    # map those back into your true UV rectangle
+    return from_unit(np.vstack(uv)[:num_samples])
 
 class HairRoots(nn.Module):
     def __init__(
@@ -350,6 +447,180 @@ class HairRoots(nn.Module):
         loc = torch.from_numpy(loc_np).to(pts.device, dtype=torch.float32)
         return loc
 
+    def _uniform_point_in_poly(self, poly: Polygon, n=1):
+        """
+        Rejection-sample `n` uniform random points inside a 2-D polygon.
+        Very small helper – CPU only, OK for a handful of points.
+        """
+        minx, miny, maxx, maxy = poly.bounds
+        pts = []
+        while len(pts) < n:
+            cand = Point(np.random.uniform(minx, maxx),
+                        np.random.uniform(miny, maxy))
+            if poly.contains(cand):
+                pts.append([cand.x, cand.y])
+        return np.asarray(pts, np.float32)                 # (n,2)
+    
+    def _make_uv_seed_grid(self, bounds, n0: int = 128, jitter: float = 0.25) -> np.ndarray:
+        """
+        Create a quasi-uniform blanket of UV seed points that already covers
+        the scalp AABB.  Returned array is (K,2) in *absolute* UV, **float32**.
+
+        Parameters
+        ----------
+        bounds : list/tuple [u_min, u_max, v_min, v_max]
+        n0     : rough target number of seeds (64–256 is typical)
+        jitter : random jitter as a fraction of the cell size
+        """
+        u0, u1, v0, v1 = bounds
+        area  = (u1 - u0) * (v1 - v0)
+        h     = np.sqrt(area / n0)          # square cell edge ≈ sqrt(area / n)
+        n_u   = int(np.ceil((u1 - u0) / h))
+        n_v   = int(np.ceil((v1 - v0) / h))
+
+        us = u0 + (np.arange(n_u) + 0.5) * h
+        vs = v0 + (np.arange(n_v) + 0.5) * h
+        uu, vv = np.meshgrid(us, vs, indexing="xy")
+        seeds  = np.stack([uu.ravel(), vv.ravel()], 1)
+
+        # jitter to avoid a perfect grid (helps Delaunay robustness)
+        jitter_amt = jitter * h
+        seeds += np.random.uniform(-jitter_amt, jitter_amt, seeds.shape)
+
+        # clip back into the AABB
+        seeds[:, 0] = np.clip(seeds[:, 0], u0, u1)
+        seeds[:, 1] = np.clip(seeds[:, 1], v0, v1)
+        return seeds.astype(np.float32)
+
+    @staticmethod
+    def _circumcenters_and_radii(
+        uv_pts: np.ndarray,           # (N,2) in [0,1]
+        simplices: np.ndarray         # (T,3) triangle‐vertex indices
+    ):
+        """
+        For each triangle in `simplices`, compute its circum‐centre and radius.
+        Returns
+        ----------
+        centres : (T,2)  float32
+        radii    : (T,)   float32
+        """
+        A = uv_pts[simplices[:,0]]
+        B = uv_pts[simplices[:,1]]
+        C = uv_pts[simplices[:,2]]
+        a = B - A
+        b = C - A
+        a2 = np.sum(a*a, axis=1)
+        b2 = np.sum(b*b, axis=1)
+        cross = a[:,0]*b[:,1] - a[:,1]*b[:,0]
+        # avoid degenerate
+        mask = np.abs(cross) > 1e-12
+        centres = np.zeros((simplices.shape[0],2), dtype=np.float32)
+        radii   = np.zeros( simplices.shape[0],   dtype=np.float32)
+        if mask.any():
+            fac = 0.5 / cross[mask]
+            cx = (  b[mask,1]*a2[mask] - a[mask,1]*b2[mask] ) * fac + A[mask,0]
+            cy = (  a[mask,0]*b2[mask] - b[mask,0]*a2[mask] ) * fac + A[mask,1]
+            centres[mask,0] = cx
+            centres[mask,1] = cy
+            diffs = centres[mask] - A[mask]
+            radii[mask] = np.sqrt(np.sum(diffs*diffs, axis=1))
+        return centres, radii
+
+    def sample_scalp_mesh_delaunay(
+        self,
+        num_samples: int,
+        pseudo_roots: Optional[torch.Tensor] = None,  # ignored
+        max_iters: int = 10000,
+        tol: float = 1e-6,
+    ) -> torch.Tensor:
+        """
+        Sample exactly `num_samples` roots by Delaunay‐driven UV insertion,
+        strictly inside self.scalp_bounds, no repeats.
+        """
+        assert self.scalp_bounds is not None, "scalp_bounds must be set"
+        # 1) get the UV positions in your original [u0,u1]×[v0,v1]
+        uv_pts = _sample_uv_delaunay(self.scalp_bounds,
+                                     num_samples,
+                                     max_iters=max_iters,
+                                     tol=tol)            # (N,2) numpy
+
+        # 2) back to torch, normalize into [0,1]^2 for your spherical mapping
+        uv = torch.from_numpy(uv_pts.astype(np.float32)) \
+                  .to(self.centroid.device)
+
+        # 3) ray‐cast each UV into 3D on the scalp
+        xyz = self.spherical_to_cartesian(uv)         # (N,3)
+        return xyz
+    
+    def densify_scalp_mesh_delaunay(
+        self,
+        roots: torch.Tensor,
+        scale: float = 2.0,
+        rounds: int = 2,
+    ) -> torch.Tensor:
+        """
+        Fast but slightly less regular densification:
+        add triangle centroids from successive Delaunay triangulations.
+
+        Parameters
+        ----------
+        roots  : (N,3) torch tensor – original roots in XYZ.
+        scale  : multiplicative density (>1). 2.0 doubles the number of roots.
+                If scale<=1 the input is returned unchanged.
+        rounds : how many centroid-insertion rounds (≥1).
+                1 round is usually enough for up to ~2× density;
+                2 rounds covers ~3×.
+
+        Returns
+        -------
+        (⌈N·scale⌉,3) tensor, originals first, on the same device.
+        """
+        if scale <= 1.0:
+            return roots
+
+        dev      = roots.device
+        target_n = int(np.ceil(len(roots) * scale))
+
+        # --- UV of the existing roots (absolute, still in [0,1] range) ----
+        with torch.no_grad():
+            uv = self.cartesian_to_spherical(roots)[..., :2].cpu().numpy()
+
+        u0, u1, v0, v1 = self.scalp_bounds
+        def to_unit(uv_):
+            return np.stack([(uv_[:, 0]-u0)/(u1-u0),
+                            (uv_[:, 1]-v0)/(v1-v0)], 1)
+
+        def from_unit(xy):
+            return np.stack([u0 + xy[:, 0]*(u1-u0),
+                            v0 + xy[:, 1]*(v1-v0)], 1)
+
+        uv_unit = to_unit(uv)                 # seed list, shape (N,2)
+
+        for _ in range(rounds):
+            if len(uv_unit) >= target_n:
+                break
+            tri  = Delaunay(uv_unit)
+            # triangle areas in unit square
+            A = uv_unit[tri.simplices[:, 0]]
+            B = uv_unit[tri.simplices[:, 1]]
+            C = uv_unit[tri.simplices[:, 2]]
+            areas = 0.5 * np.abs(
+                (B[:, 0]-A[:, 0])*(C[:, 1]-A[:, 1]) -
+                (B[:, 1]-A[:, 1])*(C[:, 0]-A[:, 0])
+            )
+
+            order = np.argsort(-areas)  # largest first
+            for idx in order:
+                if len(uv_unit) >= target_n:
+                    break
+                centroid = (A[idx] + B[idx] + C[idx]) / 3.0
+                uv_unit = np.vstack([uv_unit, centroid])
+
+        # ---- convert the *new* UVs back to XYZ ---------------------------
+        uv_new_abs = torch.from_numpy(from_unit(uv_unit[len(roots):])).float().to(dev)
+        xyz_new    = self.spherical_to_cartesian(uv_new_abs)
+        return torch.cat([roots, xyz_new], 0)
+    
     def sample_scalp_mesh(
         self,
         num_samples: int,
@@ -448,30 +719,394 @@ class HairRoots(nn.Module):
 
     def uv_to_cartesian(self, uv_norm: torch.Tensor) -> torch.Tensor:
         """
-        Differentiable inversion of UV coords to 3D points on the scalp using bilinear sampling.
+        Map UV ∈ [0,1]² back to 3-D scalp positions by ray-casting.
+        (No pre-baked `scalp_xyz_map` needed; **not differentiable**.)
 
-        Args:
-            uv_norm (torch.Tensor[...,2]): UV coords in [0,1]^2
-        Returns:
-            torch.Tensor[...,3]: 3D points on the scalp surface
+        Args
+        ----
+        uv_norm : (..., 2) tensor on any device, each (u,v) ∈ [0,1].
+
+        Returns
+        -------
+        (..., 3) tensor on the *same* device with points on the head surface.
         """
-        assert self.scalp_xyz_map is not None, "Need precomputed scalp_xyz_map"
-        
-        # flatten and prepare grid for sampling
-        orig_shape = uv_norm.shape[:-1]
-        uv_flat = uv_norm.reshape(-1,2).clamp(0.0,1.0)
-        # convert to normalized grid coords [-1,1]
-        grid = uv_flat * 2.0 - 1.0
-        N = grid.shape[0]
-        grid = grid.view(1,1,N,2)
+        # ---------- 0. reshape & move to CPU for trimesh -------------
+        extra  = uv_norm.shape[:-1]
+        uv_np  = uv_norm.reshape(-1, 2).detach().cpu().numpy()        # (N,2)
+        N      = uv_np.shape[0]
 
-        # sample: scalp_xyz_map (1,3,H,W)
-        sampled = torch.nn.functional.grid_sample(
-            self.scalp_xyz_map,
-            grid,
-            mode='bilinear',
-            align_corners=True
-        )  # (1,3,1,N)
+        # ---------- 1. build ray directions from (u,v) --------------
+        uv_pi  = uv_np * np.pi
+        cot_u, cot_v = 1.0 / np.tan(uv_pi[:, 0]), 1.0 / np.tan(uv_pi[:, 1])
+        h      = 2.0 / (cot_u**2 + cot_v**2 + 1.0)
+        dirs   = np.stack([h * cot_u, h - 1.0, h * cot_v], axis=1)    # (N,3)
+        dirs   = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)   # unit-length
 
-        pts = sampled.view(3, N).transpose(0,1)  # (N,3)
-        return pts.reshape(*orig_shape, 3)
+        # ---------- 2. shoot rays from the centroid -----------------
+        origin = self.centroid.detach().cpu().numpy()
+        origins = np.repeat(origin[None, :], N, axis=0)               # (N,3)
+
+        pts, hit_idx, _ = self.head.ray.intersects_location(
+            ray_origins     = origins,
+            ray_directions  = dirs,
+            multiple_hits   = False
+        )
+
+        # ---------- 3. allocate output & scatter hits ----------------
+        out = np.repeat(origin[None, :], N, axis=0)                   # default: centroid
+        if len(hit_idx):
+            out[hit_idx] = pts
+
+        # ---------- 4. nearest-surface fallback for misses -----------
+        miss = np.setdiff1d(np.arange(N), hit_idx)
+        if miss.size:
+            # shoot the ray “far” and snap to nearest surface
+            bounds   = self.head.bounds
+            diameter = np.linalg.norm(bounds[1] - bounds[0])
+            far_pts  = origins[miss] + dirs[miss] * diameter
+            close_pts, _, _ = self.head.nearest.on_surface(far_pts)
+            out[miss] = close_pts
+
+        # ---------- 5. reshape & return on original device ----------
+        xyz = torch.from_numpy(out.astype(np.float32)
+                            ).to(uv_norm.device).reshape(*extra, 3)
+        return xyz
+
+    @torch.no_grad()
+    def sample_scalp_hex(
+        self,
+        num_samples: int,
+        pseudo_roots: Optional[torch.Tensor] = None  # unused; only here for signature
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Build a true honeycomb‐lattice of UV‐vertices (i.e. the VERTICES of a hex‐tiling)
+        that covers the rectangle [u0,u1]×[v0,v1] exactly.  We choose the triangular
+       ‐lattice spacing `a` so that roughly `num_samples` cells fit inside, then
+        drop any lattice‐points whose (absolute UV) falls outside the AABB.  Finally,
+        we truncate (row‐major) to at most `num_samples` points, and send those
+        **absolute UV** coordinates directly into `spherical_to_cartesian(…)` (no extra
+        normalization).
+
+        Returns:
+          - xyz_tensor:  (N_out, 3) on the same device as `self.centroid`
+          - hex_radius:  float, the circumradius of each hex cell in UV‐space
+        """
+        assert self.scalp_bounds is not None, "Must set `scalp_bounds` before calling sample_scalp_honeycomb."
+        device = self.centroid.device
+
+        # 1) Extract the absolute‐UV AABB:
+        u0, u1, v0, v1 = self.scalp_bounds
+        width_uv  = u1 - u0
+        height_uv = v1 - v0
+        area_uv   = width_uv * height_uv
+
+        # 2) Solve for “triangular‐lattice spacing” a so that ≈num_samples cells tile the area:
+        #    Each hexagon in the dual has area = (√3/2) * a².  Therefore:
+        #      (√3/2) * a²  ≈  area_uv / num_samples
+        #    ⇒ a = sqrt( (2/√3) * (area_uv / num_samples) )
+        a = math.sqrt((2.0 / math.sqrt(3.0)) * (area_uv / float(num_samples)))
+        self.current_hc_spacing = a
+
+        # 3) In a triangular lattice of spacing “a”, each Voronoi‐hexagon has circumradius R = a / √3
+        hex_radius = a / math.sqrt(3.0)
+
+        # 4) We now build a 2D triangular grid of points in absolute UV:
+        #    - horizontal spacing dx = a
+        #    - vertical spacing   dy = (√3/2) * a
+        dx = a
+        dy = (math.sqrt(3.0) / 2.0) * a
+
+        # 5) How many rows/cols do we need to cover [u0..u1]×[v0..v1]?  We overshoot then cull.
+        n_cols = int(math.ceil(width_uv  / dx)) + 1
+        n_rows = int(math.ceil(height_uv / dy)) + 1
+
+        # 6) Make NumPy index arrays for rows/columns:
+        row_idxs = np.arange(n_rows, dtype=np.int64)  # [0..n_rows-1]
+        col_idxs = np.arange(n_cols, dtype=np.int64)  # [0..n_cols-1]
+
+        #    Compute each row’s absolute‐UV v‐coordinate:  v = v0 + row * dy
+        v_coords_full  = v0 + row_idxs.astype(np.float32) * dy         # shape (n_rows,)
+        valid_row_mask = (v_coords_full <= v1)                          # keep only rows whose center ≤ v1
+        v_coords       = v_coords_full[valid_row_mask]                  # shape (R,)
+        actual_rows    = row_idxs[valid_row_mask]                        # shape (R,)
+        R              = v_coords.shape[0]                               # number of valid rows
+
+        #    On a triangular grid, each odd row is offset by (dx/2) horizontally:
+        offsets_for_row = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)  # shape (R,)
+
+        # 7) Build the full 2D array of candidate UV‐vertices:
+        #    u_grid[i,j] = u0 + j*dx + offsets_for_row[i],   for j=0..n_cols-1
+        uu     = (u0 + col_idxs.astype(np.float32) * dx)[None, :]   # shape (1, n_cols)
+        off    = offsets_for_row[:, None]                            # shape (R, 1)
+        u_grid = uu + off                                            # shape (R, n_cols)
+
+        #    v_grid[i,j] = v_coords[i]  (same across all columns in row i)
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)        # shape (R, n_cols)
+
+        # 8) Flatten into an (R*n_cols, 2) array of absolute UV‐points:
+        u_flat = u_grid.reshape(-1)  # (R * n_cols,)
+        v_flat = v_grid.reshape(-1)  # (R * n_cols,)
+        uv_all = np.stack([u_flat, v_flat], axis=1)  # shape (R*n_cols, 2)
+
+        # 9) Cull any candidate whose UV‐vertex lies strictly outside [u0..u1]×[v0..v1]:
+        keep_mask = (
+            (uv_all[:, 0] >= u0) & (uv_all[:, 0] <= u1) &
+            (uv_all[:, 1] >= v0) & (uv_all[:, 1] <= v1)
+        )
+        uv_in = uv_all[keep_mask]  # shape (K, 2)
+
+        # 10) If no valid points, return an empty tensor + hex_radius
+        K = uv_in.shape[0]
+        if K == 0:
+            empty = torch.zeros((0, 3), device=device, dtype=torch.float32)
+            return empty, hex_radius
+
+        # 11) Truncate in row‐major order to at most num_samples (no randomness):
+        if K > num_samples:
+            uv_sel = uv_in[:num_samples]
+        else:
+            uv_sel = uv_in  # shape (min(K, num_samples), 2)
+
+        # 12) Convert these **absolute UV** coords directly to a torch‐tensor and feed to spherical_to_cartesian:
+        #     (We do NOT re‐normalize to [0,1] here—your spherical_to_cartesian must now expect absolute UV.)
+        uv_tensor = torch.from_numpy(uv_sel.astype(np.float32)).to(device)  # (N_out, 2)
+        xyz_tensor = self.spherical_to_cartesian(uv_tensor)                 # (N_out, 3)
+
+        return xyz_tensor, hex_radius
+
+
+    @torch.no_grad()
+    def densify_scalp_hex(
+        self,
+        old_roots: Optional[torch.Tensor] = None  # ignored, because we re‐tile from scratch
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        “Densify” by halving the previously‐stored triangular spacing (self.current_hc_spacing),
+        rebuilding a finer honeycomb grid over the same AABB, culling anything outside,
+        and projecting directly to 3D.  We do NOT keep the old points; the new lattice
+        is strictly finer (step = a_old/2).  No duplicates, no randomness.
+
+        Returns:
+           (xyz_new, hex_radius_new)
+             - xyz_new        : (M_new, 3) on the same device
+             - hex_radius_new : float = (a_new / √3)
+        """
+        assert hasattr(self, "current_hc_spacing"), "You must call sample_scalp_honeycomb(...) first."
+        device = self.centroid.device
+
+        # 1) Halve the old triangular‐spacing:
+        a_old = self.current_hc_spacing
+        a_new = a_old / 2.0
+        self.current_hc_spacing = a_new
+
+        #    New hex-circumradius:
+        hex_radius_new = a_new / math.sqrt(3.0)
+
+        # 2) Compute dx_new, dy_new for the finer triangular grid:
+        dx = a_new
+        dy = (math.sqrt(3.0) / 2.0) * a_new
+
+        # 3) Same absolute‐UV AABB:
+        u0, u1, v0, v1 = self.scalp_bounds
+        width_uv  = u1 - u0
+        height_uv = v1 - v0
+
+        # 4) How many columns/rows to cover again?
+        n_cols = int(math.ceil(width_uv  / dx)) + 1
+        n_rows = int(math.ceil(height_uv / dy)) + 1
+
+        # 5) Build row/col index arrays:
+        row_idxs = np.arange(n_rows, dtype=np.int64)
+        col_idxs = np.arange(n_cols, dtype=np.int64)
+
+        #    Each row’s absolute‐UV v:
+        v_coords_full  = v0 + row_idxs.astype(np.float32) * dy
+        valid_row_mask = (v_coords_full <= v1)
+        v_coords       = v_coords_full[valid_row_mask]        # (R,)
+        actual_rows    = row_idxs[valid_row_mask]             # (R,)
+        R              = v_coords.shape[0]
+
+        #    Horizontal offset for each odd row:
+        offsets_for_row = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)  # (R,)
+
+        # 6) Form the full finer grid of candidate UV‐vertices:
+        uu     = (u0 + col_idxs.astype(np.float32) * dx)[None, :]  # (1, n_cols)
+        off    = offsets_for_row[:, None]                          # (R, 1)
+        u_grid = uu + off                                          # (R, n_cols)
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)      # (R, n_cols)
+
+        # 7) Flatten to (R*n_cols, 2):
+        u_flat = u_grid.reshape(-1)
+        v_flat = v_grid.reshape(-1)
+        uv_all = np.stack([u_flat, v_flat], axis=1)  # (R*n_cols, 2)
+
+        # 8) Cull any vertices outside [u0..u1]×[v0..v1]:
+        keep_mask = (
+            (uv_all[:, 0] >= u0) & (uv_all[:, 0] <= u1) &
+            (uv_all[:, 1] >= v0) & (uv_all[:, 1] <= v1)
+        )
+        uv_in = uv_all[keep_mask]  # shape (M_new, 2)
+
+        # 9) If none remain, return empty + new radius:
+        M_new = uv_in.shape[0]
+        if M_new == 0:
+            empty = torch.zeros((0, 3), device=device, dtype=torch.float32)
+            return empty, hex_radius_new
+
+        # 10) Directly project those **absolute UV** points to 3D:
+        uv_tensor = torch.from_numpy(uv_in.astype(np.float32)).to(device)  # (M_new, 2)
+        xyz_new   = self.spherical_to_cartesian(uv_tensor)                 # (M_new, 3)
+
+        return xyz_new, hex_radius_new
+    
+    @torch.no_grad()
+    def sample_scalp_hex_cull(
+        self,
+        num_samples: int,
+        pseudo_roots: Optional[torch.Tensor] = None  # used to define region
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Build a hex-tiling over the UV AABB, cull any cells outside the submesh
+        defined by `pseudo_roots` (snapped to the head surface), and return
+        their 3D positions plus the hexagon circumradius in UV.
+        """
+        assert self.scalp_bounds is not None, "Must set `scalp_bounds` before calling sample_scalp_hex."
+        device = self.centroid.device
+
+        # -- 1) snap pseudo_roots to mesh and build submesh ------------------
+        assert isinstance(pseudo_roots, torch.Tensor) and pseudo_roots.numel() > 0, \
+            "`pseudo_roots` must be a nonempty (N,3) Tensor"
+        pts_np = pseudo_roots.detach().cpu().numpy()
+        snapped_pts, _, face_idx = self.head.nearest.on_surface(pts_np)
+        valid_faces = np.unique(face_idx)
+        submesh = trimesh.Trimesh(
+            vertices=self.head.vertices,
+            faces=self.head.faces[valid_faces],
+            process=False
+        )
+
+        # -- 2) compute original hex grid in absolute UV ---------------------
+        u0, u1, v0, v1 = self.scalp_bounds
+        width_uv = u1 - u0
+        height_uv = v1 - v0
+        area_uv = width_uv * height_uv
+
+        # triangular‐lattice spacing a so ≈ num_samples cells
+        a = math.sqrt((2.0 / math.sqrt(3.0)) * (area_uv / float(num_samples)))
+        self.current_hc_spacing = a
+        hex_radius = a / math.sqrt(3.0)
+
+        dx = a
+        dy = (math.sqrt(3.0) / 2.0) * a
+        n_cols = int(math.ceil(width_uv  / dx)) + 1
+        n_rows = int(math.ceil(height_uv / dy)) + 1
+
+        row_idxs = np.arange(n_rows, dtype=np.int64)
+        col_idxs = np.arange(n_cols, dtype=np.int64)
+
+        v_coords_full = v0 + row_idxs.astype(np.float32) * dy
+        valid_rows = v_coords_full <= v1
+        v_coords = v_coords_full[valid_rows]
+        actual_rows = row_idxs[valid_rows]
+
+        offsets = ((actual_rows % 2) * (dx/2.0)).astype(np.float32)
+        uu = (u0 + col_idxs.astype(np.float32)*dx)[None, :]
+        off = offsets[:, None]
+        u_grid = uu + off
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)
+
+        uv_all = np.stack([u_grid.ravel(), v_grid.ravel()], axis=1)
+        inside = (
+            (uv_all[:,0] >= u0) & (uv_all[:,0] <= u1) &
+            (uv_all[:,1] >= v0) & (uv_all[:,1] <= v1)
+        )
+        uv_sel = uv_all[inside]
+
+        # -- 3) project each UV to Cartesian & cull by submesh membership ---
+        uv_tensor = torch.from_numpy(uv_sel.astype(np.float32)).to(device)
+        xyz_pred = self.spherical_to_cartesian(uv_tensor)
+        xyz_np = xyz_pred.detach().cpu().numpy()
+
+        # find closest-face for each candidate and keep those on submesh
+        _, _, cand_face = submesh.nearest.on_surface(xyz_np)
+        keep = np.isin(cand_face, np.arange(len(valid_faces)))
+
+        final_xyz = torch.from_numpy(xyz_np[keep].astype(np.float32)).to(device)
+        # truncate so we return at most num_samples
+        if len(final_xyz) > num_samples:
+            final_xyz = final_xyz[:num_samples]
+
+        return final_xyz, hex_radius
+
+    @torch.no_grad()
+    def densify_scalp_hex_cull(
+        self,
+        old_roots: Optional[torch.Tensor] = None  # ignored, because we re‐tile from scratch
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        As before, build a finer honeycomb grid over the same AABB,
+        but *then* cull any hex‐vertices whose UV falls outside the
+        triangulated UV‐hull of the current roots.
+        """
+        assert hasattr(self, "current_hc_spacing"), "You must call sample_scalp_honeycomb(...) first."
+        u0, u1, v0, v1 = self.scalp_bounds
+        device = self.centroid.device
+
+        # 1) Halve spacing & recompute hex‐circumradius
+        a_old = self.current_hc_spacing
+        a_new = a_old / 2.0
+        self.current_hc_spacing = a_new
+        hex_radius_new = a_new / math.sqrt(3.0)
+
+        # 2) Build absolute‐UV triangular grid (as before)
+        dx = a_new
+        dy = (math.sqrt(3.0) / 2.0) * a_new
+        width_uv, height_uv = u1 - u0, v1 - v0
+        n_cols = int(math.ceil(width_uv  / dx)) + 1
+        n_rows = int(math.ceil(height_uv / dy)) + 1
+
+        row_idxs = np.arange(n_rows, dtype=np.int64)
+        col_idxs = np.arange(n_cols, dtype=np.int64)
+        v_coords_full  = v0 + row_idxs.astype(np.float32) * dy
+        valid_row_mask = (v_coords_full <= v1)
+        v_coords       = v_coords_full[valid_row_mask]
+        actual_rows    = row_idxs[valid_row_mask]
+
+        offsets_for_row = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)
+
+        uu     = (u0 + col_idxs.astype(np.float32) * dx)[None, :]
+        off    = offsets_for_row[:, None]
+        u_grid = uu + off
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)
+
+        u_flat = u_grid.reshape(-1)
+        v_flat = v_grid.reshape(-1)
+        uv_all = np.stack([u_flat, v_flat], axis=1)  # (R*n_cols, 2)
+
+        # 3) First cull by AABB
+        keep = (
+            (uv_all[:,0] >= u0) & (uv_all[:,0] <= u1) &
+            (uv_all[:,1] >= v0) & (uv_all[:,1] <= v1)
+        )
+        uv_in = uv_all[keep]  # still in absolute UV
+
+        # 4) New: cull by current‐roots' UV‐triangulation
+        if len(uv_in) > 0:
+            # compute absolute-UV of your existing roots
+            with torch.no_grad():
+                uv_roots = self.cartesian_to_spherical(self.roots)[..., :2]  # (N_roots,2)
+            uv_roots_np = uv_roots.cpu().numpy().astype(np.float32)
+
+            tri = Delaunay(uv_roots_np)
+            mask = tri.find_simplex(uv_in) >= 0
+            uv_in = uv_in[mask]
+
+        # 5) If nothing remains, return empty
+        if uv_in.shape[0] == 0:
+            return torch.zeros((0,3), device=device, dtype=torch.float32), hex_radius_new
+
+        # 6) Project the survivors back to 3D
+        uv_tensor = torch.from_numpy(uv_in.astype(np.float32)).to(device)
+        xyz_new   = self.spherical_to_cartesian(uv_tensor)
+
+        return xyz_new, hex_radius_new

@@ -16,14 +16,17 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib
 import debug
+import trimesh
+import cv2
 
+from flame import FlameHead
 from hair.hair_models          import Perm
 from scene.gaussian_perm       import GaussianPerm
 from scene                     import Scene_mica
 from src.perm_deform_model     import PermDeformModel
 from gaussian_renderer         import render
 from arguments                 import ModelParams, PipelineParams, OptimizationParams
-from utils.general_utils       import to_image_np
+from utils.general_utils       import to_image_np, compute_occlusion_mask
 
 STRAND_VERTEX_COUNT = 100
 
@@ -126,20 +129,29 @@ def main():
 
     parser.add_argument("--start_checkpoint", type=str, required=True)
     parser.add_argument("--idname",           type=str, required=True)
-    parser.add_argument("--image_res",        type=int, default=512)
+    parser.add_argument("--image_res",        type=int, default=720)
     parser.add_argument("--out_dir",          type=str, required=True)
     parser.add_argument("--fps",              type=int, default=30)
+    parser.add_argument("--cull_head_off",              type=bool, default=True)
     args = parser.parse_args(); args.device = "cuda"
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     lpt,opt,ppt = lp.extract(args), op.extract(args), pp.extract(args)
 
     scalp_mask = pickle.load(open(
-        "/home/alrivero/ENPC/re_perm/flame/FLAME_masks/FLAME_masks.pkl","rb"),
+        "/home/alrivero/ENPC/re_perm/flame/assets/FLAME_masks.pkl","rb"),
         encoding="latin1")["scalp"]
 
     data_dir = Path(args.source_path)/args.idname
     mica_dir = data_dir/"track_out"/args.idname
+
+    flame = FlameHead(
+        300, 
+        100, 
+        add_teeth=True,
+        remove_lip_inside=False,
+        face_clusters=("skin", "hair", "boundary", "lips_tight", "teeth", "sclerae", "irises"),
+    ).to(args.device)
 
     perm = Perm(lpt.perm_path, lpt.obj_head_path,
                 scalp_vertex_idxs=scalp_mask,
@@ -148,8 +160,7 @@ def main():
     pseudo = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0]
     start_hair = np.load(lpt.emp_hair_path) if lpt.emp_hair_path else None
     gauss = GaussianPerm(perm, pseudo, start_hair, lpt.sh_degree).to(args.device)
-    deform= PermDeformModel(perm, args.device).to(args.device)
-    
+    deform= PermDeformModel(perm, flame, args.device).to(args.device)
 
     m,g,_ = torch.load(args.start_checkpoint, map_location=args.device)
     deform.restore(m); gauss.restore(g,opt); gauss.eval(); deform.eval()
@@ -168,20 +179,46 @@ def main():
     for cam in tqdm(cams, desc="rendering"):
         cam.load2device(args.device)
 
-        cd = dict(R=torch.tensor(cam.R,device=args.device),
-                  T=torch.tensor(cam.T,device=args.device),
-                  roots=gauss.get_roots_xyz[None],
-                  theta=gauss.theta, beta=gauss.beta)
+        codedict = {
+            "R":      torch.tensor(cam.R, device=args.device),
+            "T":      torch.tensor(cam.T, device=args.device),
+            "roots":  gauss.get_roots_xyz[None],
+            "theta":  gauss.theta,
+            "beta":   gauss.beta,
+            "expr":   cam.exp_param,
+            "shape":   cam.shape_param,
+            "eyes_pose":   cam.eyes_pose,
+            "jaw_pose":   cam.jaw_pose,
+            "neck_pose":   cam.neck_pose
+        }
+
+        flame_verts, flame_faces, _ = flame(
+            codedict['shape'],
+            codedict['expr'],
+            torch.tensor([[0.0, 0.0, 0.0]]).to(args.device),
+            codedict['neck_pose'],
+            codedict['jaw_pose'],
+            codedict['eyes_pose'],
+            torch.tensor([[0.0, 0.0, 0.0]]).to(args.device),
+            return_faces=True,
+            return_normals=True,
+        )
         
-        verts,_,rot_d,sc_c = deform.decode(gauss, cd)
+        _, _, verts, _, rot_d, sc_c = deform.decode(gauss, codedict)
         strand_pts = verts.reshape(gauss.num_strands, STRAND_VERTEX_COUNT, 3)
         gauss.update_xyz_rot_scale(strand_pts, rot_d, sc_c)
 
         if load_filter:
             gauss.compute_3D_filter(cams, args.device)
+            # gauss.prune_strands_by_opacity(0.01)
+            # gauss.compute_3D_filter(cams, args.device)
             load_filter = False
 
-        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size)
+        if args.cull_head_off:
+            occ_mask, depth_map = compute_occlusion_mask(gauss, cam, flame_verts, flame_faces)
+        else:
+            occ_mask, depth_map = None, None
+        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask)
 
         pred_rgb = to_image_np(pkg["render"])
         pred_seg = to_image_np(pkg["segment"])
@@ -192,21 +229,25 @@ def main():
         gt_seg  = to_image_np(cam.hair_mask.float())
 
         orient  = orient_to_rgb(cam.hair_orient) if hasattr(cam,"hair_orient") else gt_seg
+        orient = cv2.resize(orient, (720, 720), interpolation=cv2.INTER_LINEAR)
 
         vr.append(pred_rgb); vs.append(pred_seg)
 
         strip = np.concatenate([
             rgbify(gt_rgb),  rgbify(pred_rgb),
             rgbify(gt_seg),  rgbify(pred_seg),
-            rgbify(orient)
+            rgbify(orient),
         ], axis=1)
+        if depth_map is not None:
+            strip = np.concatenate([strip, rgbify(to_image_np(depth_map))], axis=1)
+
         vcmp.append(strip)
 
         cam.load2device("cpu")
 
     imageio.mimsave(Path(args.out_dir)/"render.mp4",       vr,   fps=args.fps)
     imageio.mimsave(Path(args.out_dir)/"segmentation.mp4", vs,   fps=args.fps)
-    imageio.mimsave(Path(args.out_dir)/"depth.mp4",        vd,   fps=args.fps)
+    # imageio.mimsave(Path(args.out_dir)/"depth.mp4",        vd,   fps=args.fps)
     imageio.mimsave(Path(args.out_dir)/"comparison.mp4",   vcmp, fps=args.fps)
     print(f"[✓] Videos saved in {args.out_dir}")
 

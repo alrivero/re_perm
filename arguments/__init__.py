@@ -52,6 +52,12 @@ class ModelParams(ParamGroup):
         self._perm_path = ""
         self._obj_head_path = ""
         self._loaded_roots_path = ""
+        self._nphm_config_path = ""
+        self._geo_nphm_path = ""
+        self._app_nphm_path = ""
+        self._xp_nphm_path = ""
+        self._dict_loaded_nphm_path = ""
+        self._cached_roots_path = "roots.pt"
         self._emp_hair_path = ""
         self._images = "images"
         self._resolution = -1
@@ -75,13 +81,13 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 600_000
-        self.theta_warmup = 2
+        self.iterations = 150_000
+        self.theta_warmup = 1
 
-        self.theta_lr_init = 0.0075
-        self.theta_lr_final = 0.0005
-        self.beta_lr_init = 0.0075
-        self.beta_lr_final = 0.0005
+        self.theta_lr_init = 0.000250
+        self.theta_lr_final = 0.00025
+        self.beta_lr_init = 0.000250
+        self.beta_lr_final = 0.00025
         self.perm_lr_delay_mult = 0.01
         self.perm_lr_max_steps = 300_000
 
@@ -91,11 +97,11 @@ class OptimizationParams(ParamGroup):
         # self.position_lr_max_steps = 30_000
 
         lr_coef = 1
-        self.feature_lr = 0.00075*lr_coef
-        self.opacity_lr = 0.005*lr_coef
-        self.scaling_lr = 0.0001*lr_coef
+        self.feature_lr = 0.0075*lr_coef
+        self.opacity_lr = 0.00015*lr_coef
+        self.scaling_lr = 0.001*lr_coef
         self.rotation_lr = 0.005*lr_coef
-        self.percent_dense = 0.01
+        self.percent_dense = 1e-4
 
         self.lambda_neighbor_orient = 1.0
         self.max_strand_len = 0.22
@@ -103,27 +109,36 @@ class OptimizationParams(ParamGroup):
         self.k_neigh = 8
 
         self.lambda_huber = 400.0
-        self.lambda_seg = 300.0
-        self.lambda_orient = 75.0 # 10.0
-        self.lambda_len = 100.0
-        self.lambda_neigh = 5.0
+        self.lambda_seg = 10000.0 * 5.0
+        self.lambda_orient = 125.0 * 10.0
+        self.lambda_sdf_contain = 0.0
+        self.lambda_sdf_flow = 3e3
+        self.lambda_neigh = 0.1
         self.lambda_out = 0.0
         self.lambda_ori_match = 1e2
         self.lambda_oblong = 1e9
         self.lambda_len_consist = 1e11
-        self.lambda_bend = 5e7
-        self.lambda_smooth_scale = 1e8
-        self.lambda_depth = 10.0
-        self.lambda_head_col = 75.0
-        self.lambda_strand_rep = 0.35
-        self.lambda_theta_l2 = 0.002 # 4
-        self.lambda_beta_l2 = 0.002
+        self.lambda_bend = 5e8
+        self.lambda_smooth_scale = 1e7
+        self.lambda_sobel = 1e27
+        self.lambda_head_col = 30000.0
+        self.lambda_gauss_head_col = 30000.0
+        self.lambda_local_len = 300000.0
+        self.lambda_color_var = 3000.0
+        self.lambda_opacity_var = 1e8
+        self.lambda_theta_l2 = 0.000000 # 4
+        self.lambda_beta_l2 = 0.000000
+        self.lambda_scale_reg = 0.0
 
-        self.densification_interval = 5000
+        self.densification_interval = 100 # 7500
         self.opacity_reset_interval = 3500
-        self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_from_iter = 99
+        self.densify_until_iter = 99 # 22500
         self.densify_grad_threshold = 0.0002
+
+        self.densify_strands_from_iter = 100
+        self.densify_strands_until_iter = 100 # 25000
+        self.densification_strand_interval = 2000 # 5000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
