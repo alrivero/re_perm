@@ -18,7 +18,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_perm import GaussianPerm
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None, occ_mask=None):
+def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None, occ_mask=None, spec_color=None):
     """
     Render the scene. 
     
@@ -84,9 +84,9 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0) + spec_color
         else:
-            shs = pc.get_features
+            shs = pc.get_features + spec_color
     else:
         colors_precomp = override_color
 

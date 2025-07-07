@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 # --------------------------------------------------------------------- #
 from hair.hair_models import Perm
 from scene.gaussian_perm import GaussianPerm
+from scene.specular_model import SpecularModel
 from scene import Scene_mica
 from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
@@ -45,10 +46,14 @@ from utils.loss_utils import (
     local_length_consistency_loss,
     color_variance_loss_sh,
     opacity_variance_loss,
+    asg_variance_loss,
     gaussian_scale_regularization_loss,
     triangle_scale_area_loss,
     sdf_hair_losses,
-    sdf_contain_and_flow
+    sdf_contain_and_flow,
+    l1_loss,
+    ssim,
+    HairDetailLoss
 )
 from flame import FlameHead
 from nphm.setup import setup_nphm_grid
@@ -209,11 +214,11 @@ if __name__ == "__main__":
     else:
         cached_roots = None
 
-    gaussians = GaussianPerm(perm, pseudo_roots, start_hair_style, lpt.sh_degree, cached_roots=cached_roots).to(args.device)
+    gaussians = GaussianPerm(perm, pseudo_roots, start_hair_style, lpt.sh_degree, lpt.asg_degree, cached_roots=cached_roots).to(args.device)
     gaussians.roots = gaussians.roots.to(args.device)
 
     extra_parameters = None
-    if opt.learn_flame_rigid_offset:
+    if lpt.learn_flame_rigid_offset:
         rotation_offsets = torch.tensor([0.0, 0.0, 0.0],
                             dtype=torch.float32,
                             device=args.device)
@@ -224,8 +229,10 @@ if __name__ == "__main__":
         translation_offsets = translation_offsets.unsqueeze(0).repeat(len(scene.getCameras()), 1).requires_grad_()
         extra_parameters = [
             {"params": [rotation_offsets], "lr": 0.0001, "name": "flame_rot"},
-            {"params": [translation_offsets], "lr": 0.0001, "name": "flame_rot"}
+            {"params": [translation_offsets], "lr": 0.0001, "name": "flame_trans"}
         ]
+
+        torch.save(rotation_offsets, os.path.join(model_dir, f"flame_rot.pth"))
     gaussians.training_setup(opt, extra_parameters=extra_parameters)
 
     # Set up NPHM SDF
@@ -287,13 +294,20 @@ if __name__ == "__main__":
     deform_model = PermDeformModel(perm, flame, args.device).to(args.device)
     deform_model.training_setup()
 
+    specular_mlp = SpecularModel()
+    specular_mlp.specular = specular_mlp.specular.to(args.device)
+    specular_mlp.train_setting(opt)
+
     first_iter = 0
     if args.start_checkpoint:
         m_params, g_params, first_iter = torch.load(args.start_checkpoint)
         deform_model.restore(m_params)
-        gaussians.restore(g_params, opt)
+        gaussians.restore(g_params, opt, extra_parameters=extra_parameters)
+        specular_mlp.load_weights(model_dir, iteration=first_iter)
 
-        first_iter -= 1
+        if lpt.learn_flame_rigid_offset:
+            rotation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_rot_020000.pth")
+            translation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_trans_020000.pth")
 
     bg_color = [1, 1, 1] if lpt.white_background else [0, 1, 0]
     bg_image = torch.zeros((3, args.image_res, args.image_res), device=args.device)
@@ -305,6 +319,13 @@ if __name__ == "__main__":
 
     save_tensor_to_obj(gaussians.roots / 100, os.path.join(train_dir, "roots.obj"))
 
+    hair_photo_loss = HairDetailLoss(
+        warmup_iters=8000,
+        fade_iters=12000,
+        polish_iters=5000,
+        blur=True,
+        device=args.device
+    )
 
     for it in range(first_iter + 1, opt.iterations + 1):
         if it % 500 == 0:
@@ -323,6 +344,10 @@ if __name__ == "__main__":
         cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack) - 1))
         cam.load2device(args.device)
 
+        enable_flame_offsets = lpt.learn_flame_rigid_offset and it >= 10000
+        flame_rot = rotation_offsets[cam.uid][None] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]]).to(args.device)
+        flame_trans = translation_offsets[cam.uid][None] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]]).to(args.device)
+        
         codedict = {
             "R":      torch.tensor(cam.R, device=args.device),
             "T":      torch.tensor(cam.T, device=args.device),
@@ -333,38 +358,42 @@ if __name__ == "__main__":
             "shape":   cam.shape_param,
             "eyes_pose":   cam.eyes_pose,
             "jaw_pose":   cam.jaw_pose,
-            "neck_pose":   cam.neck_pose
+            "neck_pose":   cam.neck_pose,
+            "root_pose":   torch.zeros_like(flame_rot),
+            "translation":   torch.zeros_like(flame_trans)
         }
-
-        enable_flame_offsets = opt.learn_flame_rigid_offset and it >= 5000
-        flame_rot = rotation_offsets[cam.uid] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]])
-        flame_trans = translation_offsets[cam.uid] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]])
 
         flame_verts, flame_faces, flame_normals = flame(
             codedict['shape'],
             codedict['expr'],
-            flame_rot,
+            torch.zeros_like(flame_rot),
             codedict['neck_pose'],
             codedict['jaw_pose'],
             codedict['eyes_pose'],
-            flame_trans,
+            torch.zeros_like(flame_trans),
             return_faces=True,
             return_normals=True,
         )
-
 
         verts_final, guide_final, verts_final_def, guide_final_def, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
         strand_pts = verts_final_def.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         strand_pts_can = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
 
-        gaussians.update_xyz_rot_scale(strand_pts, rot_delta, scale_coef)
+        tangents = gaussians.update_xyz_rot_scale(strand_pts, rot_delta, scale_coef)
 
         if it == first_iter + 1:
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
+        if it >= 3000:
+            dir_pp = (gaussians.get_xyz - cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            spec_color = specular_mlp.step(gaussians.get_asg_features, dir_pp_normalized, tangents)
+        else:
+            spec_color = 0.0
+
         occ_mask, _ = compute_occlusion_mask(gaussians, cam, flame_verts, flame_faces)
 
-        render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, occ_mask=occ_mask)
+        render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
         img_render   = render_pkg["render"]
         img_segment  = render_pkg["segment"]
 
@@ -374,7 +403,9 @@ if __name__ == "__main__":
         depth_gt  = cam.depth_map
         gt_img    = gt_img * alpha + bg_image * (1 - alpha)
 
-        loss_h = huber_loss(img_render, gt_img, alpha, delta=0.1, reduction="mean")
+        
+        loss_h = hair_photo_loss(img_render, gt_img, it)
+
         if it <= opt.theta_warmup:
             loss_seg = huber_loss(img_segment, alpha, alpha, delta=0.1, reduction="mean")
         else:
@@ -398,7 +429,20 @@ if __name__ == "__main__":
         loss_local_len            = local_length_consistency_loss(gaussians)
         loss_color_var            = color_variance_loss_sh(gaussians)
         loss_opacity_var          = opacity_variance_loss(gaussians)
+        loss_asg_var              = asg_variance_loss(gaussians)
         loss_scale_reg            = gaussian_scale_regularization_loss(gaussians)
+        
+        if enable_flame_offsets and it >= 8000 and it:
+            loss_flame_rot_reg = (rotation_offsets.norm(dim=1) ** 2).mean()
+            loss_flame_trans_reg = (translation_offsets.norm(dim=1) ** 2).mean()
+        else:
+            # keep the graph happy when offsets are frozen / disabled
+            loss_flame_rot_reg   = torch.tensor(0.0, device=args.device)
+            loss_flame_trans_reg = torch.tensor(0.0, device=args.device)
+        
+        if it > 50000:
+            loss_flame_rot_reg = loss_flame_rot_reg.detach()
+            loss_flame_trans_reg = loss_flame_trans_reg.detach()
 
 
         mu_theta    = gaussians.theta_start.clone().to(args.device)
@@ -419,44 +463,53 @@ if __name__ == "__main__":
         lambda_local_len      = opt.lambda_local_len
         lambda_color_var      = opt.lambda_color_var
         lambda_opacity_var    = opt.lambda_opacity_var
+        lambda_asg_var        = opt.lambda_asg_var
         lambda_theta_l2       = opt.lambda_theta_l2
         lambda_beta_l2        = opt.lambda_beta_l2
-        lambda_scale_reg      = args.lambda_scale_reg
+        lambda_scale_reg      = opt.lambda_scale_reg
+        lambda_flame_rot_reg   = opt.lambda_flame_rot_reg
+        lambda_flame_trans_reg = opt.lambda_flame_trans_reg
 
-        w_huber          = lambda_huber          * loss_h.item()
-        w_nei            = lambda_nei            * loss_nei.item()
-        w_orient         = lambda_orient         * loss_o.item()
-        w_seg            = lambda_seg            * loss_seg.item()
-        w_sdf_contain    = lambda_sdf_contain         * loss_sdf_contain.item()
-        w_sdf_flow       = lambda_sdf_flow        * loss_sdf_flow.item()
-        w_bend           = lambda_bend           * loss_bend.item()
-        w_sobel          = lambda_sobel          * loss_sobel.item()
-        w_head_col       = lambda_head_col       * loss_head_col.item()
-        w_gauss_head_col = lambda_gauss_head_col * loss_gauss_head_col.item()
-        w_local_len      = lambda_local_len      * loss_local_len.item()
-        w_color_var      = lambda_color_var      * loss_color_var.item()
-        w_opacity_var    = lambda_opacity_var     * loss_opacity_var.item()
-        w_theta_l2       = lambda_theta_l2       * loss_theta_l2.item()
-        w_beta_l2        = lambda_beta_l2        * loss_beta_l2.item()
-        w_scale_reg      = lambda_scale_reg      * loss_scale_reg.item()
+        w_huber           = lambda_huber                * loss_h.item()
+        w_nei             = lambda_nei                  * loss_nei.item()
+        w_orient          = lambda_orient               * loss_o.item()
+        w_seg             = lambda_seg                  * loss_seg.item()
+        w_sdf_contain     = lambda_sdf_contain          * loss_sdf_contain.item()
+        w_sdf_flow        = lambda_sdf_flow             * loss_sdf_flow.item()
+        w_bend            = lambda_bend                 * loss_bend.item()
+        w_sobel           = lambda_sobel                * loss_sobel.item()
+        w_head_col        = lambda_head_col             * loss_head_col.item()
+        w_gauss_head_col  = lambda_gauss_head_col       * loss_gauss_head_col.item()
+        w_local_len       = lambda_local_len            * loss_local_len.item()
+        w_color_var       = lambda_color_var            * loss_color_var.item()
+        w_opacity_var     = lambda_opacity_var          * loss_opacity_var.item()
+        w_asg_var         = lambda_asg_var              * loss_asg_var.item()
+        w_theta_l2        = lambda_theta_l2             * loss_theta_l2.item()
+        w_beta_l2         = lambda_beta_l2              * loss_beta_l2.item()
+        w_scale_reg       = lambda_scale_reg            * loss_scale_reg.item()
+        w_flame_rot_reg   = lambda_flame_rot_reg        * loss_flame_rot_reg.item()
+        w_flame_trans_reg = lambda_flame_trans_reg      * loss_flame_trans_reg.item()
 
         loss = (
-            lambda_huber          * loss_h +
-            lambda_seg            * loss_seg +
-            lambda_orient         * loss_o +
-            lambda_sdf_contain    * loss_sdf_contain +
-            lambda_sdf_flow       * loss_sdf_flow +
-            lambda_nei            * loss_nei +
-            lambda_bend           * loss_bend +
-            lambda_sobel          * loss_sobel +
-            lambda_head_col       * loss_head_col +
-            lambda_gauss_head_col * loss_gauss_head_col +
-            lambda_local_len      * loss_local_len +
-            lambda_color_var      * loss_color_var +
-            lambda_opacity_var    * loss_opacity_var +
-            lambda_theta_l2       * loss_theta_l2 +
-            lambda_beta_l2        * loss_beta_l2 +
-            lambda_scale_reg      * loss_scale_reg
+            lambda_huber           * loss_h +
+            lambda_seg             * loss_seg +
+            lambda_orient          * loss_o +
+            lambda_sdf_contain     * loss_sdf_contain +
+            lambda_sdf_flow        * loss_sdf_flow +
+            lambda_nei             * loss_nei +
+            lambda_bend            * loss_bend +
+            lambda_sobel           * loss_sobel +
+            lambda_head_col        * loss_head_col +
+            lambda_gauss_head_col  * loss_gauss_head_col +
+            lambda_local_len       * loss_local_len +
+            lambda_color_var       * loss_color_var +
+            lambda_opacity_var     * loss_opacity_var +
+            lambda_asg_var         * loss_asg_var +
+            lambda_theta_l2        * loss_theta_l2 +
+            lambda_beta_l2         * loss_beta_l2 +
+            lambda_scale_reg       * loss_scale_reg +
+            lambda_flame_rot_reg   * loss_flame_rot_reg +
+            lambda_flame_trans_reg * loss_flame_trans_reg
         )
 
         gaussians.update_learning_rate(it)
@@ -475,7 +528,7 @@ if __name__ == "__main__":
                                         and it % opt.densification_interval == 0:
             if occ_mask is not None:
                 with torch.no_grad():
-                    radii = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size)["radii"]
+                    radii = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, spec_color=spec_color)["radii"]
                                         
             size_threshold = 20 if it > opt.opacity_reset_interval else None
             num_clone, num_split = gaussians.densify_and_prune(
@@ -495,8 +548,9 @@ if __name__ == "__main__":
                                         and it % opt.densification_strand_interval == 0:
             torch.save(
                 (deform_model.capture(), gaussians.capture(), it),
-                os.path.join(model_dir, f"chkpnt_{it:06d}.pth")
+                os.path.join(model_dir, f"chkpnt_{it:06d}_pre_dense.pth")
             )
+            specular_mlp.save_weights(model_dir, it)
             print(f"\n[ITER {it}] Pre-Densification Checkpoint saved.\n")
 
             new_roots, new_radii = perm.hair_roots.densify_scalp_hex(gaussians.roots)
@@ -506,15 +560,16 @@ if __name__ == "__main__":
             gaussians.reset_gaussians_to_new_roots(new_roots, new_radii)
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
-            opt.theta_lr_init *= 0.75
-            opt.theta_lr_final *= 0.75
-            opt.beta_lr_init *= 0.75
-            opt.beta_lr_final *= 0.75
-            gaussians.training_setup(opt)
+            gaussians.training_setup(opt, extra_parameters=extra_parameters)
             save_tensor_to_obj(gaussians.roots / 100, os.path.join(train_dir, f"roots_{it}.obj"))
 
             opt.densification_strand_interval *= 4
             opt.densify_from_iter = 500 + it
+            opt.lambda_color_var *= 10.0
+
+        if it % 100 == 0:
+            num_reset = gaussians.halve_large_parallel_sigmas()
+            print(f"Gaussians Scales Halved: {num_reset}")
 
         # periodic global opacity reset (commented out)
         # if it < opt.densify_until_iter and \
@@ -532,6 +587,9 @@ if __name__ == "__main__":
                 deform_model.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 deform_model.optimizer.zero_grad(set_to_none=True)
+                specular_mlp.optimizer.step()
+                specular_mlp.optimizer.zero_grad()
+                specular_mlp.update_learning_rate(it)
 
         if it % 20 == 0:
             print(
@@ -549,37 +607,41 @@ if __name__ == "__main__":
                 f"local_len {loss_local_len:.4f} (w {w_local_len:.4f})  "
                 f"color_var {loss_color_var:.4f} (w {w_color_var:.4f})  "
                 f"opacity_var {loss_opacity_var:.4f} (w {w_opacity_var:.4f})  "
+                f"asg_var {loss_asg_var:.4f} (w {w_asg_var:.4f})  "
                 f"theta_l2 {loss_theta_l2:.4f} (w {w_theta_l2:.4f})  "
                 f"beta_l2 {loss_beta_l2:.4f} (w {w_beta_l2:.4f})  "
                 f"scale_reg {loss_scale_reg:.4f} (w {w_scale_reg:.4f})  "
+                f"flame_rot_reg {loss_flame_rot_reg:.4f} (w {w_flame_rot_reg:.4f})  "
+                f"flame_trans_reg {loss_flame_trans_reg:.4f} (w {w_flame_trans_reg:.4f})  "
                 f"→ total {loss.item():.4f}     "
                 f"→ Gaussian Count {gaussians.num_gaussians}     "
                 f"→ Strand Count {gaussians.num_strands}     "
-                f"→ View Count {len(sample_idxs)}     "
             )
             if _use_wandb:
                 wandb.log({
-                    "loss/total":          loss.item(),
-                    "loss/huber":          loss_h.item(),
-                    "loss/seg":            loss_seg.item(),
-                    "loss/orient":         loss_o.item(),
-                    "loss/sdf_contain":    loss_sdf_contain.item(),
-                    "loss/sdf_flow":       loss_sdf_flow.item(),
-                    "loss/neigh":          loss_nei.item(),
-                    "loss/bend":           loss_bend.item(),
-                    "loss/sobel":          loss_sobel.item(),
-                    "loss/head_col":       loss_head_col.item(),
-                    "loss/gauss_head_col": loss_gauss_head_col.item(),
-                    "loss/local_len":      loss_local_len.item(),
-                    "loss/color_var":      loss_color_var.item(),
-                    "loss/opacity_var":    loss_opacity_var.item(),
-                    "loss/theta_l2":       loss_theta_l2.item(),
-                    "loss/beta_l2":        loss_beta_l2.item(),
-                    "loss/scale_reg":      loss_scale_reg.item(),
-                    "iter":                it,
-                    "num_gaussians":       gaussians.num_gaussians,
-                    "num_strands":         gaussians.num_strands,
-                    "num_views": len(sample_idxs)
+                    "loss/total":            loss.item(),
+                    "loss/huber":            loss_h.item(),
+                    "loss/seg":              loss_seg.item(),
+                    "loss/orient":           loss_o.item(),
+                    "loss/sdf_contain":      loss_sdf_contain.item(),
+                    "loss/sdf_flow":         loss_sdf_flow.item(),
+                    "loss/neigh":            loss_nei.item(),
+                    "loss/bend":             loss_bend.item(),
+                    "loss/sobel":            loss_sobel.item(),
+                    "loss/head_col":         loss_head_col.item(),
+                    "loss/gauss_head_col":   loss_gauss_head_col.item(),
+                    "loss/local_len":        loss_local_len.item(),
+                    "loss/color_var":        loss_color_var.item(),
+                    "loss/opacity_var":      loss_opacity_var.item(),
+                    "loss/asg_var":          loss_asg_var.item(),
+                    "loss/theta_l2":         loss_theta_l2.item(),
+                    "loss/beta_l2":          loss_beta_l2.item(),
+                    "loss/scale_reg":        loss_scale_reg.item(),
+                    "loss/flame_rot_reg":    loss_flame_rot_reg.item(),
+                    "loss/flame_trans_reg":  loss_flame_trans_reg.item(),
+                    "iter":                  it,
+                    "num_gaussians":         gaussians.num_gaussians,
+                    "num_strands":           gaussians.num_strands,
                 }, step=it)
 
         if it % 500 == 0 or it == 1:
@@ -622,6 +684,10 @@ if __name__ == "__main__":
                 (deform_model.capture(), gaussians.capture(), it),
                 os.path.join(model_dir, f"chkpnt_{it:06d}.pth")
             )
+            specular_mlp.save_weights(model_dir, it)
+            if lpt.learn_flame_rigid_offset:
+                torch.save(rotation_offsets, os.path.join(model_dir, f"flame_rot_{it:06d}.pth"))
+                torch.save(translation_offsets, os.path.join(model_dir, f"flame_trans_{it:06d}.pth"))
             print(f"\n[ITER {it}] Checkpoint saved.\n")
 
         cam.load2device("cpu")

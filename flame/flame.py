@@ -681,43 +681,62 @@ class FlameHead(nn.Module):
 
     def apply_neck_rotation(
         self,
-        points,           # (N,3)  or (B,N,3)  – canonical coordinates
-        shape,            # (B, n_shape)
-        expr,             # (B, n_expr)
-        neck_pose,        # (B, 3)  – axis-angle for the neck joint ONLY
+        points,            # (N,3)  or (B,N,3)  – canonical coordinates
+        shape,             # (B, n_shape)
+        expr,              # (B, n_expr)
+        root_pose,         # (B, 3)  – axis-angle for joint 0 (global head)
+        neck_pose,         # (B, 3)  – axis-angle for joint 1 (neck)
+        translation,       # (B, 3)  – world-space head translation
     ):
         """
-        Rigidly rotates `points` around the neck joint by the given `neck_pose`.
-        Global head rotation / translation, jaw, eyes and other joints are NOT
-        included.
+        Rigidly transforms *canonical* `points` by
+
+            1. global root rotation  (joint 0)   ─ around root pivot
+            2. neck  rotation        (joint 1)   ─ around neck pivot
+            3. global translation                ─ applied last
+
+        Jaw / eye / other joints are **not** considered here.
 
         Returns
         -------
-        points_rot : torch.Tensor  (B, N, 3)
-            The input points after applying the neck rotation.
+        points_rt : (B, N, 3) – transformed points in world space.
         """
-        B = neck_pose.shape[0]
+        B = root_pose.shape[0]
         device = points.device
 
-        # 1 ─ rotation matrix of the neck joint
+        # ------------------------------------------------------------------ 1. rotation matrices
+        R_root = batch_rodrigues(root_pose.reshape(-1, 3))          # (B,3,3)
         R_neck = batch_rodrigues(neck_pose.reshape(-1, 3))          # (B,3,3)
 
-        # 2 ─ neck-joint pivot in the canonical, shape-deformed mesh
-        betas      = torch.cat([shape, expr], dim=1)                # (B,n_betas)
-        v_shaped   = self.v_template[None] +                        \
-                     blend_shapes(betas, self.shapedirs)            # (B,V,3)
-        J_cano     = vertices2joints(self.J_regressor, v_shaped)    # (B,J,3)
-        pivot      = J_cano[:, 1]                                   # (B,3)
+        # ------------------------------------------------------------------ 2. joint pivots in canonical space
+        betas    = torch.cat([shape, expr], dim=1)                  # (B,n_betas)
+        v_can    = self.v_template[None] + blend_shapes(betas, self.shapedirs)
+        J_cano   = vertices2joints(self.J_regressor, v_can)         # (B,J,3)
+        pivot_root = J_cano[:, 0]                                   # (B,3) joint 0
+        pivot_neck = J_cano[:, 1]                                   # (B,3) joint 1
 
-        # 3 ─ broadcast points to batch if needed
+        # ------------------------------------------------------------------ 3. broadcast points to batch
         if points.dim() == 2:                                       # (N,3) → (B,N,3)
             points = points.unsqueeze(0).expand(B, -1, -1).to(device)
 
-        # 4 ─ rotate around the pivot
-        rel   = points - pivot[:, None, :]                          # (B,N,3)
-        rel_R = torch.einsum('bij,bnj->bni', R_neck, rel)           # (B,N,3)
-        points_rot = rel_R + pivot[:, None, :]                      # (B,N,3)
-        return points_rot
+        # ------------------------------------------------------------------ 4. apply ROOT rotation around pivot_root
+        rel_root   = points - pivot_root[:, None, :]                # (B,N,3)
+        rel_root_R = torch.einsum("bij,bnj->bni", R_root, rel_root) # (B,N,3)
+        pts_after_root = rel_root_R + pivot_root[:, None, :]        # (B,N,3)
+
+        # Update neck pivot after root rotation (it moves with the head)
+        rel_neck  = pivot_neck - pivot_root                         # (B,3)
+        rel_neck_R = torch.einsum("bij,bj->bi", R_root, rel_neck)   # (B,3)
+        pivot_neck_world = rel_neck_R + pivot_root                  # (B,3)
+
+        # ------------------------------------------------------------------ 5. apply NECK rotation around pivot_neck_world
+        rel_neck_pts = pts_after_root - pivot_neck_world[:, None, :]          # (B,N,3)
+        rel_neck_pts_R = torch.einsum("bij,bnj->bni", R_neck, rel_neck_pts)   # (B,N,3)
+        pts_after_neck = rel_neck_pts_R + pivot_neck_world[:, None, :]        # (B,N,3)
+
+        # ------------------------------------------------------------------ 6. add global translation and return
+        points_rt = pts_after_neck + translation[:, None, :]        # (B,N,3)
+        return points_rt
 
 class FlameTexPainted(nn.Module):
     def __init__(self, tex_size=512, painted_tex_path=FLAME_PAINTED_TEX_PATH):

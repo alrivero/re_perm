@@ -83,18 +83,24 @@ class PermDeformModel(nn.Module):
         expr = codedict['expr']
         shape = codedict['shape']
         neck_pose = codedict['neck_pose']
+        root_pose = codedict['root_pose']
+        trans = codedict['translation']
 
         strands_final_def = self.flame.apply_neck_rotation(
             strands_final,           # (N,3)  or (B,N,3)  – canonical coordinates
             shape,            # (B, n_shape)
             expr,             # (B, n_expr)
-            neck_pose,        # (B, 3)  – axis-angle for the neck joint ONLY
+            root_pose,
+            neck_pose,
+            trans
         )
         guide_strands_def = self.flame.apply_neck_rotation(
             guide_strands,           # (N,3)  or (B,N,3)  – canonical coordinates
             shape,            # (B, n_shape)
             expr,             # (B, n_expr)
-            neck_pose,        # (B, 3)  – axis-angle for the neck joint ONLY
+            root_pose,
+            neck_pose,
+            trans
         )
 
         return strands_final, guide_strands, strands_final_def, guide_strands_def, None, None

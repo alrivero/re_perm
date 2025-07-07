@@ -27,6 +27,7 @@ from src.perm_deform_model     import PermDeformModel
 from gaussian_renderer         import render
 from arguments                 import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils       import to_image_np, compute_occlusion_mask
+from scene.specular_model import SpecularModel
 
 STRAND_VERTEX_COUNT = 100
 
@@ -138,6 +139,10 @@ def main():
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     lpt,opt,ppt = lp.extract(args), op.extract(args), pp.extract(args)
 
+    data_dir     = os.path.join(args.source_path, args.idname)
+    log_dir      = os.path.join(data_dir, "log")
+    model_dir    = os.path.join(log_dir, "ckpt")
+
     scalp_mask = pickle.load(open(
         "/home/alrivero/ENPC/re_perm/flame/assets/FLAME_masks.pkl","rb"),
         encoding="latin1")["scalp"]
@@ -159,11 +164,25 @@ def main():
                 mesh_scale=100.).to(args.device)
     pseudo = perm.hair_roots.load_txt(lpt.loaded_roots_path)[0]
     start_hair = np.load(lpt.emp_hair_path) if lpt.emp_hair_path else None
-    gauss = GaussianPerm(perm, pseudo, start_hair, lpt.sh_degree).to(args.device)
+    gauss = GaussianPerm(perm, pseudo, start_hair, lpt.sh_degree, lpt.asg_degree).to(args.device)
     deform= PermDeformModel(perm, flame, args.device).to(args.device)
 
-    m,g,_ = torch.load(args.start_checkpoint, map_location=args.device)
-    deform.restore(m); gauss.restore(g,opt); gauss.eval(); deform.eval()
+    rotation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_rot_060000.pth")
+    translation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_trans_060000.pth")
+
+    extra_parameters = [
+        {"params": [rotation_offsets], "lr": 0.0001, "name": "flame_rot"},
+        {"params": [translation_offsets], "lr": 0.0001, "name": "flame_trans"}
+    ]
+    gauss.training_setup(opt, extra_parameters=extra_parameters)
+
+    specular_mlp = SpecularModel()
+    specular_mlp.specular = specular_mlp.specular.to(args.device)
+    specular_mlp.train_setting(opt)
+
+    m,g,it = torch.load(args.start_checkpoint, map_location=args.device)
+    deform.restore(m); gauss.restore(g,opt, extra_parameters=extra_parameters); gauss.eval(); deform.eval()
+    specular_mlp.load_weights(model_dir, iteration=it)
 
     bg = torch.tensor([1,1,1] if lpt.white_background else [0,1,0],
                       dtype=torch.float32, device=args.device)
@@ -179,6 +198,10 @@ def main():
     for cam in tqdm(cams, desc="rendering"):
         cam.load2device(args.device)
 
+        enable_flame_offsets = lpt.learn_flame_rigid_offset and it >= 10000
+        flame_rot = rotation_offsets[cam.uid][None] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]]).to(args.device)
+        flame_trans = translation_offsets[cam.uid][None] if enable_flame_offsets else torch.tensor([[0.0, 0.0, 0.0]]).to(args.device)
+        
         codedict = {
             "R":      torch.tensor(cam.R, device=args.device),
             "T":      torch.tensor(cam.T, device=args.device),
@@ -189,24 +212,26 @@ def main():
             "shape":   cam.shape_param,
             "eyes_pose":   cam.eyes_pose,
             "jaw_pose":   cam.jaw_pose,
-            "neck_pose":   cam.neck_pose
+            "neck_pose":   cam.neck_pose,
+            "root_pose":   torch.zeros_like(flame_rot),
+            "translation":   torch.zeros_like(flame_trans)
         }
 
         flame_verts, flame_faces, _ = flame(
             codedict['shape'],
             codedict['expr'],
-            torch.tensor([[0.0, 0.0, 0.0]]).to(args.device),
+            torch.zeros_like(flame_rot),
             codedict['neck_pose'],
             codedict['jaw_pose'],
             codedict['eyes_pose'],
-            torch.tensor([[0.0, 0.0, 0.0]]).to(args.device),
+            torch.zeros_like(flame_trans),
             return_faces=True,
             return_normals=True,
         )
         
         _, _, verts, _, rot_d, sc_c = deform.decode(gauss, codedict)
         strand_pts = verts.reshape(gauss.num_strands, STRAND_VERTEX_COUNT, 3)
-        gauss.update_xyz_rot_scale(strand_pts, rot_d, sc_c)
+        tangents = gauss.update_xyz_rot_scale(strand_pts, rot_d, sc_c)
 
         if load_filter:
             gauss.compute_3D_filter(cams, args.device)
@@ -218,7 +243,12 @@ def main():
             occ_mask, depth_map = compute_occlusion_mask(gauss, cam, flame_verts, flame_faces)
         else:
             occ_mask, depth_map = None, None
-        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask)
+
+        dir_pp = (gauss.get_xyz - cam.camera_center.repeat(gauss.get_features.shape[0], 1))
+        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+        spec_color = specular_mlp.step(gauss.get_asg_features, dir_pp_normalized, tangents)
+
+        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
 
         pred_rgb = to_image_np(pkg["render"])
         pred_seg = to_image_np(pkg["segment"])

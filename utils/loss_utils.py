@@ -10,6 +10,7 @@
 #
 
 import torch
+import lpips
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp, pi
@@ -18,6 +19,160 @@ from pytorch3d.ops import knn_points
 from pytorch3d.structures import Meshes
 
 from utils.general_utils import project_to_screen, quaternion_to_rotation_matrix, convert_normal_to_camera_space
+from kornia.filters import sobel, gaussian_blur2d
+from kornia.losses import ssim_loss as ms_ssim
+
+def _bchw(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 3:          # (C,H,W)  →  (1,C,H,W)
+        return x.unsqueeze(0)
+    if x.dim() == 4:          # already batched
+        return x
+    raise ValueError(f"Expected 3- or 4-D tensor, got {x.shape}")
+
+
+def rgb_to_luminance(x: torch.Tensor) -> torch.Tensor:
+    # x is (B,C,H,W)
+    return 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
+
+
+def linear_to_lpips(
+        x_lin: torch.Tensor,
+        eps: float = 1e-6               # ← ε-clamp here
+) -> torch.Tensor:
+    """
+    Linear-RGB [0,1]  →  sRGB (IEC 61966-2-1) in the range [-1,1] expected by LPIPS.
+    Adding eps > 0 guarantees x**(1/2.4) has a finite gradient.
+    """
+    a, k0 = 0.055, 0.0031308           # forward TF knot
+
+    # 1) clip and ε-clamp
+    x = x_lin.clamp(min=eps, max=1.0)
+
+    # 2) piece-wise transfer function
+    x_srgb = torch.where(
+        x <= k0,
+        12.92 * x,
+        (1 + a) * x.pow(1 / 2.4) - a
+    )
+
+    # 3) scale to [-1, 1] for LPIPS
+    return x_srgb * 2.0 - 1.0
+
+
+# ---------------- main class ------------------------------------------
+class HairDetailLoss:
+    """
+    Composite loss with three phases
+        A) Huber                       (coarse)
+        B) L1 + MS-SSIM + Sobel-Y      (detail)
+        C) L1 + MS-SSIM + Sobel-Y + LPIPS (polish)
+
+    Parameters
+    ----------
+    warmup_iters , fade_iters  : see previous version.
+    polish_iters  : int
+        How many iterations to *ramp in* LPIPS after phase B finishes.
+        0 → keep LPIPS weight fixed from the start of phase C.
+    w_lpips_final : float
+        Target LPIPS weight (relative to L1=1.0).
+    device        : torch device for the LPIPS network.
+    """
+
+    def __init__(
+        self,
+        warmup_iters: int = 6_000,
+        fade_iters: int = 20_000,
+        polish_iters: int = 5_000,
+        huber_delta: float = 0.10,
+        w_ssim_final: float = 0.20,
+        w_grad_final: float = 0.02,
+        w_lpips_final: float = 0.10,
+        blur: bool = False,
+        blur_sigma: float = 1.0,
+        device: str = "cuda",
+    ):
+        # phase boundaries
+        self.warmup   = warmup_iters
+        self.fade     = fade_iters
+        self.polish   = polish_iters
+
+        # loss hyper-params
+        self.delta    = huber_delta
+        self.w_ssim_f = w_ssim_final
+        self.w_grad_f = w_grad_final
+        self.w_lpips_f = w_lpips_final
+        self.blur     = blur
+        self.blur_sigma = blur_sigma
+
+        # LPIPS network (VGG backbone, frozen) -------------------------
+        self.lpips = lpips.LPIPS(net='vgg').to(device).eval()
+        for p in self.lpips.parameters():
+            p.requires_grad_(False)
+
+    # --------------------------------------------------------------
+    def _huber(self, x, y):
+        diff   = x - y
+        abs_e  = diff.abs()
+        quad   = 0.5 * diff ** 2
+        linear = self.delta * (abs_e - 0.5 * self.delta)
+        return torch.where(abs_e <= self.delta, quad, linear).mean()
+
+    # --------------------------------------------------------------
+    def __call__(self, pred: torch.Tensor, tgt: torch.Tensor, step: int) -> torch.Tensor:
+
+        # ------ phase-dependent weights -----------------------------
+        if step < self.warmup:
+            # Phase A
+            w_huber, w_l1, w_ssim, w_grad, w_lpips = 1.0, 0, 0, 0, 0
+
+        elif step < self.warmup + self.fade:
+            # Fade-in Phase B
+            t = (step - self.warmup) / self.fade
+            w_huber = 1.0 - t
+            w_l1    = t
+            w_ssim  = t * self.w_ssim_f
+            w_grad  = t * self.w_grad_f
+            w_lpips = 0.0
+
+        else:
+            # Phase C – polish (optionally ramp LPIPS)
+            w_huber = 0.0
+            w_l1    = 1.0
+            w_ssim  = self.w_ssim_f
+            w_grad  = self.w_grad_f
+
+            if self.polish > 0:
+                t_lp = min(1.0, (step - (self.warmup + self.fade)) / self.polish)
+                w_lpips = t_lp * self.w_lpips_f
+            else:
+                w_lpips = self.w_lpips_f
+
+        # ------ compute each term -----------------------------------
+        loss = 0.0
+        pred4, tgt4 = _bchw(pred), _bchw(tgt)       # <-- add this
+
+        # use pred4 / tgt4 below
+        if w_huber:
+            loss += w_huber * self._huber(pred4, tgt4)
+
+        if w_l1:
+            loss += w_l1 * F.l1_loss(pred4, tgt4)
+
+        if w_ssim:
+            loss += w_ssim * ms_ssim(pred4, tgt4, window_size=11, max_val=1.0)
+
+        if w_grad:
+            lum_pred = rgb_to_luminance(pred4)
+            lum_tgt  = rgb_to_luminance(tgt4)
+            if self.blur:
+                k = int(2 * math.ceil(2 * self.blur_sigma) + 1)
+                lum_tgt = gaussian_blur2d(lum_tgt, (k, k), (self.blur_sigma, self.blur_sigma))
+            loss += w_grad * F.l1_loss(sobel(lum_pred), sobel(lum_tgt))
+
+        if w_lpips:
+            loss += w_lpips * self.lpips(linear_to_lpips(pred4), linear_to_lpips(tgt4)).mean()
+
+        return loss
 
 def sdf_contain_and_flow(
         nphm_grid,
@@ -1293,6 +1448,48 @@ def color_variance_loss_sh(gaussians) -> torch.Tensor:
     # Collapse each strand's D-dimensional variance to a scalar, then average
     strand_var = var_feats.mean(dim=1)             # (S,)
     return strand_var.mean()
+
+def asg_variance_loss(gaussians) -> torch.Tensor:
+    """
+    Mean per-strand variance of the 24-D ASG colour features.
+
+    • get_asg_features() → (M, 24) tensor of per-Gaussian colour coefficients
+    • _strand_id            → (M,)  LongTensor   mapping Gaussians → strand index
+    • num_strands           → scalar S
+
+    The loss is the average (over strands) of the average (over the 24 channels)
+    variance within each strand.
+
+        L = 1/S  ∑_s  ( 1/24 ∑_d  Var_s[ f_{⋅d} ] )
+          = 1/S  ∑_s  (1/24) ∑_d (E[f²] – (E[f])²)_sd
+    """
+    # 1 ─ fetch data -------------------------------------------------------
+    asg_all   = gaussians.get_asg_features            # (M, 24)
+    strand_id = gaussians._strand_id                  # (M,)
+    S         = gaussians.num_strands
+    device    = asg_all.device
+    D         = asg_all.shape[1]                      # 24
+
+    # 2 ─ per-strand counts  (S,)
+    counts = torch.bincount(strand_id, minlength=S).float().clamp_min_(1.0)
+
+    # 3 ─ per-strand sum of features  (S, 24)
+    sum_feat = torch.zeros(S, D, device=device)
+    sum_feat.index_add_(0, strand_id, asg_all)
+
+    # 4 ─ per-strand sum of squared features  (S, 24)
+    sum_feat_sq = torch.zeros(S, D, device=device)
+    sum_feat_sq.index_add_(0, strand_id, asg_all * asg_all)
+
+    # 5 ─ means & mean-square  --------------------------------------------
+    mean_feat    = sum_feat    / counts[:, None]      # (S, 24)
+    mean_feat_sq = sum_feat_sq / counts[:, None]      # (S, 24)
+
+    # 6 ─ per-strand, per-channel variance
+    var = torch.clamp(mean_feat_sq - mean_feat * mean_feat, min=0.0)  # (S, 24)
+
+    # 7 ─ average over channels, then over strands → scalar loss
+    return var.mean()
 
 def opacity_variance_loss(gaussians) -> torch.Tensor:
     """

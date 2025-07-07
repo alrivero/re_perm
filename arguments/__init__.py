@@ -47,6 +47,7 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        self.asg_degree = 24
         self._source_path = ""
         self._model_path = ""
         self._perm_path = ""
@@ -65,6 +66,7 @@ class ModelParams(ParamGroup):
         self._kernel_size = 0.1
         self.data_device = "cuda"
         self.eval = False
+        self.learn_flame_rigid_offset = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -74,7 +76,7 @@ class ModelParams(ParamGroup):
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
-        self.convert_SHs_python = False
+        self.convert_SHs_python = True
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
@@ -93,8 +95,9 @@ class OptimizationParams(ParamGroup):
 
         # self.position_lr_init = 0.00016
         # self.position_lr_final = 0.0000016
-        # self.position_lr_delay_mult = 0.01
-        # self.position_lr_max_steps = 30_000
+        self.position_lr_delay_mult = 0.01
+        self.position_lr_max_steps = 30_000
+        self.specular_lr_max_steps = 30_000
 
         lr_coef = 1
         self.feature_lr = 0.0075*lr_coef
@@ -108,11 +111,11 @@ class OptimizationParams(ParamGroup):
         self.delta_strand_len = 0.01
         self.k_neigh = 8
 
-        self.lambda_huber = 400.0
-        self.lambda_seg = 10000.0 * 5.0
-        self.lambda_orient = 125.0 * 10.0
+        self.lambda_huber = 8000.0
+        self.lambda_seg = 10000.0 * 5.0 * 1.25
+        self.lambda_orient = 125.0 * 5.0
         self.lambda_sdf_contain = 0.0
-        self.lambda_sdf_flow = 3e3
+        self.lambda_sdf_flow = 0.0
         self.lambda_neigh = 0.1
         self.lambda_out = 0.0
         self.lambda_ori_match = 1e2
@@ -124,21 +127,25 @@ class OptimizationParams(ParamGroup):
         self.lambda_head_col = 30000.0
         self.lambda_gauss_head_col = 30000.0
         self.lambda_local_len = 300000.0
-        self.lambda_color_var = 3000.0
+        self.lambda_color_var = 10000.0
+        self.lambda_asg_var = 10000.0
         self.lambda_opacity_var = 1e8
         self.lambda_theta_l2 = 0.000000 # 4
         self.lambda_beta_l2 = 0.000000
         self.lambda_scale_reg = 0.0
+        self.lambda_flame_rot_reg = 3e1
+        self.lambda_flame_trans_reg = 3e2
+        self.lambda_dssim = 0.2
 
         self.densification_interval = 100 # 7500
         self.opacity_reset_interval = 3500
-        self.densify_from_iter = 99
-        self.densify_until_iter = 99 # 22500
+        self.densify_from_iter = 500
+        self.densify_until_iter = 0 # 22500
         self.densify_grad_threshold = 0.0002
 
         self.densify_strands_from_iter = 100
-        self.densify_strands_until_iter = 100 # 25000
-        self.densification_strand_interval = 2000 # 5000
+        self.densify_strands_until_iter = 8001
+        self.densification_strand_interval = 8000 # 5000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

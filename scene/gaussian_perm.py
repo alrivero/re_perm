@@ -15,8 +15,8 @@ SCALE_DIVISOR = 1
 
 class GaussianPerm(nn.Module):
     def __init__(self, perm, pseudo_roots,
-                 start_hair_style, sh_degree,
-                 num_strands=100000,
+                 start_hair_style, sh_degree, asg_degree,
+                 num_strands=10000,
                  neighbor_k=6,
                  num_gaussians=2000000,
                  cached_roots=None):
@@ -25,7 +25,9 @@ class GaussianPerm(nn.Module):
         self.perm          = perm
         self.num_strands   = num_strands
         self.max_sh_degree = sh_degree
+        self.max_asg_degree = asg_degree
         self.neighbor_k    = neighbor_k
+        self.uniform_strand_color = False
 
         # sample scalp roots once
         self.roots, self.global_strand_radii = self.perm.hair_roots.sample_scalp_hex(
@@ -178,7 +180,10 @@ class GaussianPerm(nn.Module):
         self._scaling_base = nn.Parameter(log0.expand(M,3).clone(), requires_grad=True)
         self._scaling      = None
 
-        # ── 7) Optional duplication ─────────────────────────────────────────
+        # ── 7) ASG Initialization ─────────-────────────────────────────────
+        self._features_asg = nn.Parameter(torch.zeros(M, self.max_asg_degree)).float()
+
+        # ── 8) Optional duplication ─────────────────────────────────────────
         if dup_factor > 1:
             orig_ids = self._strand_id
             self._strand_id = orig_ids.repeat(dup_factor)
@@ -193,6 +198,7 @@ class GaussianPerm(nn.Module):
             self._rho_hat       = nn.Parameter(rep(self._rho_hat),       True)
             self._features_dc   = nn.Parameter(rep(self._features_dc),   True)
             self._features_rest = nn.Parameter(rep(self._features_rest), True)
+            self._features_asg  = nn.Parameter(rep(self._features_asg),  True)
             self._opacity       = nn.Parameter(rep(self._opacity),       True)
             self._scaling_base  = nn.Parameter(rep(self._scaling_base),  True)
             self._xyz           = rep(self._xyz)
@@ -227,70 +233,92 @@ class GaussianPerm(nn.Module):
     @torch.no_grad()
     def reset_gaussians_to_new_roots(
         self,
-        new_roots: torch.Tensor,           # (S_new, 3) in metres
+        new_roots: torch.Tensor,         # (S_new, 3) in metres
         new_radii: float = 1.0,
-        total_gaussians: int = 200_000,
-        thick_perp: float = 6.645693247264717e-05,
+        total_gaussians: int = 3_000_000,
+        thick_perp: float = 5.645693247264717e-05,
         par_ratio:   float = 20.0,
         k_neighbors: int   = 2,
-        dup_factor:  int   = 1
+        dup_factor:  int   = 1,
+        uniform_strand_color: bool = False    # ← NEW FLAG
     ):
         """
-        Re-sample exactly `total_gaussians` Gaussians on `new_roots`,
-        distributing them by new strand‐length, inheriting colour
-        by averaging each new root's k_neighbors old‐root colours,
-        and reinitializing all other per-Gaussian parameters.
+        Re-initialise the Gaussian scene on a new set of scalp roots.
+
+        Parameters
+        ----------
+        uniform_strand_color
+            If **True**, colour SH coefficients, ASG features and opacity logits
+            are stored *once per strand* (shape `(S_new, …)`); the usual attribute
+            names (`_features_dc`, `_features_rest`, `_features_asg`, `_opacity`)
+            are **re-used**.  The properties `get_features`, `get_asg_features`
+            and `get_opacity` automatically broadcast them to `(M, …)` when
+            accessed, so no other code must change.
         """
         device = self._xyz.device
+        dtype  = self._xyz.dtype
 
-        # 0) flatten old-colours
+        # ------------------------------------------------------------------ 0.  flatten existing features
         M_old = self._s.shape[0]
-        dc_shape   = tuple(self._features_dc.shape[1:])   # e.g. (1, n_sh_dc)
-        rest_shape = tuple(self._features_rest.shape[1:]) # e.g. (1, n_sh_rest)
-        Ddc  = dc_shape[0] * dc_shape[1]
-        Dr   = rest_shape[0] * rest_shape[1]
+
+        dc_shape   = self._features_dc.shape[1:]        # (1, n_dc)
+        rest_shape = self._features_rest.shape[1:]      # (3, n_rest)
+        Ddc  = int(np.prod(dc_shape))                   # scalar
+        Dr   = int(np.prod(rest_shape))
+        Dasg = self._features_asg.shape[1]
+
         old_dc_flat   = self._features_dc.reshape(M_old, Ddc)
         old_rest_flat = self._features_rest.reshape(M_old, Dr)
-        all_old_feats = torch.cat([old_dc_flat, old_rest_flat], dim=1)  # (M_old, Ddc+Dr)
+        old_asg_flat  = self._features_asg                 # (M_old, Dasg)
 
-        # average per old‐strand
+        # ------------------------------------------------------------------ 1.  per-old-strand means
         S_old = self.num_strands
-        strand_feats = torch.zeros((S_old, Ddc+Dr), device=device)
-        counts       = torch.zeros((S_old,), device=device)
-        strand_feats.index_add_(0, self._strand_id, all_old_feats)
-        counts.index_add_(0, self._strand_id, torch.ones_like(self._strand_id, dtype=torch.float))
-        nz = counts > 0
-        strand_feats[nz] /= counts[nz].unsqueeze(1)
+        strand_feats_colour = torch.zeros((S_old, Ddc + Dr), device=device, dtype=dtype)
+        strand_feats_asg    = torch.zeros((S_old, Dasg     ), device=device, dtype=dtype)
+        counts              = torch.zeros((S_old,),        device=device, dtype=dtype)
 
-        # 1) k-NN lookup (drop n_jobs)
+        strand_feats_colour.index_add_(0, self._strand_id,
+                                    torch.cat([old_dc_flat, old_rest_flat], dim=1))
+        strand_feats_asg   .index_add_(0, self._strand_id, old_asg_flat)
+        counts.index_add_(0, self._strand_id,
+                        torch.ones_like(self._strand_id, dtype=dtype))
+        nz = counts > 0
+        strand_feats_colour[nz] /= counts[nz].unsqueeze(1)
+        strand_feats_asg   [nz] /= counts[nz].unsqueeze(1)
+
+        # ------------------------------------------------------------------ 2.  k-NN colour transfer to new roots
         old_np = self.roots.cpu().numpy()
         new_np = new_roots.cpu().numpy()
-        tree   = scipy.spatial.cKDTree(old_np)
-        _, nn  = tree.query(new_np, k=k_neighbors)  # (S_new, k)
+        tree   = _sp.cKDTree(old_np)
+        _, nearest_neigh = tree.query(new_np, k=k_neighbors)    # (S_new, k)
 
         S_new = new_roots.shape[0]
-        new_strand_feats = torch.zeros((S_new, Ddc+Dr), device=device)
-        for i in range(S_new):
-            valid = [j for j in nn[i] if j < S_old]
-            if valid:
-                new_strand_feats[i] = strand_feats[valid].mean(dim=0)
-            else:
-                new_strand_feats[i].uniform_(-1,1)
+        new_colour_per_strand = torch.zeros((S_new, Ddc + Dr), device=device, dtype=dtype)
+        new_asg_per_strand    = torch.zeros((S_new, Dasg     ), device=device, dtype=dtype)
 
-        # 2) decode new strands & lengths
-        out     = self.perm(roots=new_roots[None], theta=self.theta, beta=self.beta)
-        strands = out["strands"].position[0] / 100.0      # (S_new, V, 3)
-        seg_len = (strands[:,1:] - strands[:,:-1]).norm(dim=-1)  # (S_new, V-1)
-        strand_L = seg_len.sum(dim=1)                           # (S_new,)
+        for i in range(S_new):
+            neigh = [j for j in nearest_neigh[i] if j < S_old]
+            if neigh:
+                new_colour_per_strand[i] = strand_feats_colour[neigh].mean(0)
+                new_asg_per_strand   [i] = strand_feats_asg   [neigh].mean(0)
+            else:                                  # degenerate – randomise
+                new_colour_per_strand[i].uniform_(-1, 1)
+                new_asg_per_strand   [i].zero_()
+
+        # ------------------------------------------------------------------ 3.  decode new strands & lengths
+        out      = self.perm(roots=new_roots[None],
+                            theta=self.theta, beta=self.beta)
+        strands  = out["strands"].position[0] / 100.0      # (S_new, V, 3)
+        seg_len  = (strands[:, 1:] - strands[:, :-1]).norm(dim=-1)
+        strand_L = seg_len.sum(dim=1)                      # (S_new,)
         self.register_buffer("strand_length", strand_L, persistent=False)
 
-        # 3) redistribute total_gaussians
+        # ------------------------------------------------------------------ 4.  redistribute total_gaussians
         if total_gaussians is None:
             total_gaussians = M_old
-        Lsum  = strand_L.sum().item()
-        raw   = strand_L / Lsum * float(total_gaussians)
-        K_list = raw.round().long().clamp(min=1).tolist()
-        drift = total_gaussians - sum(K_list)
+        raw     = (strand_L / strand_L.sum()) * float(total_gaussians)
+        K_list  = raw.round().long().clamp(min=1).tolist()
+        drift   = total_gaussians - sum(K_list)
         if drift > 0:
             o = torch.argsort(strand_L, descending=True)
             for i in range(drift):
@@ -302,90 +330,142 @@ class GaussianPerm(nn.Module):
                 if K_list[sid] > 1:
                     K_list[sid] -= 1
 
-        # 4) build new _strand_id & offsets
+        # ------------------------------------------------------------------ 5.  build axial logits + strand-id lookup
         s_list, sid_list = [], []
         for sid, K in enumerate(K_list):
-            s_uniform = torch.linspace(0, 1, K, device=device)
-            eps = 1e-6                       # stay away from 0/1 to avoid ±∞
-            s_clamped = s_uniform.clamp(min=eps, max=1-eps)
+            s_uniform  = torch.linspace(0, 1, K, device=device, dtype=dtype)
+            eps        = 1e-6
+            s_clamped  = s_uniform.clamp(min=eps, max=1-eps)
             s_hat_init = torch.log(s_clamped) - torch.log1p(-s_clamped)
-
-            s_list.append(s_hat_init)
+            s_list .append(s_hat_init)
             sid_list.append(torch.full((K,), sid, device=device, dtype=torch.long))
-        ids     = torch.cat(sid_list)
-        offsets = torch.zeros((S_new+1,), dtype=torch.long, device=device)
-        offsets[1:] = torch.cumsum(torch.tensor(K_list, device=device), dim=0)
 
-        self._s             = torch.nn.Parameter(torch.cat(s_list), requires_grad=True)
+        ids     = torch.cat(sid_list)
+        offsets = torch.zeros((S_new + 1,), dtype=torch.long, device=device)
+        offsets[1:] = torch.cumsum(torch.tensor(K_list, device=device), 0)
+
+        self._s           = nn.Parameter(torch.cat(s_list), requires_grad=True)
         self.register_buffer("_strand_id",    ids,      persistent=False)
-        self.register_buffer("_gauss_offset", offsets, persistent=False)
+        self.register_buffer("_gauss_offset", offsets,  persistent=False)
         self.num_gaussians = int(offsets[-1])
 
-        # 5) new cage‐radii
-        strand_R = torch.ones((S_new,), device=device) * new_radii
+        # ------------------------------------------------------------------ 6.  per-strand cage radius
+        strand_R = torch.ones((S_new,), device=device, dtype=dtype) * new_radii
         self.register_buffer("_strand_radius", strand_R, persistent=False)
 
-        # 6) centers & rotations
+        # ------------------------------------------------------------------ 7.  centres & quats
         centers, quats = [], []
         for sid in range(S_new):
             a, b = offsets[sid].item(), offsets[sid+1].item()
             if b > a:
-                ss = torch.linspace(0,1,b-a,device=device)
+                ss = torch.linspace(0, 1, b - a, device=device, dtype=dtype)
                 c, t = self._center_tangent_normal(strands[sid], ss)
-                centers.append(c)
-                quats.append(self._edge_dirs_to_quat(t))
-        self._xyz      = torch.cat(centers,0)
-        self._rotation = torch.cat(quats,0)
+                centers.append(c);  quats.append(self._edge_dirs_to_quat(t))
+        self._xyz      = torch.cat(centers, 0)
+        self._rotation = torch.cat(quats,   0)
 
-        # 7) assign learnt colours back into original shapes
-        M_new    = self.num_gaussians
-        feat_rep = new_strand_feats[ids]                   # (M_new, Ddc+Dr)
-        dc_flat  = feat_rep[:, :Ddc]
-        rs_flat  = feat_rep[:, Ddc:]
+        # ------------------------------------------------------------------ 8.  initialise colour / opacity / ASG
+        if uniform_strand_color:
+            # -------- one vector per strand (shape (S_new, …)) ---------------
+            self._features_dc   = nn.Parameter(
+                new_colour_per_strand[:, :Ddc].view(S_new, 1, Ddc),
+                requires_grad=True
+            )
+            self._features_rest = nn.Parameter(
+                new_colour_per_strand[:, Ddc:].view(S_new, 3, Dr // 3),
+                requires_grad=True
+            )
+            self._features_asg  = nn.Parameter(
+                new_asg_per_strand,                       # (S_new, Dasg)
+                requires_grad=True
+            )
+            self._opacity       = nn.Parameter(
+                self.inverse_opacity_activation(
+                    torch.ones((S_new, 1), device=device, dtype=dtype)
+                ),
+                requires_grad=True
+            )
+            self.uniform_strand_color = True
+        else:
+            # ---------- one vector per Gaussian (legacy behaviour) -----------
+            colour = new_colour_per_strand[self._strand_id]   # (M_new, Ddc+Dr)
+            asg    = new_asg_per_strand   [self._strand_id]   # (M_new, Dasg)
 
-        self._features_dc   = torch.nn.Parameter(dc_flat.reshape(M_new, *dc_shape),
-                                                requires_grad=True)
-        self._features_rest = torch.nn.Parameter(rs_flat.reshape(M_new, *rest_shape),
-                                                requires_grad=True)
+            dc_flat = colour[:, :Ddc]
+            rs_flat = colour[:, Ddc:]
 
-        # 8) re-init φ, ρ̂ & opacity
-        self._phi     = torch.nn.Parameter(
-                            torch.empty((M_new,1), device=device).uniform_(0,2*math.pi),
-                            requires_grad=True
-                        )
-        rho          = torch.rand((M_new,1), device=device)
-        self._rho_hat = torch.nn.Parameter(
-                            self.inverse_rho_activation(rho),
-                            requires_grad=True
-                        )
-        self._opacity = torch.nn.Parameter(
-                            self.inverse_opacity_activation(torch.ones((M_new,1), device=device)),
-                            requires_grad=True
-                        )
+            self._features_dc   = nn.Parameter(
+                dc_flat.view(self.num_gaussians, 1, Ddc).transpose(1, 2).contiguous(),
+                requires_grad=True
+            )
+            self._features_rest = nn.Parameter(
+                rs_flat.view(self.num_gaussians, 3, Dr // 3).transpose(1, 2).contiguous(),
+                requires_grad=True
+            )
+            self._features_asg  = nn.Parameter(asg,  requires_grad=True)
+            self._opacity       = nn.Parameter(
+                self.inverse_opacity_activation(
+                    torch.ones((self.num_gaussians, 1), device=device, dtype=dtype)
+                ),
+                requires_grad=True
+            )
+            self.uniform_strand_color = False
 
-        # 9) re-init scaling_base
-        sigma_perp0 = thick_perp
-        sigma_para0    = thick_perp * par_ratio
-        log0           = torch.tensor([sigma_perp0, sigma_para0, sigma_perp0],
-                                    device=device).log()
-        self._scaling_base = torch.nn.Parameter(
-                                log0.expand(M_new,3).clone(),
-                                requires_grad=True
-                            )
+        # ------------------------------------------------------------------ 9.  other learnables
+        self._phi      = nn.Parameter(
+            torch.empty((self.num_gaussians, 1), device=device, dtype=dtype)
+                .uniform_(0, 2*math.pi),
+            requires_grad=True
+        )
+        rho            = torch.rand((self.num_gaussians, 1), device=device, dtype=dtype)
+        self._rho_hat  = nn.Parameter(self.inverse_rho_activation(rho), True)
+
+        sigma_p = thick_perp
+        sigma_l = sigma_p * par_ratio
+        log0    = torch.tensor([sigma_p, sigma_l, sigma_p],
+                            device=device, dtype=dtype).log()
+        self._scaling_base = nn.Parameter(
+            log0.expand(self.num_gaussians, 3).clone(), True
+        )
         self._scaling = None
 
-        # 10) reset accumulators
-        self.xyz_gradient_accum = torch.zeros((M_new,1), device=device)
+        # ------------------------------------------------------------------ 10.  accumulators
+        self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1), device=device, dtype=dtype)
         self.denom              = torch.zeros_like(self.xyz_gradient_accum)
         self.register_buffer("max_radii2D",
-                            torch.zeros((M_new,), device=device),
+                            torch.zeros((self.num_gaussians,), device=device, dtype=dtype),
                             persistent=False)
 
-        # 11) (optional) duplicate if dup_factor > 1
-        #     … your existing dup logic here …
+        # ------------------------------------------------------------------ 11.  optional duplication block (unchanged)
+        if dup_factor > 1:
+            orig_ids = self._strand_id
+            self._strand_id = orig_ids.repeat(dup_factor)
+            counts = torch.bincount(self._strand_id, minlength=S_new)
+            new_off = torch.zeros(S_new + 1, dtype=torch.long, device=device)
+            new_off[1:] = counts.cumsum(0)
+            self._gauss_offset = new_off
 
-        # 12) finally update roots & adjacency
-        self.roots = new_roots.to(device)
+            def rep(x): return x.repeat(dup_factor, *[1]*(x.dim()-1))
+            self._s            = nn.Parameter(rep(self._s),            True)
+            self._phi          = nn.Parameter(rep(self._phi),          True)
+            self._rho_hat      = nn.Parameter(rep(self._rho_hat),      True)
+            self._features_dc  = nn.Parameter(rep(self._features_dc),  True)
+            self._features_rest= nn.Parameter(rep(self._features_rest),True)
+            self._features_asg = nn.Parameter(rep(self._features_asg), True)
+            self._opacity      = nn.Parameter(rep(self._opacity),      True)
+            self._scaling_base = nn.Parameter(rep(self._scaling_base), True)
+            self._xyz          = rep(self._xyz)
+            self._rotation     = rep(self._rotation)
+
+            self.num_gaussians = self._s.shape[0]
+            self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1), device=device, dtype=dtype)
+            self.denom              = torch.zeros_like(self.xyz_gradient_accum)
+            self.register_buffer("max_radii2D",
+                                torch.zeros((self.num_gaussians,), device=device, dtype=dtype),
+                                persistent=False)
+
+        # ------------------------------------------------------------------ 12.  internal bookkeeping
+        self.roots       = new_roots.to(device, dtype=dtype)
         self.num_strands = S_new
         self.compute_root_adjacency()
 
@@ -640,6 +720,7 @@ class GaussianPerm(nn.Module):
             self._phi,
             self._features_dc,
             self._features_rest,
+            self._features_asg,
             self._opacity,
             self._scaling_base,
 
@@ -661,10 +742,10 @@ class GaussianPerm(nn.Module):
             # 17–18: gradient statistics
             self.xyz_gradient_accum,
             self.denom,
-            # self.max_radii2D,
+            self.max_radii2D,
         )
 
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args, extra_parameters=None):
         """
         Unpack everything from capture(), rebuild optimizer, reload state,
         and re-register all buffers.
@@ -678,6 +759,7 @@ class GaussianPerm(nn.Module):
             self._phi,
             self._features_dc,
             self._features_rest,
+            self._features_asg,
             self._opacity,
             self._scaling_base,
 
@@ -693,7 +775,7 @@ class GaussianPerm(nn.Module):
 
             xyz_grad_accum,
             denom,
-            # self.max_radii2D,
+            self.max_radii2D,
         ) = model_args
 
         # 1) re-register those three as buffers so they move with .to(device):
@@ -706,7 +788,7 @@ class GaussianPerm(nn.Module):
         self.denom              = denom
 
         # 3) rebuild optimizer (this sees all your nn.Parameter fields)
-        self.training_setup(training_args)
+        self.training_setup(training_args, extra_parameters)
         # 4) load its saved state
         self.optimizer.load_state_dict(opt_state_dict)
 
@@ -747,29 +829,46 @@ class GaussianPerm(nn.Module):
         return torch.stack((perp, paral, perp), dim=1)
 
     @property
+    def get_features(self):
+        if getattr(self, "uniform_strand_color", False):
+            # ─ strand-level tensors → per-Gaussian via self._strand_id
+            dc   = self._features_dc  [self._strand_id]          # (M,1,n_dc)
+            rest = self._features_rest[self._strand_id]          # (M,3,n_rest)
+            return torch.cat((dc, rest), dim=2)                  # (M,4,n_tot)
+        else:
+            # ─ legacy: tensors already (M, …); just return them
+            return torch.cat((self._features_dc,
+                            self._features_rest), dim=1)
+
+    @property
+    def get_asg_features(self):
+        if getattr(self, "uniform_strand_color", False):
+            return self._features_asg[self._strand_id]           # broadcast
+        else:
+            return self._features_asg
+
+    @property
+    def get_opacity(self):
+        if getattr(self, "uniform_strand_color", False):
+            return torch.sigmoid(self._opacity[self._strand_id]) # broadcast
+        else:
+            return torch.sigmoid(self._opacity)
+
+    @property
+    def get_axial_weight(self):           # s in [0,1]
+        return torch.sigmoid(self._s)
+
+    @property
     def get_scaling_with_3D_filter(self):
         scales = self.get_scaling
         
         scales = torch.square(scales) + torch.square(self.filter_3D)
         scales = torch.sqrt(scales)
         return scales
-
-    @property
-    def get_features(self):
-        """
-        Spherical-harmonic colour coefficients, concatenated
-        to shape (M, 3 × ( (L+1)² ) ).
-        """
-        return torch.cat((self._features_dc, self._features_rest), dim=1)
-
-    @property
-    def get_opacity(self):
-        """Alpha of each Gaussian after sigmoid – shape (M,1)."""
-        return self.opacity_activation(self._opacity)
     
     @property
     def get_opacity_with_3D_filter(self):
-        opacity = self.opacity_activation(self._opacity)
+        opacity = self.get_opacity
         # apply 3D filter
         scales = self.get_scaling
         
@@ -781,9 +880,6 @@ class GaussianPerm(nn.Module):
         coef = torch.sqrt(det1 / det2)
         return opacity * coef[..., None]
 
-    @property
-    def get_axial_weight(self):           # s in [0,1]
-        return torch.sigmoid(self._s)
 
     @property
     def get_radial_uv(self):
@@ -830,6 +926,7 @@ class GaussianPerm(nn.Module):
             # Gaussian appearance
             {"params": [self._features_dc],   "lr": training_args.feature_lr,           "name": "f_dc"},
             {"params": [self._features_rest], "lr": training_args.feature_lr / 20.0,    "name": "f_rest"},
+            {'params': [self._features_asg],  'lr': training_args.feature_lr,           "name": "f_asg"},
             {"params": [self._opacity],       "lr": training_args.opacity_lr,           "name": "opacity"},
 
             # Gaussian shape
@@ -1109,6 +1206,8 @@ class GaussianPerm(nn.Module):
         # ------------------------------------------------------------------ final size check
         assert self._xyz.shape[0] == M, \
             f"Wrong M after update: got {self._xyz.shape[0]} vs {M}"
+        
+        return tangent
 
     @torch.no_grad()
     def compute_3D_filter(self, cameras, device="cuda"):
@@ -1163,6 +1262,39 @@ class GaussianPerm(nn.Module):
         #TODO box to gaussian transform
         filter_3D = distance / focal_length * (0.2 ** 0.5)
         self.filter_3D = filter_3D[..., None]
+
+    @torch.no_grad()
+    def halve_large_parallel_sigmas(
+        self,
+        thick_perp: float = 6.645693247264717e-05,  # default σ⊥
+        par_ratio:  float = 20.0,                  # default σ‖ / σ⊥
+        thresh_mul: float = 2.0                    # clamp when σ‖ ≥ 3× default
+    ) -> int:
+        """
+        If σ‖ ≥ thick_perp * par_ratio * thresh_mul, divide that σ‖ by two.
+        Returns the number of Gaussians affected.
+        """
+        # 1. Current longitudinal sigmas (σ‖ = exp(log σ‖))
+        sigma_par = self._scaling_base[:, 1].exp()                # (M,)
+        threshold = thick_perp * par_ratio * thresh_mul
+
+        # 2. Offending Gaussians
+        mask = sigma_par >= threshold
+        n_fixed = int(mask.sum().item())
+        if n_fixed == 0:
+            return 0
+
+        # 3. Halve σ‖  → subtract ln 2 from its log value
+        self._scaling_base.data[mask, 1] -= math.log(2.0)
+        self._scaling_base.data[mask, 0] -= math.log(2.0)
+
+        # 4. Keep cached _scaling tensor in sync
+        base  = self._scaling_base
+        perp  = base[:, [0]]
+        para  = base[:, [1]]
+        self._scaling = torch.cat([perp, para, perp], dim=1)
+
+        return n_fixed
 
     # ================================================================
     #  ----  DENSIFICATION / PRUNE HELPERS  ---------------------------
@@ -1240,6 +1372,7 @@ class GaussianPerm(nn.Module):
         new_xyz      = self._xyz[sel]
         new_features_dc   = self._features_dc  [sel]
         new_features_rest = self._features_rest[sel]
+        new_features_asg  = self._features_asg[sel]
         new_opacity  = self._opacity[sel]
         new_scaling  = self._scaling_base[sel]
         new_rotation = self._rotation[sel]
@@ -1254,6 +1387,7 @@ class GaussianPerm(nn.Module):
             "xyz":       new_xyz,
             "f_dc":      new_features_dc,
             "f_rest":    new_features_rest,
+            "f_asg":     new_features_asg,
             "opacity":   new_opacity,
             "scaling":   new_scaling,
             "rotation":  new_rotation,
@@ -1266,6 +1400,7 @@ class GaussianPerm(nn.Module):
         self._xyz            = ext["xyz"]
         self._features_dc    = ext["f_dc"]
         self._features_rest  = ext["f_rest"]
+        self._features_asg   = ext["f_asg"]
         self._opacity        = ext["opacity"]
         self._scaling_base   = ext["scaling"]
         self._rotation       = ext["rotation"]
@@ -1327,6 +1462,7 @@ class GaussianPerm(nn.Module):
             "xyz":       dup(self._xyz),          # dummy, will be recomputed next frame
             "f_dc":      dup(self._features_dc),
             "f_rest":    dup(self._features_rest),
+            "f_asg":    dup(self._features_asg),
             "opacity":   dup(self._opacity),
             "scaling":   new_scaling,
             "rotation":  dup(self._rotation),
@@ -1339,6 +1475,7 @@ class GaussianPerm(nn.Module):
         self._xyz            = ext["xyz"]
         self._features_dc    = ext["f_dc"]
         self._features_rest  = ext["f_rest"]
+        self._features_asg   = ext["f_asg"]
         self._opacity        = ext["opacity"]
         self._scaling_base   = ext["scaling"]
         self._rotation       = ext["rotation"]
@@ -1406,6 +1543,7 @@ class GaussianPerm(nn.Module):
         self._phi           = new_params["phi"]
         self._features_dc   = new_params["f_dc"]
         self._features_rest = new_params["f_rest"]
+        self._features_asg  = new_params["f_asg"]
         self._opacity       = new_params["opacity"]
         self._scaling_base  = new_params["scaling"]
 
@@ -1520,6 +1658,7 @@ class GaussianPerm(nn.Module):
         self._phi           = new_params["phi"]
         self._features_dc   = new_params["f_dc"]
         self._features_rest = new_params["f_rest"]
+        self._features_asg  = new_params["f_asg"]
         self._opacity       = new_params["opacity"]
         self._scaling_base  = new_params["scaling"]
         # (θ and β live in different groups, they get returned but we ignore them)
@@ -1616,6 +1755,7 @@ class GaussianPerm(nn.Module):
         new_xyz           = self._xyz[sel]
         new_features_dc   = self._features_dc[sel]
         new_features_rest = self._features_rest[sel]
+        new_features_asg = self._features_asg[sel]
         new_opacity       = self._opacity[sel]
         new_scaling_base  = self._scaling_base[sel]
         new_rotation      = self._rotation[sel]
@@ -1629,6 +1769,7 @@ class GaussianPerm(nn.Module):
             "xyz":      new_xyz,
             "f_dc":     new_features_dc,
             "f_rest":   new_features_rest,
+            "f_asg":    new_features_asg,
             "opacity":  new_opacity,
             "scaling":  new_scaling_base,
             "rotation": new_rotation,
@@ -1641,6 +1782,7 @@ class GaussianPerm(nn.Module):
         self._xyz           = ext["xyz"]
         self._features_dc   = ext["f_dc"]
         self._features_rest = ext["f_rest"]
+        self._features_asg = ext["f_asg"]
         self._opacity       = ext["opacity"]
         self._scaling_base  = ext["scaling"]
         self._rotation      = ext["rotation"]
@@ -1701,6 +1843,7 @@ class GaussianPerm(nn.Module):
             "xyz":      dup(self._xyz),
             "f_dc":     dup(self._features_dc),
             "f_rest":   dup(self._features_rest),
+            "f_asg":    dup(self._features_asg),
             "opacity":  dup(self._opacity),
             "scaling":  new_scalings,
             "rotation": dup(self._rotation),
@@ -1713,6 +1856,7 @@ class GaussianPerm(nn.Module):
         self._xyz           = ext["xyz"]
         self._features_dc   = ext["f_dc"]
         self._features_rest = ext["f_rest"]
+        self._features_asg = ext["f_asg"]
         self._opacity       = ext["opacity"]
         self._scaling_base  = ext["scaling"]
         self._rotation      = ext["rotation"]
