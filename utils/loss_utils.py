@@ -89,42 +89,48 @@ def alpha_blended_loss(pred_alpha: torch.Tensor,
           + w_grad * loss_grad
     return loss
 
+import math
+import torch
+
 class UncertaintyKLLoss:
     """
     Computes
-        KL_z   = E_s[ z_s² ]           · 1/(2 σ_z²)
-        KL_tau = E_i[ (log τ_i-μ_τ)² ] · 1/(2 σ_τ²)
+        KL_z   = E_s[ (z_s - mu_z)^2 ]   · 1/(2 σ_z^2)
+        KL_tau = E_i[ (logτ_i - mu_tau)^2 ]· 1/(2 σ_tau^2)
     and multiplies their sum by an annealed weight β(step).
 
-    Call signature
-    --------------
-        kl_loss = kl_sched(gaussians, step)
-
-    The class assumes the GaussianPerm object exposes
-        gaussians._gate_logit   # shape (S,1)
-        gaussians._log_tau      # shape (M,1)
+    Gate‐logits z_s are assumed ~ N(mu_z, σ_z^2)  (maps → ~0.9 prior),
+    logτ_i     are assumed ~ N(mu_tau, σ_tau^2)  (σ_perp prior).
     """
 
-    def __init__(self,
-                 beta_start : float = 1e-3,
-                 beta_final : float = 1e-4,
-                 t_start    : int   = 0,
-                 t_end      : int   = 50_000,
-                 sigma_z    : float = 1.0,
-                 mu_tau     : float = math.log(0.02),
-                 sigma_tau  : float = 0.5):
+    def __init__(
+        self,
+        beta_start: float = 1e-3,
+        beta_final: float = 1e-4,
+        t_start: int     = 0,
+        t_end:   int     = 50_000,
+        # Prior on gate logits z ~ N(mu_z, σ_z^2):
+        mu_z:    float   = math.log(0.9 / 0.1),   # ≈2.20
+        sigma_z: float   = 0.5,
+        # Prior on log-σ tau ~ N(mu_tau, σ_tau^2):
+        mu_tau:    float = math.log(5.645693247264717e-05),  # ≈-9.78
+        sigma_tau: float = 0.2
+    ):
         self.beta_start = beta_start
         self.beta_final = beta_final
         self.t_start    = t_start
-        self.t_end      = max(t_end, t_start + 1)           # avoid div-0
+        self.t_end      = max(t_end, t_start + 1)
 
-        self.inv_2sig2_z   = 1.0 / (2.0 * sigma_z  ** 2)
-        self.inv_2sig2_tau = 1.0 / (2.0 * sigma_tau ** 2)
-        self.mu_tau        = mu_tau
+        # gate‐logit prior
+        self.mu_z = mu_z
+        self.inv_2sig2_z = 1.0 / (2.0 * sigma_z**2)
 
-    # ------------------------------------------------------------
+        # log‐tau prior
+        self.mu_tau = mu_tau
+        self.inv_2sig2_tau = 1.0 / (2.0 * sigma_tau**2)
+
     def beta(self, step: int) -> float:
-        """Linear ramp β(step)."""
+        """Linear ramp of β between beta_start→beta_final over [t_start,t_end]."""
         if step < self.t_start:
             return self.beta_start
         if step >= self.t_end:
@@ -132,23 +138,21 @@ class UncertaintyKLLoss:
         t = (step - self.t_start) / (self.t_end - self.t_start)
         return (1 - t) * self.beta_start + t * self.beta_final
 
-    # ------------------------------------------------------------
-    def __call__(self,
-                 gaussians,          # GaussianPerm instance
-                 step: int           # current iteration
-                 ) -> torch.Tensor:
+    def __call__(self, gaussians, step: int) -> torch.Tensor:
         """
-        Returns: scalar KL-penalty for this step.
+        gaussians: your GaussianPerm instance,
+        step:      current iteration.
         """
-        # -- fetch latents ---------------------------------------
-        z   = gaussians._gate_logit          # (S,1)
-        logtau = gaussians._log_tau             # (M,1)
+        # 1) fetch the raw parameters
+        z      = gaussians._gate_logit   # (S,1)
+        logtau = gaussians._log_tau      # (M,1)
 
-        # -- compute per-family KLs ------------------------------
-        kl_z   = self.inv_2sig2_z * z.pow(2).mean()
-        # kl_tau = self.inv_2sig2_tau * (logtau - self.mu_tau).pow(2).mean()
+        # 2) compute KL for each family
+        kl_z   = self.inv_2sig2_z * (z - self.mu_z).pow(2).mean()
+        kl_tau = self.inv_2sig2_tau * (logtau - self.mu_tau).pow(2).mean()
 
-        return self.beta(step) * (kl_z) # + kl_tau)
+        # 3) anneal & return
+        return self.beta(step) * (kl_z + kl_tau)
 
 def _bchw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:          # (C,H,W)  →  (1,C,H,W)
