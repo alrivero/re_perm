@@ -11,6 +11,7 @@
 
 import torch
 import lpips
+import math
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp, pi
@@ -20,7 +21,134 @@ from pytorch3d.structures import Meshes
 
 from utils.general_utils import project_to_screen, quaternion_to_rotation_matrix, convert_normal_to_camera_space
 from kornia.filters import sobel, gaussian_blur2d
-from kornia.losses import ssim_loss as ms_ssim
+from kornia.losses import ssim_loss as ms_ssim, ssim_loss
+
+# ------------------------------------------------------------------ helpers
+def _huber(x: torch.Tensor,
+           y: torch.Tensor,
+           delta: float = 0.1,
+           reduction: str = "mean") -> torch.Tensor:
+    """Classic Huber / smooth-L1 loss with custom delta."""
+    diff  = x - y
+    abs_d = diff.abs()
+    loss  = torch.where(abs_d <= delta,
+                        0.5 * diff.pow(2),
+                        delta * (abs_d - 0.5 * delta))
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "none":
+        return loss
+    return loss.mean()                 # default == "mean"
+
+# ------------------------------------------------------------------ main
+def alpha_blended_loss(pred_alpha: torch.Tensor,
+                       tgt_alpha : torch.Tensor,
+                       *,
+                       delta: float = 0.1,
+                       w_l1 : float = 1.0,
+                       w_ssim: float = 0.2,
+                       w_grad: float = 0.03) -> torch.Tensor:
+    """
+    Composite α-matte loss:
+
+        L = w_l1   · Huber(pred, tgt)
+          + w_ssim · MS-SSIM(pred, tgt)
+          + w_grad · L1(∇pred, ∇tgt)
+
+    Shapes
+    ------
+    pred_alpha, tgt_alpha : (B, 1, H, W) in [0, 1]
+
+    Returns
+    -------
+    scalar loss (torch.Tensor, shape = ())
+    """
+
+    # --- make sure inputs are single-channel (B,1,H,W) float32 ------------
+    if pred_alpha.ndim == 3:   # (B,H,W)
+        pred_alpha = pred_alpha.unsqueeze(1)
+    if tgt_alpha.ndim == 3:
+        tgt_alpha = tgt_alpha.unsqueeze(1)
+    pred_alpha = pred_alpha.float()
+    tgt_alpha  = tgt_alpha.float()
+
+    # --- component losses -------------------------------------------------
+    loss_huber = _huber(pred_alpha, tgt_alpha, delta)
+
+    # kornia ms-SSIM returns the dissimilarity (1 − MS-SSIM)
+    loss_ssim  = ssim_loss(pred_alpha, tgt_alpha, window_size=11, reduction="mean")
+
+    # gradient L1 via Sobel (produces (B,2,H,W); we take magnitude)
+    grad_pred = sobel(pred_alpha)      # (B, 2, H, W)
+    grad_tgt  = sobel(tgt_alpha)
+    loss_grad = F.l1_loss(grad_pred, grad_tgt)
+
+    # --- weighted sum -----------------------------------------------------
+    loss =  w_l1 * loss_huber \
+          + w_ssim * loss_ssim \
+          + w_grad * loss_grad
+    return loss
+
+class UncertaintyKLLoss:
+    """
+    Computes
+        KL_z   = E_s[ z_s² ]           · 1/(2 σ_z²)
+        KL_tau = E_i[ (log τ_i-μ_τ)² ] · 1/(2 σ_τ²)
+    and multiplies their sum by an annealed weight β(step).
+
+    Call signature
+    --------------
+        kl_loss = kl_sched(gaussians, step)
+
+    The class assumes the GaussianPerm object exposes
+        gaussians._gate_logit   # shape (S,1)
+        gaussians._log_tau      # shape (M,1)
+    """
+
+    def __init__(self,
+                 beta_start : float = 1e-3,
+                 beta_final : float = 1e-4,
+                 t_start    : int   = 0,
+                 t_end      : int   = 50_000,
+                 sigma_z    : float = 1.0,
+                 mu_tau     : float = math.log(0.02),
+                 sigma_tau  : float = 0.5):
+        self.beta_start = beta_start
+        self.beta_final = beta_final
+        self.t_start    = t_start
+        self.t_end      = max(t_end, t_start + 1)           # avoid div-0
+
+        self.inv_2sig2_z   = 1.0 / (2.0 * sigma_z  ** 2)
+        self.inv_2sig2_tau = 1.0 / (2.0 * sigma_tau ** 2)
+        self.mu_tau        = mu_tau
+
+    # ------------------------------------------------------------
+    def beta(self, step: int) -> float:
+        """Linear ramp β(step)."""
+        if step < self.t_start:
+            return self.beta_start
+        if step >= self.t_end:
+            return self.beta_final
+        t = (step - self.t_start) / (self.t_end - self.t_start)
+        return (1 - t) * self.beta_start + t * self.beta_final
+
+    # ------------------------------------------------------------
+    def __call__(self,
+                 gaussians,          # GaussianPerm instance
+                 step: int           # current iteration
+                 ) -> torch.Tensor:
+        """
+        Returns: scalar KL-penalty for this step.
+        """
+        # -- fetch latents ---------------------------------------
+        z   = gaussians._gate_logit          # (S,1)
+        logtau = gaussians._log_tau             # (M,1)
+
+        # -- compute per-family KLs ------------------------------
+        kl_z   = self.inv_2sig2_z * z.pow(2).mean()
+        # kl_tau = self.inv_2sig2_tau * (logtau - self.mu_tau).pow(2).mean()
+
+        return self.beta(step) * (kl_z) # + kl_tau)
 
 def _bchw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:          # (C,H,W)  →  (1,C,H,W)
@@ -58,7 +186,6 @@ def linear_to_lpips(
     # 3) scale to [-1, 1] for LPIPS
     return x_srgb * 2.0 - 1.0
 
-
 # ---------------- main class ------------------------------------------
 class HairDetailLoss:
     """
@@ -67,110 +194,129 @@ class HairDetailLoss:
         B) L1 + MS-SSIM + Sobel-Y      (detail)
         C) L1 + MS-SSIM + Sobel-Y + LPIPS (polish)
 
-    Parameters
-    ----------
-    warmup_iters , fade_iters  : see previous version.
-    polish_iters  : int
-        How many iterations to *ramp in* LPIPS after phase B finishes.
-        0 → keep LPIPS weight fixed from the start of phase C.
-    w_lpips_final : float
-        Target LPIPS weight (relative to L1=1.0).
-    device        : torch device for the LPIPS network.
+    New in this version
+    -------------------
+    • Optional per-pixel maps
+        gate_map : (1,H,W) — pixel trust g(u) ∈(0,1]
+        tau_map  : (1,H,W) — pixel noise σ(u)  >0
+      If provided, magnitude-type residuals are multiplied by
+          w(u) = gate_map / (tau_map+1e-12)
+      and scale-free residuals (SSIM, LPIPS) by gate_map only.
     """
 
+    # ---------- initialisation unchanged except for docstring ----------
     def __init__(
         self,
         warmup_iters: int = 6_000,
-        fade_iters: int = 20_000,
+        fade_iters  : int = 20_000,
         polish_iters: int = 5_000,
-        huber_delta: float = 0.10,
+        huber_delta : float = 0.10,
         w_ssim_final: float = 0.20,
         w_grad_final: float = 0.02,
-        w_lpips_final: float = 0.10,
-        blur: bool = False,
-        blur_sigma: float = 1.0,
-        device: str = "cuda",
-    ):
+        w_lpips_final:float = 0.10,
+        blur        : bool  = False,
+        blur_sigma  : float = 1.0,
+        device      : str   = "cuda"):
         # phase boundaries
-        self.warmup   = warmup_iters
-        self.fade     = fade_iters
-        self.polish   = polish_iters
+        self.warmup  = warmup_iters
+        self.fade    = fade_iters
+        self.polish  = polish_iters
 
-        # loss hyper-params
-        self.delta    = huber_delta
-        self.w_ssim_f = w_ssim_final
-        self.w_grad_f = w_grad_final
+        # weights
+        self.delta     = huber_delta
+        self.w_ssim_f  = w_ssim_final
+        self.w_grad_f  = w_grad_final
         self.w_lpips_f = w_lpips_final
-        self.blur     = blur
-        self.blur_sigma = blur_sigma
+        self.blur      = blur
+        self.blur_sigma= blur_sigma
 
-        # LPIPS network (VGG backbone, frozen) -------------------------
+        # frozen LPIPS net
         self.lpips = lpips.LPIPS(net='vgg').to(device).eval()
-        for p in self.lpips.parameters():
-            p.requires_grad_(False)
+        for p in self.lpips.parameters(): p.requires_grad_(False)
 
-    # --------------------------------------------------------------
+    # ---------------- private huber -----------------------------------
     def _huber(self, x, y):
         diff   = x - y
         abs_e  = diff.abs()
         quad   = 0.5 * diff ** 2
         linear = self.delta * (abs_e - 0.5 * self.delta)
-        return torch.where(abs_e <= self.delta, quad, linear).mean()
+        return torch.where(abs_e <= self.delta, quad, linear)
 
-    # --------------------------------------------------------------
-    def __call__(self, pred: torch.Tensor, tgt: torch.Tensor, step: int) -> torch.Tensor:
+    # ---------------- forward -----------------------------------------
+    def __call__(self,
+                 pred    : torch.Tensor,
+                 tgt     : torch.Tensor,
+                 step    : int,
+                 # optional uncertainty maps
+                 tau_map : torch.Tensor = None,   # (1,H,W) σ
+                 gate_map: torch.Tensor = None    # (1,H,W) g
+                 ) -> torch.Tensor:
 
-        # ------ phase-dependent weights -----------------------------
-        if step < self.warmup:
-            # Phase A
-            w_huber, w_l1, w_ssim, w_grad, w_lpips = 1.0, 0, 0, 0, 0
+        # insure BCHW layout
+        pred4, tgt4 = _bchw(pred), _bchw(tgt)      # (B,3,H,W)
 
-        elif step < self.warmup + self.fade:
-            # Fade-in Phase B
-            t = (step - self.warmup) / self.fade
-            w_huber = 1.0 - t
-            w_l1    = t
-            w_ssim  = t * self.w_ssim_f
-            w_grad  = t * self.w_grad_f
-            w_lpips = 0.0
-
+        # -------- weights per pixel ----------------------------------
+        if gate_map is None:
+            g_map = torch.ones_like(pred4[:, :1])  # broadcast
         else:
-            # Phase C – polish (optionally ramp LPIPS)
-            w_huber = 0.0
-            w_l1    = 1.0
-            w_ssim  = self.w_ssim_f
-            w_grad  = self.w_grad_f
+            g_map = _bchw(gate_map)                # (1,1,H,W) → broadcast
 
-            if self.polish > 0:
-                t_lp = min(1.0, (step - (self.warmup + self.fade)) / self.polish)
-                w_lpips = t_lp * self.w_lpips_f
+        if tau_map is None:
+            w_map = g_map                          # acts like gate only
+        else:
+            t_map = _bchw(tau_map)
+            w_map = g_map / (t_map + 1e-12)
+
+        # -------- phase-dependent global scalars ---------------------
+        if step < self.warmup:                            # Phase A
+            w_hu, w_l1, w_ss, w_gr, w_lp = 1, 0, 0, 0, 0
+        elif step < self.warmup + self.fade:              # Fade-in B
+            t = (step - self.warmup)/self.fade
+            w_hu = 1 - t;  w_l1 = t
+            w_ss = t * self.w_ssim_f
+            w_gr = t * self.w_grad_f
+            w_lp = 0
+        else:                                             # Phase C
+            w_hu = 0; w_l1 = 1
+            w_ss = self.w_ssim_f
+            w_gr = self.w_grad_f
+            if self.polish>0:
+                t_lp = min(1,(step-(self.warmup+self.fade))/self.polish)
+                w_lp = t_lp * self.w_lpips_f
             else:
-                w_lpips = self.w_lpips_f
+                w_lp = self.w_lpips_f
 
-        # ------ compute each term -----------------------------------
+        # -------- losses ---------------------------------------------
         loss = 0.0
-        pred4, tgt4 = _bchw(pred), _bchw(tgt)       # <-- add this
 
-        # use pred4 / tgt4 below
-        if w_huber:
-            loss += w_huber * self._huber(pred4, tgt4)
+        if w_hu:
+            hub = self._huber(pred4, tgt4)                # (B,3,H,W)
+            loss += w_hu * (hub * w_map).mean()
 
         if w_l1:
-            loss += w_l1 * F.l1_loss(pred4, tgt4)
+            l1 = (pred4 - tgt4).abs()                     # (B,3,H,W)
+            loss += w_l1 * (l1 * w_map).mean()
 
-        if w_ssim:
-            loss += w_ssim * ms_ssim(pred4, tgt4, window_size=11, max_val=1.0)
+        if w_ss:
+            ssim_map = 1 - ms_ssim(pred4, tgt4,
+                                    window_size=11, max_val=1.0,
+                                    reduction='none')     # (B,1,H,W)
+            loss += w_ss * (ssim_map * g_map).mean() * 50
 
-        if w_grad:
+        if w_gr:
             lum_pred = rgb_to_luminance(pred4)
             lum_tgt  = rgb_to_luminance(tgt4)
             if self.blur:
-                k = int(2 * math.ceil(2 * self.blur_sigma) + 1)
-                lum_tgt = gaussian_blur2d(lum_tgt, (k, k), (self.blur_sigma, self.blur_sigma))
-            loss += w_grad * F.l1_loss(sobel(lum_pred), sobel(lum_tgt))
+                k = int(2*math.ceil(2*self.blur_sigma)+1)
+                lum_tgt = gaussian_blur2d(lum_tgt,(k,k),
+                                          (self.blur_sigma, self.blur_sigma))
+            grad = (sobel(lum_pred) - sobel(lum_tgt)).abs()  # (B,1,H,W)
+            loss += w_gr * (grad * w_map).mean()
 
-        if w_lpips:
-            loss += w_lpips * self.lpips(linear_to_lpips(pred4), linear_to_lpips(tgt4)).mean()
+        if w_lp:
+            lp = self.lpips(linear_to_lpips(pred4), linear_to_lpips(tgt4))        # (B,1,1,1)
+            # lpips already averaged spatially; weight by mean gate
+            loss += w_lp * (lp.squeeze() * g_map.mean()).mean() * 25
 
         return loss
 

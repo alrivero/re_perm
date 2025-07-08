@@ -6,7 +6,11 @@ import lpips
 import datetime as dt
 import debug
 import yaml
+import math
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import pathlib
+from typing import Union, Optional
 
 try:
     import wandb
@@ -53,7 +57,9 @@ from utils.loss_utils import (
     sdf_contain_and_flow,
     l1_loss,
     ssim,
-    HairDetailLoss
+    HairDetailLoss,
+    UncertaintyKLLoss, 
+    alpha_blended_loss
 )
 from flame import FlameHead
 from nphm.setup import setup_nphm_grid
@@ -91,6 +97,76 @@ def make_side_by_side(left: torch.Tensor, right: torch.Tensor, image_res: int) -
     canvas[:, :image_res] = left_np
     canvas[:, image_res:] = right_np
     return canvas
+
+
+def save_gate_tau_vis(
+    gate_tensor: torch.Tensor,          # (..., 1, H, W) or (H, W)
+    tau_tensor : torch.Tensor,          # same spatial shape as gate_tensor
+    out_path   : Union[str, pathlib.Path],
+    *,
+    log_tau: bool = True,
+    alpha_mask: Optional[torch.Tensor] = None,   # (H,W) mask of visible hair
+    cmap_gate: str = "plasma",
+    cmap_tau : str = "magma",
+    dpi: int = 150,
+):
+    """
+    Show gate (sigma(z) in [0,1]) and tau (variance or std-dev) side-by-side.
+
+    Parameters
+    ----------
+    gate_tensor : torch.Tensor
+        Either gate logits or probabilities.  If you pass logits, convert first
+        with torch.sigmoid.
+    tau_tensor : torch.Tensor
+        Raw tau values (sigma, sigma², or log sigma).  Set log_tau accordingly.
+    out_path : str | pathlib.Path
+        Output file path; extension decides the format (e.g. “gate_tau_012.png”).
+    log_tau : bool
+        If True, log-scale tau before normalising to 0-1.
+    alpha_mask : torch.Tensor | None
+        Binary mask that marks foreground / background.  Background pixels are
+        ignored for the min-max scaling so they stay neutral.
+    """
+    out_path = pathlib.Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # -------- detach & squeeze to (H,W) -----------------------------------
+    gate_map = gate_tensor.squeeze().float().detach().cpu()
+    tau_map  = tau_tensor.squeeze().float().detach().cpu()
+
+    if alpha_mask is not None:
+        mask = alpha_mask.squeeze().bool().cpu()
+    else:
+        mask = torch.ones_like(gate_map, dtype=torch.bool)
+
+    # -------- normalise gate to [0,1] -------------------------------------
+    gate_fg   = gate_map[mask]
+    gate_norm = (gate_fg - gate_fg.min()) / (gate_fg.max() - gate_fg.min() + 1e-12)
+    gate_vis  = torch.zeros_like(gate_map)
+    gate_vis[mask] = gate_norm
+
+    # -------- normalise tau to [0,1] --------------------------------------
+    tau_proc = torch.log10(tau_map.clamp_min(1e-6)) if log_tau else tau_map
+    tau_fg   = tau_proc[mask]
+    tau_norm = (tau_fg - tau_fg.min()) / (tau_fg.max() - tau_fg.min() + 1e-12)
+    tau_vis  = torch.zeros_like(tau_map)
+    tau_vis[mask] = tau_norm
+
+    # -------- plot --------------------------------------------------------
+    fig, ax = plt.subplots(1, 2, figsize=(8, 4), dpi=dpi, constrained_layout=True)
+
+    ax[0].imshow(gate_vis.numpy(), cmap=cmap_gate)
+    ax[0].set_title("Gate σ(z)")
+    ax[0].axis("off")
+
+    ax[1].imshow(tau_vis.numpy(), cmap=cmap_tau)
+    ax[1].set_title("Tau (log)" if log_tau else "Tau")
+    ax[1].axis("off")
+
+    fig.suptitle(out_path.name, fontsize=9)
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
 
 def toggle_beta_trainable(gaussians, trainable: bool, training_args):
     """
@@ -304,10 +380,11 @@ if __name__ == "__main__":
         deform_model.restore(m_params)
         gaussians.restore(g_params, opt, extra_parameters=extra_parameters)
         specular_mlp.load_weights(model_dir, iteration=first_iter)
+        first_iter -= 1
 
         if lpt.learn_flame_rigid_offset:
-            rotation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_rot_020000.pth")
-            translation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_trans_020000.pth")
+            rotation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_rot_070000.pth")
+            translation_offsets = torch.load("/data/add_disk0/alrivero/imagine_data/arjit/log/ckpt/flame_trans_070000.pth")
 
     bg_color = [1, 1, 1] if lpt.white_background else [0, 1, 0]
     bg_image = torch.zeros((3, args.image_res, args.image_res), device=args.device)
@@ -327,7 +404,21 @@ if __name__ == "__main__":
         device=args.device
     )
 
+    kl_loss = UncertaintyKLLoss(
+        beta_start = 1e-2,        # off for the first few k steps
+        beta_final = 4e-2,       # weighted-KL ≈ 5 at the start of the ramp
+        t_start    = 8_000,      # begin ramp here
+        t_end      = 30_000,     # reach full strength well before 50k
+        sigma_z    = 1.0,
+        mu_tau     = math.log(0.02),
+        sigma_tau  = 0.5,
+    )
+
+    uniform_strand_color = True
+    enable_uncertainty = True
+
     for it in range(first_iter + 1, opt.iterations + 1):
+
         if it % 500 == 0:
             gaussians.oneupSHdegree()
 
@@ -404,18 +495,12 @@ if __name__ == "__main__":
         gt_img    = gt_img * alpha + bg_image * (1 - alpha)
 
         
-        loss_h = hair_photo_loss(img_render, gt_img, it)
-
-        if it <= opt.theta_warmup:
-            loss_seg = huber_loss(img_segment, alpha, alpha, delta=0.1, reduction="mean")
+        if enable_uncertainty:
+            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"], tau_map=render_pkg["tau"])
         else:
-            loss_seg = huber_loss(
-                img_segment,
-                (alpha == 1).float(),
-                torch.ones_like(alpha),
-                delta=0.1,
-                reduction="mean"
-            )
+            loss_h = hair_photo_loss(img_render, gt_img, it)
+
+        loss_seg = alpha_blended_loss(img_segment, alpha)
 
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
@@ -427,22 +512,29 @@ if __name__ == "__main__":
         loss_head_col             = head_collision_loss(strand_pts, flame_verts[0], flame_normals[0])
         loss_gauss_head_col       = gaussian_head_collision_loss(gaussians, flame_verts[0], flame_normals[0])
         loss_local_len            = local_length_consistency_loss(gaussians)
-        loss_color_var            = color_variance_loss_sh(gaussians)
-        loss_opacity_var          = opacity_variance_loss(gaussians)
-        loss_asg_var              = asg_variance_loss(gaussians)
         loss_scale_reg            = gaussian_scale_regularization_loss(gaussians)
         
-        if enable_flame_offsets and it >= 8000 and it:
+        if uniform_strand_color:
+            loss_color_var = torch.tensor(0.0).to(args.device)
+            loss_asg_var = torch.tensor(0.0).to(args.device)
+            loss_opacity_var = torch.tensor(0.0).to(args.device)
+        else:
+            loss_color_var            = color_variance_loss_sh(gaussians)
+            loss_asg_var              = asg_variance_loss(gaussians)
+            loss_opacity_var          = opacity_variance_loss(gaussians)
+
+        if enable_uncertainty:
+            loss_uncertainty_kl = kl_loss(gaussians, it)
+        else:
+            loss_uncertainty_kl = torch.tensor(0.0)
+
+        if False:
             loss_flame_rot_reg = (rotation_offsets.norm(dim=1) ** 2).mean()
             loss_flame_trans_reg = (translation_offsets.norm(dim=1) ** 2).mean()
         else:
             # keep the graph happy when offsets are frozen / disabled
             loss_flame_rot_reg   = torch.tensor(0.0, device=args.device)
             loss_flame_trans_reg = torch.tensor(0.0, device=args.device)
-        
-        if it > 50000:
-            loss_flame_rot_reg = loss_flame_rot_reg.detach()
-            loss_flame_trans_reg = loss_flame_trans_reg.detach()
 
 
         mu_theta    = gaussians.theta_start.clone().to(args.device)
@@ -469,6 +561,7 @@ if __name__ == "__main__":
         lambda_scale_reg      = opt.lambda_scale_reg
         lambda_flame_rot_reg   = opt.lambda_flame_rot_reg
         lambda_flame_trans_reg = opt.lambda_flame_trans_reg
+        lambda_uncertainty_kl  = opt.lambda_uncertainty_kl
 
         w_huber           = lambda_huber                * loss_h.item()
         w_nei             = lambda_nei                  * loss_nei.item()
@@ -489,6 +582,7 @@ if __name__ == "__main__":
         w_scale_reg       = lambda_scale_reg            * loss_scale_reg.item()
         w_flame_rot_reg   = lambda_flame_rot_reg        * loss_flame_rot_reg.item()
         w_flame_trans_reg = lambda_flame_trans_reg      * loss_flame_trans_reg.item()
+        w_uncertainty_kl = lambda_uncertainty_kl      *  loss_uncertainty_kl.item()
 
         loss = (
             lambda_huber           * loss_h +
@@ -509,7 +603,8 @@ if __name__ == "__main__":
             lambda_beta_l2         * loss_beta_l2 +
             lambda_scale_reg       * loss_scale_reg +
             lambda_flame_rot_reg   * loss_flame_rot_reg +
-            lambda_flame_trans_reg * loss_flame_trans_reg
+            lambda_flame_trans_reg * loss_flame_trans_reg +
+            lambda_uncertainty_kl  * loss_uncertainty_kl
         )
 
         gaussians.update_learning_rate(it)
@@ -557,7 +652,7 @@ if __name__ == "__main__":
             while new_roots.shape[0] <= gaussians.roots.shape[0]:
                 new_roots, new_radii = perm.hair_roots.densify_scalp_hex(gaussians.roots)
 
-            gaussians.reset_gaussians_to_new_roots(new_roots, new_radii)
+            gaussians.reset_gaussians_to_new_roots(new_roots, new_radii, uniform_strand_color=True)
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
             gaussians.training_setup(opt, extra_parameters=extra_parameters)
@@ -566,6 +661,9 @@ if __name__ == "__main__":
             opt.densification_strand_interval *= 4
             opt.densify_from_iter = 500 + it
             opt.lambda_color_var *= 10.0
+
+            uniform_strand_color = True
+            enable_uncertainty = True
 
         if it % 100 == 0:
             num_reset = gaussians.halve_large_parallel_sigmas()
@@ -613,6 +711,7 @@ if __name__ == "__main__":
                 f"scale_reg {loss_scale_reg:.4f} (w {w_scale_reg:.4f})  "
                 f"flame_rot_reg {loss_flame_rot_reg:.4f} (w {w_flame_rot_reg:.4f})  "
                 f"flame_trans_reg {loss_flame_trans_reg:.4f} (w {w_flame_trans_reg:.4f})  "
+                f"uncertainty_kl {loss_uncertainty_kl:.4f} (w {w_uncertainty_kl:.4f})  "
                 f"→ total {loss.item():.4f}     "
                 f"→ Gaussian Count {gaussians.num_gaussians}     "
                 f"→ Strand Count {gaussians.num_strands}     "
@@ -639,6 +738,7 @@ if __name__ == "__main__":
                     "loss/scale_reg":        loss_scale_reg.item(),
                     "loss/flame_rot_reg":    loss_flame_rot_reg.item(),
                     "loss/flame_trans_reg":  loss_flame_trans_reg.item(),
+                    "loss/uncertainty_kl":   loss_uncertainty_kl.item(),
                     "iter":                  it,
                     "num_gaussians":         gaussians.num_gaussians,
                     "num_strands":           gaussians.num_strands,
@@ -649,6 +749,7 @@ if __name__ == "__main__":
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
+            save_gate_tau_vis(render_pkg["gate"], render_pkg["tau"], os.path.join(train_dir, f"{it:06d}_gate_tau.png"))
 
         if it % 10000 == 0 or it == 1:
             export_strands_as_obj(

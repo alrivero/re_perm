@@ -125,7 +125,6 @@ class Scene_mica:
             hair_mask = Image.open(hair_mask_path)
             hair_mask = PILtoTensor(hair_mask)
             hair_mask = (hair_mask - hair_mask.min()) / (hair_mask.max() - hair_mask.min() + 1e-8)
-            hair_mask[hair_mask < 0.99] = 0.0
 
             # hairstep map
             hair_orient_path = os.path.join(hair_orient_folder, image_name_ori+'.png')

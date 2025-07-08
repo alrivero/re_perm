@@ -183,7 +183,20 @@ class GaussianPerm(nn.Module):
         # ── 7) ASG Initialization ─────────-────────────────────────────────
         self._features_asg = nn.Parameter(torch.zeros(M, self.max_asg_degree)).float()
 
-        # ── 8) Optional duplication ─────────────────────────────────────────
+        # ── 8) Uncertainty Initialization ─────────-────────────────────────────────
+        # FIX ME
+        gate_logit0 = math.log(0.88) - math.log(1 - 0.88)
+        self._gate_logit = nn.Parameter(
+            torch.full((40250, 1), gate_logit0, device=device),  # ≈ 5.3
+            requires_grad=True
+        )
+
+        self._log_tau = nn.Parameter(
+            torch.full((2063942, 1), math.log(0.01),
+                    device=device),
+            requires_grad=True)
+
+        # ── 9) Optional duplication ─────────────────────────────────────────
         if dup_factor > 1:
             orig_ids = self._strand_id
             self._strand_id = orig_ids.repeat(dup_factor)
@@ -201,6 +214,7 @@ class GaussianPerm(nn.Module):
             self._features_asg  = nn.Parameter(rep(self._features_asg),  True)
             self._opacity       = nn.Parameter(rep(self._opacity),       True)
             self._scaling_base  = nn.Parameter(rep(self._scaling_base),  True)
+            self._log_tau       = nn.Parameter(rep(self._log_tau), True)
             self._xyz           = rep(self._xyz)
             self._rotation      = rep(self._rotation)
 
@@ -372,7 +386,7 @@ class GaussianPerm(nn.Module):
                 requires_grad=True
             )
             self._features_rest = nn.Parameter(
-                new_colour_per_strand[:, Ddc:].view(S_new, 3, Dr // 3),
+                new_colour_per_strand[:, Ddc:].view(S_new, 3, Dr // 3).transpose(1, 2).contiguous(),
                 requires_grad=True
             )
             self._features_asg  = nn.Parameter(
@@ -412,6 +426,17 @@ class GaussianPerm(nn.Module):
             self.uniform_strand_color = False
 
         # ------------------------------------------------------------------ 9.  other learnables
+        gate_logit0 = math.log(0.88) - math.log(1 - 0.88)
+        self._gate_logit = nn.Parameter(
+            torch.full((S_new, 1), gate_logit0, device=device),  # ≈ 5.3
+            requires_grad=True
+        )
+
+        #   lobe-level log-sigma  (σ = 0.02  ⇒ log ≈ –3.91)
+        self._log_tau = nn.Parameter(
+            torch.full((self.num_gaussians, 1), math.log(0.01),
+                    device=device), requires_grad=True)
+
         self._phi      = nn.Parameter(
             torch.empty((self.num_gaussians, 1), device=device, dtype=dtype)
                 .uniform_(0, 2*math.pi),
@@ -723,6 +748,8 @@ class GaussianPerm(nn.Module):
             self._features_asg,
             self._opacity,
             self._scaling_base,
+            self._gate_logit,
+            self._log_tau,
 
             # 9: optimizer state
             self.optimizer.state_dict(),
@@ -743,6 +770,8 @@ class GaussianPerm(nn.Module):
             self.xyz_gradient_accum,
             self.denom,
             self.max_radii2D,
+
+            self.uniform_strand_color
         )
 
     def restore(self, model_args, training_args, extra_parameters=None):
@@ -762,6 +791,8 @@ class GaussianPerm(nn.Module):
             self._features_asg,
             self._opacity,
             self._scaling_base,
+            self._gate_logit,
+            self._log_tau,
 
             opt_state_dict,
 
@@ -776,6 +807,7 @@ class GaussianPerm(nn.Module):
             xyz_grad_accum,
             denom,
             self.max_radii2D,
+            self.uniform_strand_color
         ) = model_args
 
         # 1) re-register those three as buffers so they move with .to(device):
@@ -796,10 +828,6 @@ class GaussianPerm(nn.Module):
         self.num_gaussians = self._s.shape[0]
         self.num_strands   = self.roots.shape[0]
         self.compute_root_adjacency()
-
-        # if you rely on self._xyz / self._rotation being fresh,
-        # call update_xyz_rot_scale(...) here with whatever your
-        # canonical strand vertices are.
 
     @property
     def get_roots_xyz(self):
@@ -834,7 +862,7 @@ class GaussianPerm(nn.Module):
             # ─ strand-level tensors → per-Gaussian via self._strand_id
             dc   = self._features_dc  [self._strand_id]          # (M,1,n_dc)
             rest = self._features_rest[self._strand_id]          # (M,3,n_rest)
-            return torch.cat((dc, rest), dim=2)                  # (M,4,n_tot)
+            return torch.cat((dc, rest), dim=1)                  # (M,4,n_tot)
         else:
             # ─ legacy: tensors already (M, …); just return them
             return torch.cat((self._features_dc,
@@ -857,6 +885,15 @@ class GaussianPerm(nn.Module):
     @property
     def get_axial_weight(self):           # s in [0,1]
         return torch.sigmoid(self._s)
+    
+    @property
+    def get_gate_per_gaussian(self):           # (M,1), σ already applied
+        g_strand = torch.sigmoid(self._gate_logit)          # (S,1)
+        return g_strand[self._strand_id]                    # broadcast
+
+    @property
+    def get_tau2_per_gaussian(self):           # (M,1)   *variance*
+        return torch.exp(2.0 * self._log_tau)
 
     @property
     def get_scaling_with_3D_filter(self):
@@ -935,6 +972,10 @@ class GaussianPerm(nn.Module):
             # radial cage stored as (ρ̂, φ)
             {"params": [self._rho_hat],       "lr": 0.5 * training_args.scaling_lr,     "name": "rho"},
             {"params": [self._phi],           "lr": 0.5 * training_args.scaling_lr,     "name": "phi"},
+            
+            # Uncertainty parameters
+            {"params": [self._gate_logit],    "lr": training_args.gate_lr,              "name": "gate"},
+            {"params": [self._log_tau],       "lr": training_args.tau_lr,               "name": "tau"},
         ]
         
         if extra_parameters is not None:

@@ -134,7 +134,14 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
         debug=pipe.debug
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
     colors_precomp = torch.ones_like(means3D)
+    gate_val = pc.get_gate_per_gaussian.squeeze(-1)
+    tau_val = pc.get_tau2_per_gaussian.squeeze(-1)
+
+
+    colors_precomp[:, 1] = gate_val[occ_mask]
+    colors_precomp[:, 2] = tau_val[occ_mask]
 
     seg_image, _= rasterizer(
         means3D = means3D,
@@ -149,7 +156,9 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
-            "segment": seg_image,
+            "segment": seg_image[[0], :, :],
+            "gate": seg_image[[1], :, :],
+            "tau": seg_image[[2], :, :],
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
