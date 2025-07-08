@@ -10,8 +10,8 @@ metrical-tracker
 *ply
 *txt
 *sh
-flame/generic_model.pkl
-flame/FLAME_masks
-flame
+flame/assets
+nphm/assets
+flame_old
 data
 pretrained_models
