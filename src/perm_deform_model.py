@@ -64,10 +64,10 @@ class PermDeformModel(nn.Module):
         strands = gaussians.perm2scene(strands)
         # strands_enc = self.pts_embedder(strands)
 
-        coef = perm_out["coef"][0].unsqueeze(1).expand(-1, C, -1).reshape(N * C, -1)
-        rotation = codedict['R'].flatten()[None].expand(N * C, -1)
-        translation = self.pts_embedder(codedict['T'][None].expand(N * C, -1))
-        condition = torch.cat((coef, rotation, translation), dim=-1)
+        # coef = perm_out["coef"][0].unsqueeze(1).expand(-1, C, -1).reshape(N * C, -1)
+        # rotation = codedict['R'].flatten()[None].expand(N * C, -1)
+        # translation = self.pts_embedder(codedict['T'][None].expand(N * C, -1))
+        # condition = torch.cat((coef, rotation, translation), dim=-1)
 
         # hair_deforms, strand_rot_delta, strand_scale_coef = self.compute_mlp_delta_coef(
         #     strands_enc,

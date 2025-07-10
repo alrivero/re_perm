@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 from hair.hair_models import Perm
 from scene.gaussian_perm import GaussianPerm
 from scene.specular_model import SpecularModel
+from scene.uncertainty_model import UncertaintyModel
 from scene import Scene_mica
 from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
@@ -99,74 +100,55 @@ def make_side_by_side(left: torch.Tensor, right: torch.Tensor, image_res: int) -
     return canvas
 
 
-def save_gate_tau_vis(
-    gate_tensor: torch.Tensor,          # (..., 1, H, W) or (H, W)
-    tau_tensor : torch.Tensor,          # same spatial shape as gate_tensor
-    out_path   : Union[str, pathlib.Path],
+def save_gate_vis(
+    gate_tensor: torch.Tensor,               # (...,1,H,W) or (H,W)
+    out_path: Union[str, pathlib.Path],
     *,
-    log_tau: bool = True,
-    alpha_mask: Optional[torch.Tensor] = None,   # (H,W) mask of visible hair
-    cmap_gate: str = "plasma",
-    cmap_tau : str = "magma",
+    alpha_mask: Optional[torch.Tensor] = None,  # (H,W) mask of valid region
+    cmap: str = "plasma",
     dpi: int = 150,
 ):
     """
-    Show gate (sigma(z) in [0,1]) and tau (variance or std-dev) side-by-side.
+    Visualize only the gate map (σ(z) in [0,1]) and save to out_path.
 
     Parameters
     ----------
     gate_tensor : torch.Tensor
-        Either gate logits or probabilities.  If you pass logits, convert first
-        with torch.sigmoid.
-    tau_tensor : torch.Tensor
-        Raw tau values (sigma, sigma², or log sigma).  Set log_tau accordingly.
+        Either gate logits or probabilities.  If logits, apply torch.sigmoid first.
     out_path : str | pathlib.Path
-        Output file path; extension decides the format (e.g. “gate_tau_012.png”).
-    log_tau : bool
-        If True, log-scale tau before normalising to 0-1.
+        Where to save the PNG (or other ext).
     alpha_mask : torch.Tensor | None
-        Binary mask that marks foreground / background.  Background pixels are
-        ignored for the min-max scaling so they stay neutral.
+        Boolean mask of foreground.  Background is shown as zero (dark).
+    cmap : str
+        Matplotlib colormap for gate.
+    dpi : int
+        Resolution of saved figure.
     """
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # -------- detach & squeeze to (H,W) -----------------------------------
-    gate_map = gate_tensor.squeeze().float().detach().cpu()
-    tau_map  = tau_tensor.squeeze().float().detach().cpu()
-
+    # detach, move to CPU, squeeze to (H,W)
+    gate = gate_tensor.squeeze().float().detach().cpu()
     if alpha_mask is not None:
         mask = alpha_mask.squeeze().bool().cpu()
     else:
-        mask = torch.ones_like(gate_map, dtype=torch.bool)
+        mask = torch.ones_like(gate, dtype=torch.bool)
 
-    # -------- normalise gate to [0,1] -------------------------------------
-    gate_fg   = gate_map[mask]
-    gate_norm = (gate_fg - gate_fg.min()) / (gate_fg.max() - gate_fg.min() + 1e-12)
-    gate_vis  = torch.zeros_like(gate_map)
-    gate_vis[mask] = gate_norm
+    # normalize only over mask region
+    fg = gate[mask]
+    vmin, vmax = float(fg.min()), float(fg.max())
+    span = max(vmax - vmin, 1e-6)
+    gate_norm = (gate - vmin) / span
+    gate_vis  = torch.zeros_like(gate)
+    gate_vis[mask] = gate_norm[mask]
 
-    # -------- normalise tau to [0,1] --------------------------------------
-    tau_proc = torch.log10(tau_map.clamp_min(1e-6)) if log_tau else tau_map
-    tau_fg   = tau_proc[mask]
-    tau_norm = (tau_fg - tau_fg.min()) / (tau_fg.max() - tau_fg.min() + 1e-12)
-    tau_vis  = torch.zeros_like(tau_map)
-    tau_vis[mask] = tau_norm
-
-    # -------- plot --------------------------------------------------------
-    fig, ax = plt.subplots(1, 2, figsize=(8, 4), dpi=dpi, constrained_layout=True)
-
-    ax[0].imshow(gate_vis.numpy(), cmap=cmap_gate)
-    ax[0].set_title("Gate σ(z)")
-    ax[0].axis("off")
-
-    ax[1].imshow(tau_vis.numpy(), cmap=cmap_tau)
-    ax[1].set_title("Tau (log)" if log_tau else "Tau")
-    ax[1].axis("off")
-
-    fig.suptitle(out_path.name, fontsize=9)
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
+    # plot
+    plt.figure(figsize=(4, 4), dpi=dpi)
+    plt.imshow(gate_vis.numpy(), cmap=cmap, vmin=0.0, vmax=1.0)
+    plt.axis("off")
+    plt.title(out_path.name, fontsize=10)
+    plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
+    plt.close()
 
 def toggle_beta_trainable(gaussians, trainable: bool, training_args):
     """
@@ -374,6 +356,10 @@ if __name__ == "__main__":
     specular_mlp.specular = specular_mlp.specular.to(args.device)
     specular_mlp.train_setting(opt)
 
+    uncertainty_mlp = UncertaintyModel()
+    uncertainty_mlp.uncertainty = uncertainty_mlp.uncertainty.to(args.device)
+    uncertainty_mlp.train_setting(opt)
+
     first_iter = 0
     if args.start_checkpoint:
         m_params, g_params, first_iter = torch.load(args.start_checkpoint)
@@ -405,20 +391,16 @@ if __name__ == "__main__":
     )
 
     kl_loss = UncertaintyKLLoss(
-        beta_start = 1e-2,        # off for the first few k steps
-        beta_final = 4e-2,       # weighted-KL ≈ 5 at the start of the ramp
+        beta_start = 1e-3,        # off for the first few k steps
+        beta_final = 2e-2,       # weighted-KL ≈ 5 at the start of the ramp
         t_start    = 8_000,      # begin ramp here
-        t_end      = 30_000,     # reach full strength well before 50k
-        sigma_z    = 1.0,
-        mu_tau     = math.log(0.02),
-        sigma_tau  = 0.5,
+        t_end      = 50_000,     # reach full strength well before 50k
     )
 
     uniform_strand_color = True
     enable_uncertainty = True
 
     for it in range(first_iter + 1, opt.iterations + 1):
-
         if it % 500 == 0:
             gaussians.oneupSHdegree()
 
@@ -482,6 +464,19 @@ if __name__ == "__main__":
         else:
             spec_color = 0.0
 
+        if enable_uncertainty:
+            dir_pp = (gaussians.get_xyz - cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            uncertainty_val = uncertainty_mlp.step(
+                gaussians.get_gate_per_gaussian,
+                dir_pp_normalized,
+                tangents,
+                gaussians.get_axial_weight,
+                torch.tensor(cam.uid / 1879).to(args.device)
+            )
+        else:
+            uncertainty_val = None
+
         occ_mask, _ = compute_occlusion_mask(gaussians, cam, flame_verts, flame_faces)
 
         render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
@@ -496,7 +491,7 @@ if __name__ == "__main__":
 
         
         if enable_uncertainty:
-            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"], tau_map=render_pkg["tau"])
+            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"])
         else:
             loss_h = hair_photo_loss(img_render, gt_img, it)
 
@@ -749,7 +744,7 @@ if __name__ == "__main__":
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
-            save_gate_tau_vis(render_pkg["gate"], render_pkg["tau"], os.path.join(train_dir, f"{it:06d}_gate_tau.png"))
+            save_gate_vis(render_pkg["gate"], os.path.join(train_dir, f"{it:06d}_gate.png"))
 
         if it % 10000 == 0 or it == 1:
             export_strands_as_obj(

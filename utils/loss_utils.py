@@ -89,70 +89,59 @@ def alpha_blended_loss(pred_alpha: torch.Tensor,
           + w_grad * loss_grad
     return loss
 
-import math
-import torch
-
 class UncertaintyKLLoss:
     """
     Computes
-        KL_z   = E_s[ (z_s - mu_z)^2 ]   · 1/(2 σ_z^2)
-        KL_tau = E_i[ (logτ_i - mu_tau)^2 ]· 1/(2 σ_tau^2)
-    and multiplies their sum by an annealed weight β(step).
 
-    Gate‐logits z_s are assumed ~ N(mu_z, σ_z^2)  (maps → ~0.9 prior),
-    logτ_i     are assumed ~ N(mu_tau, σ_tau^2)  (σ_perp prior).
+        KL_z = E_s[(z_s - mu_z)^2] · 1/(2 σ_z^2)
+
+    for your per‐strand gate‐logits z_s, and multiplies by an annealed
+    weight β(step):
+
+        loss = β(step) * KL_z
+
+    where β(step) linearly ramps from beta_start → beta_final over [t_start,t_end].
     """
 
     def __init__(
         self,
         beta_start: float = 1e-3,
         beta_final: float = 1e-4,
-        t_start: int     = 0,
-        t_end:   int     = 50_000,
+        t_start:    int   = 0,
+        t_end:      int   = 50_000,
         # Prior on gate logits z ~ N(mu_z, σ_z^2):
-        mu_z:    float   = math.log(0.9 / 0.1),   # ≈2.20
-        sigma_z: float   = 0.5,
-        # Prior on log-σ tau ~ N(mu_tau, σ_tau^2):
-        mu_tau:    float = math.log(5.645693247264717e-05),  # ≈-9.78
-        sigma_tau: float = 0.2
+        mu_z:    float = math.log(0.815 / 0.185),  # σ(z)≈0.8
+        sigma_z: float = 0.32
     ):
         self.beta_start = beta_start
         self.beta_final = beta_final
         self.t_start    = t_start
         self.t_end      = max(t_end, t_start + 1)
 
-        # gate‐logit prior
-        self.mu_z = mu_z
+        # gate‐logit prior parameters
+        self.mu_z        = mu_z
         self.inv_2sig2_z = 1.0 / (2.0 * sigma_z**2)
 
-        # log‐tau prior
-        self.mu_tau = mu_tau
-        self.inv_2sig2_tau = 1.0 / (2.0 * sigma_tau**2)
-
     def beta(self, step: int) -> float:
-        """Linear ramp of β between beta_start→beta_final over [t_start,t_end]."""
+        """Linear ramp of β from beta_start→beta_final over [t_start,t_end]."""
         if step < self.t_start:
             return self.beta_start
         if step >= self.t_end:
             return self.beta_final
         t = (step - self.t_start) / (self.t_end - self.t_start)
-        return (1 - t) * self.beta_start + t * self.beta_final
+        return (1.0 - t) * self.beta_start + t * self.beta_final
 
     def __call__(self, gaussians, step: int) -> torch.Tensor:
         """
-        gaussians: your GaussianPerm instance,
-        step:      current iteration.
+        gaussians: your GaussianPerm instance containing
+                   `. _gate_logit` of shape (S,1)
+        step:      current training iteration.
         """
-        # 1) fetch the raw parameters
-        z      = gaussians._gate_logit   # (S,1)
-        logtau = gaussians._log_tau      # (M,1)
-
-        # 2) compute KL for each family
-        kl_z   = self.inv_2sig2_z * (z - self.mu_z).pow(2).mean()
-        kl_tau = self.inv_2sig2_tau * (logtau - self.mu_tau).pow(2).mean()
-
-        # 3) anneal & return
-        return self.beta(step) * (kl_z + kl_tau)
+        z = gaussians._gate_logit           # (S,1)
+        # compute KL_z = E[(z - mu_z)^2] / (2 σ_z^2)
+        kl_z = self.inv_2sig2_z * (z - self.mu_z).pow(2).mean()
+        # anneal
+        return self.beta(step) * kl_z
 
 def _bchw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:          # (C,H,W)  →  (1,C,H,W)
@@ -194,133 +183,132 @@ def linear_to_lpips(
 class HairDetailLoss:
     """
     Composite loss with three phases
-        A) Huber                       (coarse)
-        B) L1 + MS-SSIM + Sobel-Y      (detail)
-        C) L1 + MS-SSIM + Sobel-Y + LPIPS (polish)
+      A) Huber                       (coarse)
+      B) L1 + MS-SSIM + Sobel-Y      (detail)
+      C) L1 + MS-SSIM + Sobel-Y + LPIPS (polish)
 
-    New in this version
-    -------------------
-    • Optional per-pixel maps
-        gate_map : (1,H,W) — pixel trust g(u) ∈(0,1]
-        tau_map  : (1,H,W) — pixel noise σ(u)  >0
-      If provided, magnitude-type residuals are multiplied by
-          w(u) = gate_map / (tau_map+1e-12)
-      and scale-free residuals (SSIM, LPIPS) by gate_map only.
+    Optional per-pixel gate_map: pixel‐trust g(u) ∈ (0,1].
+    All magnitude‐type residuals (Huber, L1, Sobel) are weighted by g(u),
+    and SSIM/LPIPS by g(u) as well.
     """
 
-    # ---------- initialisation unchanged except for docstring ----------
     def __init__(
         self,
         warmup_iters: int = 6_000,
-        fade_iters  : int = 20_000,
+        fade_iters:   int = 20_000,
         polish_iters: int = 5_000,
-        huber_delta : float = 0.10,
+        huber_delta:  float = 0.10,
         w_ssim_final: float = 0.20,
         w_grad_final: float = 0.02,
         w_lpips_final:float = 0.10,
-        blur        : bool  = False,
-        blur_sigma  : float = 1.0,
-        device      : str   = "cuda"):
+        blur:         bool  = False,
+        blur_sigma:   float = 1.0,
+        device:       str   = "cuda"
+    ):
         # phase boundaries
-        self.warmup  = warmup_iters
-        self.fade    = fade_iters
-        self.polish  = polish_iters
+        self.warmup   = warmup_iters
+        self.fade     = fade_iters
+        self.polish   = polish_iters
 
-        # weights
+        # weights & settings
         self.delta     = huber_delta
         self.w_ssim_f  = w_ssim_final
         self.w_grad_f  = w_grad_final
         self.w_lpips_f = w_lpips_final
-        self.blur      = blur
-        self.blur_sigma= blur_sigma
+        self.blur       = blur
+        self.blur_sigma = blur_sigma
 
-        # frozen LPIPS net
+        # LPIPS network (frozen)
         self.lpips = lpips.LPIPS(net='vgg').to(device).eval()
-        for p in self.lpips.parameters(): p.requires_grad_(False)
+        for p in self.lpips.parameters():
+            p.requires_grad_(False)
 
-    # ---------------- private huber -----------------------------------
-    def _huber(self, x, y):
+    def _huber(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         diff   = x - y
         abs_e  = diff.abs()
         quad   = 0.5 * diff ** 2
         linear = self.delta * (abs_e - 0.5 * self.delta)
         return torch.where(abs_e <= self.delta, quad, linear)
 
-    # ---------------- forward -----------------------------------------
-    def __call__(self,
-                 pred    : torch.Tensor,
-                 tgt     : torch.Tensor,
-                 step    : int,
-                 # optional uncertainty maps
-                 tau_map : torch.Tensor = None,   # (1,H,W) σ
-                 gate_map: torch.Tensor = None    # (1,H,W) g
-                 ) -> torch.Tensor:
+    def __call__(
+        self,
+        pred     : torch.Tensor,        # (B,3,H,W) or (3,H,W)
+        tgt      : torch.Tensor,        # same shape as pred
+        step     : int,
+        gate_map : torch.Tensor = None  # (1,H,W) or (H,W)
+    ) -> torch.Tensor:
 
-        # insure BCHW layout
-        pred4, tgt4 = _bchw(pred), _bchw(tgt)      # (B,3,H,W)
+        # ensure BCHW
+        pred4, tgt4 = _bchw(pred), _bchw(tgt)
 
-        # -------- weights per pixel ----------------------------------
+        # build per-pixel gate g(u)
         if gate_map is None:
-            g_map = torch.ones_like(pred4[:, :1])  # broadcast
+            g_map = torch.ones_like(pred4[:, :1])  # (B,1,H,W)
         else:
-            g_map = _bchw(gate_map)                # (1,1,H,W) → broadcast
+            g_map = _bchw(gate_map)
 
-        if tau_map is None:
-            w_map = g_map                          # acts like gate only
-        else:
-            t_map = _bchw(tau_map)
-            w_map = g_map / (t_map + 1e-12)
-
-        # -------- phase-dependent global scalars ---------------------
-        if step < self.warmup:                            # Phase A
+        # phase‐dependent global weights
+        if step < self.warmup:               # Phase A
             w_hu, w_l1, w_ss, w_gr, w_lp = 1, 0, 0, 0, 0
-        elif step < self.warmup + self.fade:              # Fade-in B
-            t = (step - self.warmup)/self.fade
+        elif step < self.warmup + self.fade: # Phase B
+            t = (step - self.warmup) / self.fade
             w_hu = 1 - t;  w_l1 = t
-            w_ss = t * self.w_ssim_f
-            w_gr = t * self.w_grad_f
-            w_lp = 0
-        else:                                             # Phase C
+            w_ss  = t * self.w_ssim_f
+            w_gr  = t * self.w_grad_f
+            w_lp  = 0
+        else:                                # Phase C
             w_hu = 0; w_l1 = 1
-            w_ss = self.w_ssim_f
-            w_gr = self.w_grad_f
-            if self.polish>0:
-                t_lp = min(1,(step-(self.warmup+self.fade))/self.polish)
+            w_ss  = self.w_ssim_f
+            w_gr  = self.w_grad_f
+            if self.polish > 0:
+                t_lp = min(1.0, (step - (self.warmup + self.fade)) / self.polish)
                 w_lp = t_lp * self.w_lpips_f
             else:
                 w_lp = self.w_lpips_f
 
-        # -------- losses ---------------------------------------------
         loss = 0.0
 
+        # Phase A: Huber
         if w_hu:
-            hub = self._huber(pred4, tgt4)                # (B,3,H,W)
-            loss += w_hu * (hub * w_map).mean()
+            hub = self._huber(pred4, tgt4)               # (B,3,H,W)
+            loss += w_hu * (hub * g_map).mean()
 
+        # Phase B,C: L1
         if w_l1:
-            l1 = (pred4 - tgt4).abs()                     # (B,3,H,W)
-            loss += w_l1 * (l1 * w_map).mean()
+            l1 = (pred4 - tgt4).abs()                    # (B,3,H,W)
+            loss += w_l1 * (l1 * g_map).mean()
 
+        # SSIM (scale‐free) — weight by gate only
         if w_ss:
-            ssim_map = 1 - ms_ssim(pred4, tgt4,
-                                    window_size=11, max_val=1.0,
-                                    reduction='none')     # (B,1,H,W)
-            loss += w_ss * (ssim_map * g_map).mean() * 50
+            ssim_map = 1 - ms_ssim(
+                pred4, tgt4,
+                window_size=11, max_val=1.0,
+                reduction='none'
+            )                                           # (B,1,H,W)
+            loss += w_ss * (ssim_map * g_map).mean()
 
+        # Sobel‐Y (detail) — magnitude‐type so weight by gate
         if w_gr:
-            lum_pred = rgb_to_luminance(pred4)
-            lum_tgt  = rgb_to_luminance(tgt4)
+            lum_p = rgb_to_luminance(pred4)
+            lum_t = rgb_to_luminance(tgt4)
             if self.blur:
-                k = int(2*math.ceil(2*self.blur_sigma)+1)
-                lum_tgt = gaussian_blur2d(lum_tgt,(k,k),
-                                          (self.blur_sigma, self.blur_sigma))
-            grad = (sobel(lum_pred) - sobel(lum_tgt)).abs()  # (B,1,H,W)
-            loss += w_gr * (grad * w_map).mean()
+                k = int(2 * math.ceil(2 * self.blur_sigma) + 1)
+                lum_t = gaussian_blur2d(
+                    lum_t, (k, k),
+                    (self.blur_sigma, self.blur_sigma)
+                )
+            grad = (sobel(lum_p) - sobel(lum_t)).abs()  # (B,1,H,W)
+            loss += w_gr * (grad * g_map).mean()
 
+        # LPIPS (polish)
         if w_lp:
-            lp = self.lpips(linear_to_lpips(pred4), linear_to_lpips(tgt4))        # (B,1,1,1)
-            # lpips already averaged spatially; weight by mean gate
-            loss += w_lp * (lp.squeeze() * g_map.mean()).mean() * 25
+            lp = self.lpips(
+                linear_to_lpips(pred4), linear_to_lpips(tgt4)
+            )                                          # (B,1,1,1)
+            # spatially averaged already; scale by mean gate
+            loss += w_lp * (lp.squeeze() * g_map.mean()).mean()
+
+        return loss
 
         return loss
 

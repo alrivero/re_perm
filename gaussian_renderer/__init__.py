@@ -18,7 +18,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_perm import GaussianPerm
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None, occ_mask=None, spec_color=None):
+def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, kernel_size=0.1, subpixel_offset=None, occ_mask=None, spec_color=None, uncertainty_vals=None):
     """
     Render the scene. 
     
@@ -136,12 +136,8 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     colors_precomp = torch.ones_like(means3D)
-    gate_val = pc.get_gate_per_gaussian.squeeze(-1)
-    tau_val = pc.get_tau2_per_gaussian.squeeze(-1)
-
-
-    colors_precomp[:, 1] = gate_val[occ_mask]
-    colors_precomp[:, 2] = tau_val[occ_mask]
+    if uncertainty_vals is not None:
+        colors_precomp[:, 1] = uncertainty_vals[occ_mask]
 
     seg_image, _= rasterizer(
         means3D = means3D,
@@ -158,7 +154,6 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
     return {"render": rendered_image,
             "segment": seg_image[[0], :, :],
             "gate": seg_image[[1], :, :],
-            "tau": seg_image[[2], :, :],
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,

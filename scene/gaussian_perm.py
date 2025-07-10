@@ -184,17 +184,8 @@ class GaussianPerm(nn.Module):
         self._features_asg = nn.Parameter(torch.zeros(M, self.max_asg_degree)).float()
 
         # ── 8) Uncertainty Initialization ─────────-────────────────────────────────
-        # FIX ME
-        gate_logit0 = math.log(0.88) - math.log(1 - 0.88)
-        self._gate_logit = nn.Parameter(
-            torch.full((40250, 1), gate_logit0, device=device),  # ≈ 5.3
-            requires_grad=True
-        )
-
-        self._log_tau = nn.Parameter(
-            torch.full((2063942, 1), math.log(0.01),
-                    device=device),
-            requires_grad=True)
+        # NOT USED UNTIL AFTER DENSIFICATION
+        self._gate_logit = nn.Parameter(torch.zeros(S, self.max_asg_degree)).float()
 
         # ── 9) Optional duplication ─────────────────────────────────────────
         if dup_factor > 1:
@@ -214,7 +205,6 @@ class GaussianPerm(nn.Module):
             self._features_asg  = nn.Parameter(rep(self._features_asg),  True)
             self._opacity       = nn.Parameter(rep(self._opacity),       True)
             self._scaling_base  = nn.Parameter(rep(self._scaling_base),  True)
-            self._log_tau       = nn.Parameter(rep(self._log_tau), True)
             self._xyz           = rep(self._xyz)
             self._rotation      = rep(self._rotation)
 
@@ -426,16 +416,7 @@ class GaussianPerm(nn.Module):
             self.uniform_strand_color = False
 
         # ------------------------------------------------------------------ 9.  other learnables
-        gate_logit0 = math.log(0.88) - math.log(1 - 0.88)
-        self._gate_logit = nn.Parameter(
-            torch.full((S_new, 1), gate_logit0, device=device),  # ≈ 5.3
-            requires_grad=True
-        )
-
-        #   lobe-level log-sigma  (σ = 0.02  ⇒ log ≈ –3.91)
-        self._log_tau = nn.Parameter(
-            torch.full((self.num_gaussians, 1), math.log(0.01),
-                    device=device), requires_grad=True)
+        self._gate_logit = nn.Parameter(torch.zeros(S_new, self.max_asg_degree, device=device)).float()
 
         self._phi      = nn.Parameter(
             torch.empty((self.num_gaussians, 1), device=device, dtype=dtype)
@@ -749,7 +730,6 @@ class GaussianPerm(nn.Module):
             self._opacity,
             self._scaling_base,
             self._gate_logit,
-            self._log_tau,
 
             # 9: optimizer state
             self.optimizer.state_dict(),
@@ -792,7 +772,6 @@ class GaussianPerm(nn.Module):
             self._opacity,
             self._scaling_base,
             self._gate_logit,
-            self._log_tau,
 
             opt_state_dict,
 
@@ -888,12 +867,7 @@ class GaussianPerm(nn.Module):
     
     @property
     def get_gate_per_gaussian(self):           # (M,1), σ already applied
-        g_strand = torch.sigmoid(self._gate_logit)          # (S,1)
-        return g_strand[self._strand_id]                    # broadcast
-
-    @property
-    def get_tau2_per_gaussian(self):           # (M,1)   *variance*
-        return torch.exp(2.0 * self._log_tau)
+        return self._gate_logit[self._strand_id]                    # broadcast
 
     @property
     def get_scaling_with_3D_filter(self):
@@ -975,7 +949,6 @@ class GaussianPerm(nn.Module):
             
             # Uncertainty parameters
             {"params": [self._gate_logit],    "lr": training_args.gate_lr,              "name": "gate"},
-            {"params": [self._log_tau],       "lr": training_args.tau_lr,               "name": "tau"},
         ]
         
         if extra_parameters is not None:
