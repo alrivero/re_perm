@@ -577,7 +577,7 @@ if __name__ == "__main__":
         w_scale_reg       = lambda_scale_reg            * loss_scale_reg.item()
         w_flame_rot_reg   = lambda_flame_rot_reg        * loss_flame_rot_reg.item()
         w_flame_trans_reg = lambda_flame_trans_reg      * loss_flame_trans_reg.item()
-        w_uncertainty_kl = lambda_uncertainty_kl      *  loss_uncertainty_kl.item()
+        w_uncertainty_kl  = lambda_uncertainty_kl       *  loss_uncertainty_kl.item()
 
         loss = (
             lambda_huber           * loss_h +
@@ -781,6 +781,7 @@ if __name__ == "__main__":
                 os.path.join(model_dir, f"chkpnt_{it:06d}.pth")
             )
             specular_mlp.save_weights(model_dir, it)
+            uncertainty_mlp.save_weights(model_dir, it)
             if lpt.learn_flame_rigid_offset:
                 torch.save(rotation_offsets, os.path.join(model_dir, f"flame_rot_{it:06d}.pth"))
                 torch.save(translation_offsets, os.path.join(model_dir, f"flame_trans_{it:06d}.pth"))
