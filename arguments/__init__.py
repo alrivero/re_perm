@@ -106,7 +106,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.005*lr_coef
         self.percent_dense = 1e-4
 
-        self.gate_lr = 0.001*lr_coef
+        self.gate_lr = 0.0001*lr_coef
         self.tau_lr = 0.001*lr_coef
 
         self.lambda_neighbor_orient = 1.0
@@ -114,9 +114,9 @@ class OptimizationParams(ParamGroup):
         self.delta_strand_len = 0.01
         self.k_neigh = 8
 
-        self.lambda_huber = 120.0 * 2.0
-        self.lambda_seg = 10000.0 * 3.0 
-        self.lambda_orient = 125.0 * 3.0 * 4.0 
+        self.lambda_huber = 10000.0
+        self.lambda_seg = 10000.0 * 5.0
+        self.lambda_orient = 125.0 * 5.0
         self.lambda_sdf_contain = 0.0
         self.lambda_sdf_flow = 0.0
         self.lambda_neigh = 0.1
@@ -139,7 +139,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_flame_rot_reg = 3e1
         self.lambda_flame_trans_reg = 3e2
         self.lambda_dssim = 0.2
-        self.lambda_uncertainty_kl = 10000.0
+        self.lambda_uncertainty_kl = 1000.0
 
         self.densification_interval = 100 # 7500
         self.opacity_reset_interval = 3500

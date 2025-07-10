@@ -791,8 +791,8 @@ class GaussianPerm(nn.Module):
             self._features_asg,
             self._opacity,
             self._scaling_base,
-            self._gate_logit,
-            self._log_tau,
+            _,
+            _,
 
             opt_state_dict,
 
@@ -822,7 +822,7 @@ class GaussianPerm(nn.Module):
         # 3) rebuild optimizer (this sees all your nn.Parameter fields)
         self.training_setup(training_args, extra_parameters)
         # 4) load its saved state
-        self.optimizer.load_state_dict(opt_state_dict)
+        # self.optimizer.load_state_dict(opt_state_dict)
 
         # 5) recompute any cached / derived state
         self.num_gaussians = self._s.shape[0]
@@ -974,14 +974,14 @@ class GaussianPerm(nn.Module):
             {"params": [self._phi],           "lr": 0.5 * training_args.scaling_lr,     "name": "phi"},
             
             # Uncertainty parameters
-            {"params": [self._gate_logit],    "lr": training_args.gate_lr,              "name": "gate"},
+            {"params": [self._gate_logit],    "lr": training_args.gate_lr, "betas": (0.9, 0.95), "weight_decay": 1e-4,            "name": "gate"},
             {"params": [self._log_tau],       "lr": training_args.tau_lr,               "name": "tau"},
         ]
         
         if extra_parameters is not None:
             l += extra_parameters
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-8)
 
         # cache β’s base LR so warm-up code can zero / restore it
         for pg in self.optimizer.param_groups:

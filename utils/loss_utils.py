@@ -110,7 +110,7 @@ class UncertaintyKLLoss:
         t_start: int     = 0,
         t_end:   int     = 50_000,
         # Prior on gate logits z ~ N(mu_z, σ_z^2):
-        mu_z:    float   = math.log(0.9 / 0.1),   # ≈2.20
+        mu_z:    float   = math.log(0.815 / 0.185),   # ≈2.20
         sigma_z: float   = 0.5,
         # Prior on log-σ tau ~ N(mu_tau, σ_tau^2):
         mu_tau:    float = math.log(5.645693247264717e-05),  # ≈-9.78
@@ -302,10 +302,16 @@ class HairDetailLoss:
             loss += w_l1 * (l1 * w_map).mean()
 
         if w_ss:
-            ssim_map = 1 - ms_ssim(pred4, tgt4,
-                                    window_size=11, max_val=1.0,
-                                    reduction='none')     # (B,1,H,W)
-            loss += w_ss * (ssim_map * g_map).mean() * 50
+            pred_gray = rgb_to_luminance(pred4)   # 0.2126 R + 0.7152 G + 0.0722 B
+            tgt_gray  = rgb_to_luminance(tgt4)
+
+            # now compute MS-SSIM on the gray maps
+            ssim_map = 1 - ms_ssim(
+                pred_gray, tgt_gray,
+                window_size=11, max_val=1.0,
+                reduction='none'
+)
+            loss += w_ss * (ssim_map).mean()
 
         if w_gr:
             lum_pred = rgb_to_luminance(pred4)
@@ -315,12 +321,12 @@ class HairDetailLoss:
                 lum_tgt = gaussian_blur2d(lum_tgt,(k,k),
                                           (self.blur_sigma, self.blur_sigma))
             grad = (sobel(lum_pred) - sobel(lum_tgt)).abs()  # (B,1,H,W)
-            loss += w_gr * (grad * w_map).mean()
+            loss += w_gr * (grad).mean()
 
         if w_lp:
             lp = self.lpips(linear_to_lpips(pred4), linear_to_lpips(tgt4))        # (B,1,1,1)
             # lpips already averaged spatially; weight by mean gate
-            loss += w_lp * (lp.squeeze() * g_map.mean()).mean() * 25
+            loss += w_lp * (lp.squeeze()).mean()
 
         return loss
 

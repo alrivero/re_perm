@@ -14,7 +14,7 @@ from typing import Union, Optional
 
 try:
     import wandb
-    _use_wandb = False
+    _use_wandb = True
 except ModuleNotFoundError:
     print("[wandb] not found – continuing without online logging.")
     _use_wandb = False
@@ -406,7 +406,7 @@ if __name__ == "__main__":
 
     kl_loss = UncertaintyKLLoss(
         beta_start = 1e-2,        # off for the first few k steps
-        beta_final = 4e-2,       # weighted-KL ≈ 5 at the start of the ramp
+        beta_final = 1e-1,       # weighted-KL ≈ 5 at the start of the ramp
         t_start    = 8_000,      # begin ramp here
         t_end      = 30_000,     # reach full strength well before 50k
         sigma_z    = 1.0,
@@ -496,7 +496,7 @@ if __name__ == "__main__":
 
         
         if enable_uncertainty:
-            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"], tau_map=render_pkg["tau"])
+            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"])
         else:
             loss_h = hair_photo_loss(img_render, gt_img, it)
 
