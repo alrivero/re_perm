@@ -12,6 +12,7 @@
 import torch
 import lpips
 import math
+from torch.special import digamma, gammaln
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp, pi
@@ -89,59 +90,246 @@ def alpha_blended_loss(pred_alpha: torch.Tensor,
           + w_grad * loss_grad
     return loss
 
-class UncertaintyKLLoss:
-    """
-    Computes
+import math
+import torch
+import torch.nn.functional as F
+from torch.special import gammaln
 
-        KL_z = E_s[(z_s - mu_z)^2] · 1/(2 σ_z^2)
+import math
+import torch
+import torch.nn.functional as F
+from torch.special import gammaln
 
-    for your per‐strand gate‐logits z_s, and multiplies by an annealed
-    weight β(step):
-
-        loss = β(step) * KL_z
-
-    where β(step) linearly ramps from beta_start → beta_final over [t_start,t_end].
+class MaskShapeKLWithExtras:
+    r"""
+    1) KL(mask_pred‖template) using the old “spike+Beta” recipe (non-zero only).
+    2) Soft‐Dice loss + κ schedule (same as before).
+    3) One-sided exponential penalty for dropping below target non-zero fraction.
     """
 
     def __init__(
         self,
+        # --- KL template params ---
+        pi_star: float,       # desired spike mass
+        alpha_star: float,    # Beta α
+        beta_star: float,     # Beta β
+        spike_thresh: float = 254/255,
+        # --- KL annealing (β‐anneal) ---
         beta_start: float = 1e-3,
         beta_final: float = 1e-4,
-        t_start:    int   = 0,
+        t_start:    int   = 8000,
         t_end:      int   = 50_000,
-        # Prior on gate logits z ~ N(mu_z, σ_z^2):
-        mu_z:    float = math.log(0.815 / 0.185),  # σ(z)≈0.8
-        sigma_z: float = 0.32
+
+        # --- Dice & κ schedule ---
+        dice_weight:  float = 1.0,
+        warmup_iter:  int   = 15_000,
+        kappa_lambda: float = 2e-4,
+
+        # --- non-zero fraction penalty ---
+        target_nz_frac: float = 0.25,
+        lambda_nz:      float = 1.0,
+        nz_exp_factor:  float = 5.0,
+        nz_thresh:      float = 1e-3,
+        nz_soft_width:  float = 0.01,
+
+        eps:          float = 1e-6
     ):
+        # KL template
+        self.pi_star    = pi_star
+        self.alpha_star = alpha_star
+        self.beta_star  = beta_star
+        self.spike_thr  = spike_thresh
+        self.eps        = eps
+        # precompute log B(α*,β*)
+        self.log_B_star = (
+            gammaln(torch.tensor(alpha_star))
+          + gammaln(torch.tensor(beta_star))
+          - gammaln(torch.tensor(alpha_star + beta_star))
+        ).item()
+
+        # KL anneal
         self.beta_start = beta_start
         self.beta_final = beta_final
         self.t_start    = t_start
         self.t_end      = max(t_end, t_start + 1)
 
-        # gate‐logit prior parameters
-        self.mu_z        = mu_z
-        self.inv_2sig2_z = 1.0 / (2.0 * sigma_z**2)
+        # Dice + κ
+        self.dice_weight  = dice_weight
+        self.warmup_iter  = warmup_iter
+        self.kappa_lambda = kappa_lambda
 
-    def beta(self, step: int) -> float:
-        """Linear ramp of β from beta_start→beta_final over [t_start,t_end]."""
-        if step < self.t_start:
-            return self.beta_start
-        if step >= self.t_end:
-            return self.beta_final
+        # non-zero fraction penalty
+        self.target_nz_frac = target_nz_frac
+        self.lambda_nz      = lambda_nz
+        self.nz_exp_factor  = nz_exp_factor
+        self.nz_thresh      = nz_thresh
+        self.nz_soft_width  = nz_soft_width
+
+    def _beta_pdf_log(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.alpha_star, self.beta_star
+        return (
+            (a - 1.0) * torch.log(torch.clamp(x, self.eps, 1.0))
+          + (b - 1.0) * torch.log(torch.clamp(1.0 - x, self.eps, 1.0))
+          - self.log_B_star
+        )
+
+    def _kl_anneal(self, step: int) -> float:
+        if step < self.t_start:  return self.beta_start
+        if step >= self.t_end:   return self.beta_final
+        t = (step - self.t_start) / (self.t_end - self.t_start)
+        return (1 - t) * self.beta_start + t * self.beta_final
+
+    @staticmethod
+    def _soft_dice(pred: torch.Tensor, gt: torch.Tensor, eps: float) -> torch.Tensor:
+        p = pred.reshape(-1)
+        g = gt.reshape(-1)
+        inter = (p * g).sum()
+        return 2 * inter / (p.sum() + g.sum() + eps)
+
+    def _kappa_from_dice(self, dice_val: float, step: int) -> float:
+        if step < self.warmup_iter:     return 1.0
+        if dice_val < 0.90:             return 0.0
+        if dice_val >= 0.92:            return 1.0
+        frac = (0.92 - dice_val) / 0.02
+        return math.exp(-self.kappa_lambda * (step - self.warmup_iter) * frac)
+
+    def __call__(self,
+                 mask_pred: torch.Tensor,
+                 mask_gt:   torch.Tensor,
+                 step:      int):
+        zero = mask_pred.new_tensor(0.0)
+
+        # ── normalize to [0,1]
+        p_min, p_max = mask_pred.min(), mask_pred.max()
+        p = (mask_pred - p_min) / (p_max - p_min + 1e-6)
+        g = (mask_gt     - mask_gt.min()) / (mask_gt.max()   - mask_gt.min()   + 1e-6)
+
+        # ── 1) KL loss exactly as in your old MaskShapeKLLoss
+        x = p[p > 0]
+        if x.numel() == 0:
+            kl_loss = zero
+        else:
+            is_spike = x > self.spike_thr
+            log_p    = torch.empty_like(x)
+            # spike mass
+            log_p[is_spike] = math.log(self.pi_star + self.eps)
+            # Beta tail
+            tail = ~is_spike
+            if tail.any():
+                log_p[tail] = (
+                    math.log(1 - self.pi_star + self.eps)
+                    + self._beta_pdf_log(x[tail])
+                )
+            kl = -log_p.mean()
+            kl_loss = self._kl_anneal(step) * kl
+
+        # ── 2) Dice & κ
+        dice_val  = self._soft_dice(p, g, self.eps)
+        kappa     = self._kappa_from_dice(float(dice_val), step)
+        dice_loss = (
+            self.dice_weight * (1 - dice_val)
+            if step >= self.warmup_iter else zero
+        )
+
+        # ── 3) one-sided exponential non-zero fraction penalty
+        soft_nz = torch.sigmoid((p - self.nz_thresh) / self.nz_soft_width)
+        obs_nz  = soft_nz.mean()
+        diff    = F.relu(self.target_nz_frac - obs_nz)
+        nz_loss = self.lambda_nz * (torch.exp(self.nz_exp_factor * diff) - 1.0)
+
+        return kl_loss, dice_loss, nz_loss, kappa
+
+class MaskShapeKLLoss:
+    r"""
+    KL  =  –  E_x∼p̂  [ log  p*(x) ]           (empirical → template)
+
+          with                           ⎧ π*                          if x≈1
+                p*(x) =  π* δ(x-1)  +    ⎨
+                                         ⎩ (1-π*) · Beta(x;α*,β*)      otherwise
+
+    • Works on **non-zero** pixels only.
+    • Uses a spike-threshold (≈0.999) to decide “exactly 1”.
+    • Fully differentiable w.r.t. `mask_pred` (the ASG output); the
+      template parameters are fixed constants.
+
+    You still get the usual annealing β(step) like in your old class.
+    """
+
+    def __init__(
+        self,
+        pi_star: float,      # template spike probability
+        alpha_star: float,   # template Beta α
+        beta_star: float,    # template Beta β
+        spike_thresh: float = 0.999,
+        # β-anneal:
+        beta_start: float = 1e-3,
+        beta_final: float = 1e-4,
+        t_start:    int   = 8000,
+        t_end:      int   = 50_000,
+        eps: float = 1e-6
+    ):
+        # template mixture params
+        self.pi_star     = float(pi_star)
+        self.alpha_star  = float(alpha_star)
+        self.beta_star   = float(beta_star)
+        self.spike_thr   = spike_thresh
+        self.eps         = eps
+        # pre-compute log-Beta(α*,β*)
+        self.log_B_star  = (
+            gammaln(torch.tensor(alpha_star))
+          + gammaln(torch.tensor(beta_star))
+          - gammaln(torch.tensor(alpha_star + beta_star))
+        ).item()
+
+        # anneal coeff
+        self.beta_start  = beta_start
+        self.beta_final  = beta_final
+        self.t_start     = t_start
+        self.t_end       = max(t_end, t_start + 1)
+
+    # ─────────────────────────────────────────────
+    def _beta_pdf_log(self, x: torch.Tensor) -> torch.Tensor:
+        # log  BetaPDF(x; α*,β*)
+        a, b = self.alpha_star, self.beta_star
+        return ((a - 1.0) * torch.log(torch.clamp(x, self.eps, 1.0))
+              + (b - 1.0) * torch.log(torch.clamp(1.0 - x, self.eps, 1.0))
+              - self.log_B_star)
+
+    def _anneal(self, step: int) -> float:
+        if step < self.t_start:  return self.beta_start
+        if step >= self.t_end:   return self.beta_final
         t = (step - self.t_start) / (self.t_end - self.t_start)
         return (1.0 - t) * self.beta_start + t * self.beta_final
+    # ─────────────────────────────────────────────
+    def __call__(self, mask_pred: torch.Tensor, step: int) -> torch.Tensor:
+        """
+        mask_pred : (B, H, W) or (H, W) float in [0,1] – rendered occupancy mask
+        step      : global training iteration  (int)
+        Returns   : scalar KL loss
+        """
+        x = mask_pred[mask_pred > 0]       # non-zero only
+        if x.numel() == 0:                 # empty mask → no loss
+            return mask_pred.new_tensor(0.0)
 
-    def __call__(self, gaussians, step: int) -> torch.Tensor:
-        """
-        gaussians: your GaussianPerm instance containing
-                   `. _gate_logit` of shape (S,1)
-        step:      current training iteration.
-        """
-        z = gaussians._gate_logit           # (S,1)
-        # compute KL_z = E[(z - mu_z)^2] / (2 σ_z^2)
-        kl_z = self.inv_2sig2_z * (z - self.mu_z).pow(2).mean()
-        # anneal
-        return self.beta(step) * kl_z
+        is_spike = x >= self.spike_thr     # “δ at 1”
+        tail     = ~is_spike
+
+        # log p*(x) for every sample
+        log_p = torch.empty_like(x)
+
+        # spike part: probability mass π*
+        log_p[is_spike] = math.log(self.pi_star + self.eps)
+
+        # tail part: (1-π*) · BetaPDF
+        if tail.any():
+            log_tail = self._beta_pdf_log(x[tail]) + math.log(1.0 - self.pi_star + self.eps)
+            log_p[tail] = log_tail
+
+        # Empirical KL  =  –mean log p*
+        kl = -log_p.mean()
+
+        return self._anneal(step) * kl
+
 
 def _bchw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:          # (C,H,W)  →  (1,C,H,W)
@@ -271,12 +459,12 @@ class HairDetailLoss:
         # Phase A: Huber
         if w_hu:
             hub = self._huber(pred4, tgt4)               # (B,3,H,W)
-            loss += w_hu * (hub * g_map).mean()
+            loss += w_hu * (hub * g_map).sum() / (g_map.sum() + 1e-6)
 
         # Phase B,C: L1
         if w_l1:
             l1 = (pred4 - tgt4).abs()                    # (B,3,H,W)
-            loss += w_l1 * (l1 * g_map).mean()
+            loss += w_l1 * (l1 * g_map).sum() / (g_map.sum() + 1e-6)
 
         # SSIM (scale‐free) — weight by gate only
         if w_ss:
@@ -285,7 +473,7 @@ class HairDetailLoss:
                 window_size=11, max_val=1.0,
                 reduction='none'
             )                                           # (B,1,H,W)
-            loss += w_ss * (ssim_map * g_map).mean()
+            loss += w_ss * (ssim_map * g_map).sum() / (g_map.sum() + 1e-6)
 
         # Sobel‐Y (detail) — magnitude‐type so weight by gate
         if w_gr:
@@ -298,17 +486,15 @@ class HairDetailLoss:
                     (self.blur_sigma, self.blur_sigma)
                 )
             grad = (sobel(lum_p) - sobel(lum_t)).abs()  # (B,1,H,W)
-            loss += w_gr * (grad * g_map).mean()
+            loss += w_gr * (grad * g_map).sum() / (g_map.sum() + 1e-6)
 
         # LPIPS (polish)
         if w_lp:
             lp = self.lpips(
                 linear_to_lpips(pred4), linear_to_lpips(tgt4)
             )                                          # (B,1,1,1)
-            # spatially averaged already; scale by mean gate
-            loss += w_lp * (lp.squeeze() * g_map.mean()).mean()
-
-        return loss
+            # Gate LPIPS by the average gate: if gate_map is zero, this term is zero
+            loss += w_lp * lp.mean()
 
         return loss
 

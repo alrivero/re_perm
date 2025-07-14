@@ -184,8 +184,12 @@ class GaussianPerm(nn.Module):
         self._features_asg = nn.Parameter(torch.zeros(M, self.max_asg_degree)).float()
 
         # ── 8) Uncertainty Initialization ─────────-────────────────────────────────
-        # NOT USED UNTIL AFTER DENSIFICATION
-        self._gate_logit = nn.Parameter(torch.zeros(S, self.max_asg_degree)).float()
+        p_target = 0.5
+        logit_p  = math.log(p_target / (1.0 - p_target))   # ≈ 2.1972245
+        gate_init = torch.zeros(40250, self.max_asg_degree + 1, device=device)
+        gate_init[:, 0].fill_(logit_p) 
+
+        self._gate_logit = nn.Parameter(gate_init).float()
 
         # ── 9) Optional duplication ─────────────────────────────────────────
         if dup_factor > 1:
@@ -416,7 +420,14 @@ class GaussianPerm(nn.Module):
             self.uniform_strand_color = False
 
         # ------------------------------------------------------------------ 9.  other learnables
-        self._gate_logit = nn.Parameter(torch.zeros(S_new, self.max_asg_degree, device=device)).float()
+        # initialise gate *logits* (column 0) so that sigmoid(logit) ≈ N(0.9, 0.35²) in [0,1]
+        p_target = 0.5
+        logit_p  = math.log(p_target / (1.0 - p_target))   # ≈ 2.1972245
+        gate_init = torch.zeros(S_new, self.max_asg_degree + 1, device=device)
+        gate_init[:, 0].fill_(logit_p) 
+
+        self._gate_logit = nn.Parameter(gate_init).float()
+
 
         self._phi      = nn.Parameter(
             torch.empty((self.num_gaussians, 1), device=device, dtype=dtype)
@@ -771,7 +782,7 @@ class GaussianPerm(nn.Module):
             self._features_asg,
             self._opacity,
             self._scaling_base,
-            self._gate_logit,
+            _,
 
             opt_state_dict,
 
@@ -801,7 +812,7 @@ class GaussianPerm(nn.Module):
         # 3) rebuild optimizer (this sees all your nn.Parameter fields)
         self.training_setup(training_args, extra_parameters)
         # 4) load its saved state
-        self.optimizer.load_state_dict(opt_state_dict)
+        # self.optimizer.load_state_dict(opt_state_dict)
 
         # 5) recompute any cached / derived state
         self.num_gaussians = self._s.shape[0]
@@ -866,8 +877,8 @@ class GaussianPerm(nn.Module):
         return torch.sigmoid(self._s)
     
     @property
-    def get_gate_per_gaussian(self):           # (M,1), σ already applied
-        return self._gate_logit[self._strand_id]                    # broadcast
+    def get_gate_per_gaussian(self):           
+        return self._gate_logit[self._strand_id]
 
     @property
     def get_scaling_with_3D_filter(self):

@@ -28,6 +28,7 @@ from gaussian_renderer         import render
 from arguments                 import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils       import to_image_np, compute_occlusion_mask
 from scene.specular_model import SpecularModel
+from scene.uncertainty_model import UncertaintyModel
 
 STRAND_VERTEX_COUNT = 100
 
@@ -122,6 +123,129 @@ def orient_to_rgb_360(orient: torch.Tensor) -> np.ndarray:
 def rgbify(arr: np.ndarray) -> np.ndarray:
     return np.repeat(arr, 3, 2) if arr.ndim == 3 and arr.shape[2] == 1 else arr
 
+import numpy as np
+import cv2
+from pathlib import Path
+from typing  import List, Tuple
+
+EPS = 1e-8  # numerical safety for divisions
+
+# ───────────────────────────────── squeeze helper ────────────────────────────
+def _squeeze(mask: np.ndarray) -> np.ndarray:
+    """
+    Accept (H,W), (H,W,1), or (1,H,W) and return (H,W) float32 in [0,1].
+    """
+    if mask.ndim == 3 and mask.shape[-1] == 1:        # (H,W,1)
+        mask = mask[..., 0]
+    if mask.ndim == 3 and mask.shape[0] == 1:         # (1,H,W)
+        mask = mask[0]
+    return mask.astype(np.float32)
+
+# ───────────────────────────────── soft metrics ──────────────────────────────
+def _soft_metrics(gt: np.ndarray,
+                  pred: np.ndarray) -> dict:
+    """
+    Continuous TP / FP / FN statistics for probability masks.
+    Returns precision, recall, dice, iou, fp_rate, fn_rate.
+    """
+    TP = np.sum(pred * gt)
+    FP = np.sum(pred * (1.0 - gt))
+    FN = np.sum((1.0 - pred) * gt)
+
+    precision = TP / (TP + FP + EPS)
+    recall    = TP / (TP + FN + EPS)
+    dice      = 2 * TP / (2 * TP + FP + FN + EPS)
+    iou       = TP / (TP + FP + FN + EPS)
+    fp_rate   = FP / (TP + FN + EPS)   # FP relative to GT positives
+    fn_rate   = FN / (TP + FN + EPS)
+
+    return dict(precision=precision, recall=recall,
+                dice=dice, iou=iou,
+                fp_rate=fp_rate, fn_rate=fn_rate)
+
+# ─────────────────────────── visualisation + metrics ─────────────────────────
+def _visualise_and_metrics(gt: np.ndarray,
+                           pred: np.ndarray,
+                           vis_thresh: float = 0.0) -> Tuple[np.ndarray, dict]:
+    """
+    * Metrics are soft/continuous.
+    * Visualisation bins both masks at vis_thresh only for colouring.
+    """
+    G = _squeeze(gt)
+    P = _squeeze(pred)
+
+    metrics = _soft_metrics(G, P)           # ← continuous!
+
+    # ----- make colour overlay for display -----
+    G_bin = G > vis_thresh
+    P_bin = P > vis_thresh
+
+    H, W = G_bin.shape
+    vis  = np.zeros((H, W, 3), dtype=np.uint8)
+    vis[np.logical_and(G_bin,  P_bin)] = (255, 255, 255)  # TP  (white)
+    vis[np.logical_and(G_bin, ~P_bin)] = (255,   0,   0)  # FN  (red)
+    vis[np.logical_and(~G_bin, P_bin)] = (  0,   0, 255)  # FP  (blue)
+
+    return vis, metrics
+
+# ───────────────────────── video + metrics writer ────────────────────────────
+def save_mask_comparison_video(pred_list: List[np.ndarray],
+                               gt_list:   List[np.ndarray],
+                               out_dir:   str,
+                               out_name:  str = "mask_comparison.mp4",
+                               fps:       int = 24,
+                               vis_thresh: float = 0.0):
+    """
+    Creates a side-by-side video  [ GT | Diff-visualisation ]
+    and saves per-frame continuous-metrics to metrics.npy.
+    """
+    assert len(pred_list) == len(gt_list), "Pred / GT list length mismatch"
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # ——— setup video writer ———
+    first_vis, _ = _visualise_and_metrics(gt_list[0], pred_list[0], vis_thresh)
+    H, W, _ = first_vis.shape
+    canvas_size = (W * 2, H)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path / out_name),
+                             fourcc, fps, canvas_size)
+
+    metrics_all = []
+    for idx, (pred, gt) in enumerate(zip(pred_list, gt_list)):
+        vis, m = _visualise_and_metrics(gt, pred, vis_thresh)
+        metrics_all.append(m)
+
+        # assemble side-by-side frame
+        gt_vis = (_squeeze(gt) * 255).astype(np.uint8)
+        gt_vis = np.repeat(gt_vis[..., None], 3, axis=2)
+        frame  = np.hstack([gt_vis, vis])            # (H,2W,3)
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        print(f"Frame {idx:04d}:  "
+              f"IoU={m['iou']:.3f}  Dice={m['dice']:.3f}  "
+              f"Prec={m['precision']:.3f}  Rec={m['recall']:.3f}")
+
+    writer.release()
+
+    # ——— save metrics.npy ———
+    dtype = [('precision','f4'),('recall','f4'),
+             ('dice','f4'),('iou','f4'),
+             ('fp_rate','f4'),('fn_rate','f4')]
+    mets_np = np.array([tuple(d.values()) for d in metrics_all], dtype=dtype)
+    np.save(out_path / "metrics.npy", mets_np)
+
+    # ——— print dataset means ———
+    mean_vals = {k: float(mets_np[k].mean()) for k in mets_np.dtype.names}
+    print("\n=== Mean over all frames ===")
+    for k, v in mean_vals.items():
+        print(f"{k:10s}: {v:.4f}")
+
+    print(f"\nVideo saved to {out_path/out_name}")
+    print(f"Per-frame metrics saved to {out_path/'metrics.npy'}")
+
 # ─────────────────────────── main ─────────────────────────
 @torch.no_grad()
 def main():
@@ -180,9 +304,14 @@ def main():
     specular_mlp.specular = specular_mlp.specular.to(args.device)
     specular_mlp.train_setting(opt)
 
+    uncertainty_mlp = UncertaintyModel()
+    uncertainty_mlp.uncertainty = uncertainty_mlp.uncertainty.to(args.device)
+    uncertainty_mlp.train_setting(opt)
+
     m,g,it = torch.load(args.start_checkpoint, map_location=args.device)
     deform.restore(m); gauss.restore(g,opt, extra_parameters=extra_parameters); gauss.eval(); deform.eval()
     specular_mlp.load_weights(model_dir, iteration=it)
+    uncertainty_mlp.load_weights(model_dir, iteration=it)
 
     bg = torch.tensor([1,1,1] if lpt.white_background else [0,1,0],
                       dtype=torch.float32, device=args.device)
@@ -193,6 +322,9 @@ def main():
     cams = scene.getCameras()
 
     vr, vs, vd, vcmp = [], [], [], []
+
+    all_pred_masks = []
+    all_gt_masks = []
 
     load_filter = True
     for cam in tqdm(cams, desc="rendering"):
@@ -248,10 +380,29 @@ def main():
         dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         spec_color = specular_mlp.step(gauss.get_asg_features, dir_pp_normalized, tangents)
 
-        pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
+        dir_pp = (gauss.get_xyz - cam.camera_center.repeat(gauss.get_features.shape[0], 1))
+        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+        uncertainty_vals = uncertainty_mlp.step(
+            gauss.get_gate_per_gaussian,
+            dir_pp_normalized,
+            tangents,
+            gauss.get_axial_weight,
+            torch.tensor(cam.uid / 1879).to(args.device)
+        )
+
+        pkg = render(
+            cam,
+            gauss,
+            ppt,
+            bg,
+            kernel_size=lpt.kernel_size,
+            occ_mask=occ_mask,
+            spec_color=spec_color,
+            uncertainty_vals=uncertainty_vals
+        )
 
         pred_rgb = to_image_np(pkg["render"])
-        pred_seg = to_image_np(pkg["segment"])
+        pred_seg = to_image_np(pkg["gate"])
 
         gt_full = to_image_np(cam.original_image)
         mask_np = (cam.hair_mask[0].cpu().numpy() > 0.5)
@@ -260,6 +411,9 @@ def main():
 
         orient  = orient_to_rgb(cam.hair_orient) if hasattr(cam,"hair_orient") else gt_seg
         orient = cv2.resize(orient, (720, 720), interpolation=cv2.INTER_LINEAR)
+
+        all_pred_masks.append(pred_seg)
+        all_gt_masks.append(gt_seg)
 
         vr.append(pred_rgb); vs.append(pred_seg)
 
@@ -274,6 +428,9 @@ def main():
         vcmp.append(strip)
 
         cam.load2device("cpu")
+
+    import pdb; pdb.set_trace()
+    save_mask_comparison_video(all_pred_masks, all_gt_masks, Path(args.out_dir), fps=args.fps)
 
     imageio.mimsave(Path(args.out_dir)/"render.mp4",       vr,   fps=args.fps)
     imageio.mimsave(Path(args.out_dir)/"segmentation.mp4", vs,   fps=args.fps)

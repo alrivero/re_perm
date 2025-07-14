@@ -59,7 +59,7 @@ from utils.loss_utils import (
     l1_loss,
     ssim,
     HairDetailLoss,
-    UncertaintyKLLoss, 
+    MaskShapeKLWithExtras, 
     alpha_blended_loss
 )
 from flame import FlameHead
@@ -109,16 +109,16 @@ def save_gate_vis(
     dpi: int = 150,
 ):
     """
-    Visualize only the gate map (σ(z) in [0,1]) and save to out_path.
+    Visualize the gate map values directly (no normalization) and save to out_path.
 
     Parameters
     ----------
     gate_tensor : torch.Tensor
-        Either gate logits or probabilities.  If logits, apply torch.sigmoid first.
+        Gate logits or probabilities. If logits, apply torch.sigmoid first.
     out_path : str | pathlib.Path
         Where to save the PNG (or other ext).
     alpha_mask : torch.Tensor | None
-        Boolean mask of foreground.  Background is shown as zero (dark).
+        Boolean mask of foreground. Background is shown as zero (dark).
     cmap : str
         Matplotlib colormap for gate.
     dpi : int
@@ -134,13 +134,9 @@ def save_gate_vis(
     else:
         mask = torch.ones_like(gate, dtype=torch.bool)
 
-    # normalize only over mask region
-    fg = gate[mask]
-    vmin, vmax = float(fg.min()), float(fg.max())
-    span = max(vmax - vmin, 1e-6)
-    gate_norm = (gate - vmin) / span
-    gate_vis  = torch.zeros_like(gate)
-    gate_vis[mask] = gate_norm[mask]
+    # prepare visualization: raw values where mask is True, zero elsewhere
+    gate_vis = torch.zeros_like(gate)
+    gate_vis[mask] = gate[mask]
 
     # plot
     plt.figure(figsize=(4, 4), dpi=dpi)
@@ -214,7 +210,7 @@ if __name__ == "__main__":
 
     data_dir     = os.path.join(args.source_path, args.idname)
     mica_datadir = os.path.join(data_dir, "track_out", args.idname)
-    log_dir      = os.path.join(data_dir, "log")
+    log_dir      = "/data/add_disk4/arivero/imagine_data/log_mask_asg"
     train_dir    = os.path.join(log_dir, "train")
     model_dir    = os.path.join(log_dir, "ckpt")
 
@@ -390,11 +386,17 @@ if __name__ == "__main__":
         device=args.device
     )
 
-    kl_loss = UncertaintyKLLoss(
-        beta_start = 1e-3,        # off for the first few k steps
-        beta_final = 2e-2,       # weighted-KL ≈ 5 at the start of the ramp
-        t_start    = 8_000,      # begin ramp here
-        t_end      = 50_000,     # reach full strength well before 50k
+    kl_loss = MaskShapeKLWithExtras(
+        pi_star = scene.target_dist['pi'],
+        alpha_star = scene.target_dist['alpha'],
+        beta_star  = scene.target_dist['beta'],
+        target_nz_frac= scene.target_dist['non_one_frac'],
+        spike_thresh = 254/255,       # same as during fitting
+        beta_start = 1e-3,
+        beta_final = 5e-2,
+        t_start    = 8000,
+        t_end      = 50_000,
+        warmup_iter=10_000
     )
 
     uniform_strand_color = True
@@ -467,7 +469,7 @@ if __name__ == "__main__":
         if enable_uncertainty:
             dir_pp = (gaussians.get_xyz - cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-            uncertainty_val = uncertainty_mlp.step(
+            uncertainty_vals = uncertainty_mlp.step(
                 gaussians.get_gate_per_gaussian,
                 dir_pp_normalized,
                 tangents,
@@ -475,31 +477,40 @@ if __name__ == "__main__":
                 torch.tensor(cam.uid / 1879).to(args.device)
             )
         else:
-            uncertainty_val = None
+            uncertainty_vals = None
 
         occ_mask, _ = compute_occlusion_mask(gaussians, cam, flame_verts, flame_faces)
 
-        render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
+        render_pkg = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color, uncertainty_vals=uncertainty_vals)
         img_render   = render_pkg["render"]
         img_segment  = render_pkg["segment"]
 
         gt_img    = cam.original_image
-        alpha     = cam.hair_mask
+        gt_alpha  = cam.hair_mask
+        alpha = render_pkg["gate"]
+
+        if enable_uncertainty:
+            # import pdb; pdb.set_trace()
+            loss_uncertainty_kl, loss_dice, loss_nz_frac, kappa = kl_loss(alpha, gt_alpha, it)
+        else:
+            loss_uncertainty_kl = torch.tensor(0.0)
+            loss_dice = torch.tensor(0.0)
+            kappa = 1.0
+
         orient    = cam.hair_orient
         depth_gt  = cam.depth_map
         gt_img    = gt_img * alpha + bg_image * (1 - alpha)
 
         
         if enable_uncertainty:
-            loss_h = hair_photo_loss(img_render, gt_img, it, gate_map=render_pkg["gate"])
+            loss_h = kappa * hair_photo_loss(img_render, gt_img, it)
         else:
             loss_h = hair_photo_loss(img_render, gt_img, it)
-
-        loss_seg = alpha_blended_loss(img_segment, alpha)
+        loss_seg = kappa * alpha_blended_loss(alpha, gt_alpha)
 
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
-        loss_o                    = orientation_loss_v2_debug(cam, gaussians, alpha, orient, occ_mask)
+        loss_o                    = kappa * orientation_loss_v2_debug(cam, gaussians, alpha, orient, occ_mask)
         loss_sdf_contain, loss_sdf_flow = sdf_contain_and_flow(nphm_grid, gaussians, strand_pts_can)
         loss_nei                  = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], gaussians.neighbor_idx)
         loss_bend                 = bending_loss(strand_pts)
@@ -518,10 +529,6 @@ if __name__ == "__main__":
             loss_asg_var              = asg_variance_loss(gaussians)
             loss_opacity_var          = opacity_variance_loss(gaussians)
 
-        if enable_uncertainty:
-            loss_uncertainty_kl = kl_loss(gaussians, it)
-        else:
-            loss_uncertainty_kl = torch.tensor(0.0)
 
         if False:
             loss_flame_rot_reg = (rotation_offsets.norm(dim=1) ** 2).mean()
@@ -557,6 +564,8 @@ if __name__ == "__main__":
         lambda_flame_rot_reg   = opt.lambda_flame_rot_reg
         lambda_flame_trans_reg = opt.lambda_flame_trans_reg
         lambda_uncertainty_kl  = opt.lambda_uncertainty_kl
+        lambda_dice            = opt.lambda_dice
+        lambda_nz_frac         = opt.lambda_nz_frac
 
         w_huber           = lambda_huber                * loss_h.item()
         w_nei             = lambda_nei                  * loss_nei.item()
@@ -577,7 +586,9 @@ if __name__ == "__main__":
         w_scale_reg       = lambda_scale_reg            * loss_scale_reg.item()
         w_flame_rot_reg   = lambda_flame_rot_reg        * loss_flame_rot_reg.item()
         w_flame_trans_reg = lambda_flame_trans_reg      * loss_flame_trans_reg.item()
-        w_uncertainty_kl  = lambda_uncertainty_kl       *  loss_uncertainty_kl.item()
+        w_uncertainty_kl  = lambda_uncertainty_kl       * loss_uncertainty_kl.item()
+        w_dice            = lambda_dice                 * loss_dice.item()
+        w_nz_frac         = lambda_nz_frac              * loss_nz_frac.item()
 
         loss = (
             lambda_huber           * loss_h +
@@ -599,7 +610,9 @@ if __name__ == "__main__":
             lambda_scale_reg       * loss_scale_reg +
             lambda_flame_rot_reg   * loss_flame_rot_reg +
             lambda_flame_trans_reg * loss_flame_trans_reg +
-            lambda_uncertainty_kl  * loss_uncertainty_kl
+            lambda_uncertainty_kl  * loss_uncertainty_kl +
+            lambda_dice            * loss_dice +
+            lambda_nz_frac         * loss_nz_frac
         )
 
         gaussians.update_learning_rate(it)
@@ -678,11 +691,16 @@ if __name__ == "__main__":
             if it < opt.iterations:
                 gaussians.optimizer.step()
                 deform_model.optimizer.step()
+                specular_mlp.optimizer.step()
+                uncertainty_mlp.optimizer.step()
+
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 deform_model.optimizer.zero_grad(set_to_none=True)
-                specular_mlp.optimizer.step()
                 specular_mlp.optimizer.zero_grad()
+                uncertainty_mlp.optimizer.zero_grad()
+                
                 specular_mlp.update_learning_rate(it)
+                uncertainty_mlp.update_learning_rate(it)
 
         if it % 20 == 0:
             print(
@@ -707,9 +725,14 @@ if __name__ == "__main__":
                 f"flame_rot_reg {loss_flame_rot_reg:.4f} (w {w_flame_rot_reg:.4f})  "
                 f"flame_trans_reg {loss_flame_trans_reg:.4f} (w {w_flame_trans_reg:.4f})  "
                 f"uncertainty_kl {loss_uncertainty_kl:.4f} (w {w_uncertainty_kl:.4f})  "
+                f"dice {loss_dice:.4f} (w {w_dice:.4f})  "
+                f"nz_frac {loss_nz_frac:.4f} (w {w_nz_frac:.4f})  "
                 f"→ total {loss.item():.4f}     "
                 f"→ Gaussian Count {gaussians.num_gaussians}     "
                 f"→ Strand Count {gaussians.num_strands}     "
+                f"→ Uncertainty Mean {uncertainty_vals.mean()}     "
+                f"→ Uncertainty Min {uncertainty_vals.min()}     "
+                f"→ Uncertainty Max {uncertainty_vals.max()}     "
             )
             if _use_wandb:
                 wandb.log({
@@ -734,15 +757,20 @@ if __name__ == "__main__":
                     "loss/flame_rot_reg":    loss_flame_rot_reg.item(),
                     "loss/flame_trans_reg":  loss_flame_trans_reg.item(),
                     "loss/uncertainty_kl":   loss_uncertainty_kl.item(),
+                    "loss/dice":             loss_dice.item(),
+                    "loss/nz_frac":          loss_nz_frac.item(),
                     "iter":                  it,
                     "num_gaussians":         gaussians.num_gaussians,
                     "num_strands":           gaussians.num_strands,
+                    "uncertianty mean":           uncertainty_vals.mean(),
+                    "uncertianty min":           uncertainty_vals.min(),
+                    "uncertianty max":           uncertainty_vals.max(),
                 }, step=it)
 
         if it % 500 == 0 or it == 1:
             canvas = make_side_by_side(gt_img, img_render, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
-            seg_canvas = make_side_by_side(alpha, img_segment, args.image_res)
+            seg_canvas = make_side_by_side(gt_alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
             save_gate_vis(render_pkg["gate"], os.path.join(train_dir, f"{it:06d}_gate.png"))
 

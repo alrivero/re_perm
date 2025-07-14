@@ -17,6 +17,43 @@ from utils.graphics_utils import focal2fov, fov2focal
 
 
 class Scene_mica:
+    @staticmethod
+    def _fit_beta_spike(mask_arr: np.ndarray, spike_thresh: float = 0.999):
+        """
+        Parameters
+        ----------
+        mask_arr : float32 array in [0,1]
+        Returns
+        -------
+        pi, alpha, beta, U, non_one_frac
+        """
+        # 1) compute non-zero mask and fraction of those < 1.0
+        nz_mask = mask_arr > 0.0
+        nz = mask_arr[nz_mask]
+        if nz.size < 10:
+            return None
+
+        non_one_count = np.count_nonzero(mask_arr[nz_mask] < 1.0)
+        non_one_frac  = non_one_count / nz.size
+
+        # 2) original spike+Beta fit
+        spike = nz >= spike_thresh
+        pi    = spike.mean()
+        rim   = nz[~spike]
+        if rim.size < 2:
+            return None
+
+        mu, var = rim.mean(), rim.var()
+        eps = 1e-8
+        common = mu * (1 - mu) / (var + eps) - 1.0
+        alpha  = mu * common
+        beta   = (1 - mu) * common
+
+        if not (np.isfinite(alpha) and np.isfinite(beta) and alpha > 0 and beta > 0):
+            return None
+
+        return pi, alpha, beta, alpha + beta, non_one_frac
+
     def __init__(self, datadir, mica_datadir, train_type, white_background, device):
         ## train_type: 0 for train, 1 for test, 2 for eval
         frame_delta = 1 # default mica-tracking starts from the second frame
@@ -57,6 +94,11 @@ class Scene_mica:
         if train_type == 2:
             range_down = self.N_frames - eval_num
             range_up = self.N_frames
+
+        self.target_dist  = None          # will hold best mixture
+        best_U            = float('inf')  # smallest so far
+        best_idx          = -1
+        best_params       = None
 
         for frame_id in tqdm(range(0, 1879)):
             image_name_ori = str(frame_id).zfill(5)
@@ -126,6 +168,15 @@ class Scene_mica:
             hair_mask = PILtoTensor(hair_mask)
             hair_mask = (hair_mask - hair_mask.min()) / (hair_mask.max() - hair_mask.min() + 1e-8)
 
+            fit = self._fit_beta_spike(hair_mask.cpu().numpy())
+            if fit is not None:
+                pi, alpha, beta, U, non_one_frac = fit
+                if U < best_U:
+                    best_U            = U
+                    best_idx          = frame_id
+                    best_params       = (pi, alpha, beta)
+                    best_non_one_frac = non_one_frac
+
             # hairstep map
             hair_orient_path = os.path.join(hair_orient_folder, image_name_ori+'.png')
             hair_orient = Image.open(hair_orient_path)
@@ -142,6 +193,20 @@ class Scene_mica:
                                 exp_param=exp_param, shape_param=shape_param, eyes_pose=eyes_pose, jaw_pose=jaw_pose, neck_pose=neck_pose,
                                 image_name=image_name_ori, uid=frame_id, data_device=device)
             self.cameras.append(camera_indiv)
+
+        if best_params is not None:
+            pi_best, alpha_best, beta_best = best_params
+            self.target_dist = dict(
+                frame_idx      = best_idx,
+                pi             = pi_best,
+                alpha          = alpha_best,
+                beta           = beta_best,
+                U              = best_U,
+                non_one_frac   = best_non_one_frac,
+            )
+        else:
+            print("[Scene_mica] Warning: no valid hair-mask tail found; "
+                  "target_dist left as None.")
         
         self.cameras = np.array(self.cameras)
     

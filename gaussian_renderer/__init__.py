@@ -137,7 +137,7 @@ def render(viewpoint_camera, pc : GaussianPerm, pipe, bg_color : torch.Tensor, s
 
     colors_precomp = torch.ones_like(means3D)
     if uncertainty_vals is not None:
-        colors_precomp[:, 1] = uncertainty_vals[occ_mask]
+        colors_precomp[:, 1] = uncertainty_vals[occ_mask].squeeze(-1)
 
     seg_image, _= rasterizer(
         means3D = means3D,

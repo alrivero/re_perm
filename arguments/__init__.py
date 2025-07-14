@@ -115,7 +115,7 @@ class OptimizationParams(ParamGroup):
         self.delta_strand_len = 0.01
         self.k_neigh = 8
 
-        self.lambda_huber = 10000.0
+        self.lambda_huber = 800 # 1000.0 * 0.7
         self.lambda_seg = 10000.0 * 5.0
         self.lambda_orient = 125.0 * 5.0
         self.lambda_sdf_contain = 0.0
@@ -140,7 +140,9 @@ class OptimizationParams(ParamGroup):
         self.lambda_flame_rot_reg = 3e1
         self.lambda_flame_trans_reg = 3e2
         self.lambda_dssim = 0.2
-        self.lambda_uncertainty_kl = 1000.0
+        self.lambda_uncertainty_kl = 100.0 * 3 * 20 * 4
+        self.lambda_dice = 75.0  
+        self.lambda_nz_frac = 1.0  
 
         self.densification_interval = 100 # 7500
         self.opacity_reset_interval = 3500

@@ -14,18 +14,17 @@ class UncertaintyRender(nn.Module):
         featureC: int = 128,
         num_theta: int = 4,
         num_phi: int = 8,
-        start_confidence: float = 0.8  # initial confidence ∈ (0,1)
     ):
         super().__init__()
 
         self.num_theta = num_theta
-        self.num_phi = num_phi
+        self.num_phi   = num_phi
         self.ch_normal_dot_viewdir = 1
         self.viewpe = viewpe
 
         # total input channels
         self.in_mlpC = (
-            2 * viewpe * 2 
+            3 * viewpe * 2 
             + 2 * viewpe * 3
             + 3
             + num_theta * num_phi * 2
@@ -49,18 +48,14 @@ class UncertaintyRender(nn.Module):
             layer3,
         )
 
-        # ─── initialize final layer ─────────────────────────────────────
-        # bias b0 such that sigmoid(b0) == start_confidence
-        b0 = math.log(start_confidence / (1.0 - start_confidence))
+        def _init_near_zero(m, std=1e-6):
+            if isinstance(m, nn.Linear):
+                # break symmetry with a small gaussian noise
+                nn.init.normal_(m.weight, mean=0.0, std=std)
+                # bias near zero
+                nn.init.normal_(m.bias,   mean=0.0, std=std)
 
-        # small random weights around zero instead of exact zeros
-        nn.init.normal_(layer3.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(layer3.bias, b0)
-
-        # (you can still keep standard kaiming for the hidden layers if you like)
-        for l in (layer1, layer2):
-            nn.init.kaiming_normal_(l.weight, nonlinearity="relu")
-            nn.init.zeros_(l.bias)
+        self.mlp.apply(lambda m: _init_near_zero(m, std=1e-6))
 
     def reflect(self, viewdir, normal):
         return 2 * (viewdir * normal).sum(dim=-1, keepdim=True) * normal - viewdir
@@ -68,7 +63,7 @@ class UncertaintyRender(nn.Module):
     def safe_normalize(self, x, eps=1e-8):
         return x / (x.norm(dim=-1, keepdim=True).clamp_min(eps))
 
-    def forward(self, viewdirs, features, normal, pos, frame_ids):
+    def forward(self, viewdirs, features, normal, uni_logit, pos, frame_ids):
         # unpack ASG params
         N = viewdirs.shape[0]
         asg = features.view(N, self.num_theta, self.num_phi, 4)
@@ -87,13 +82,12 @@ class UncertaintyRender(nn.Module):
             parts.append(viewdirs)
         if self.viewpe > 0:
             parts.append(positional_encoding(viewdirs, self.viewpe))
-            aux = torch.cat([pos.unsqueeze(-1), frame_ids.unsqueeze(-1)], dim=-1)
+            aux = torch.cat([pos.unsqueeze(-1), frame_ids.unsqueeze(-1), uni_logit], dim=-1)
             parts.append(positional_encoding(aux, self.viewpe))
 
         x = torch.cat(parts, dim=-1)
         logit = self.mlp(x)                # (N,1)
-        confidence = torch.sigmoid(logit)  # ∈ (0,1)
-        return confidence
+        return logit
 
 class UncertaintyNetwork(nn.Module):
     def __init__(self):
@@ -111,11 +105,14 @@ class UncertaintyNetwork(nn.Module):
         self.render_module = UncertaintyRender(self.view_pe, self.hidden_feature, self.num_theta, self.num_phi)
 
     def forward(self, lobes, view, normal, pos, frame_id):
-        feature = self.gaussian_feature(lobes)
-        frame_ids = frame_id[None].repeat(len(lobes))
+        uni_logit = torch.zeros_like(lobes[:, [0]])
+        lobes = lobes[:, 1:]
 
-        spec = self.render_module(view, feature, normal, pos, frame_ids)
-        return spec
+        feature = self.gaussian_feature(lobes)
+        frame_ids = torch.zeros_like(frame_id[None].repeat(len(lobes)))
+
+        spec = self.render_module(view, feature, normal, uni_logit, pos, frame_ids)
+        return torch.sigmoid(spec + uni_logit)
 
 class UncertaintyModel():
     def __init__(self):
@@ -129,7 +126,7 @@ class UncertaintyModel():
     def train_setting(self, training_args):
         l = [
             {'params': list(self.uncertainty.parameters()),
-            'lr': training_args.gate_lr / 10,
+            'lr': training_args.gate_lr / 5,
             "name": "uncertainty"}
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
