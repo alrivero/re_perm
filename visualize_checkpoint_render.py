@@ -14,6 +14,7 @@ import numpy as np
 import torch, imageio
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 import matplotlib
 import debug
 import trimesh
@@ -28,8 +29,41 @@ from gaussian_renderer         import render
 from arguments                 import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils       import to_image_np, compute_occlusion_mask
 from scene.specular_model import SpecularModel
+from utils.loss_utils import _project_gaussians_to_uv
 
 STRAND_VERTEX_COUNT = 100
+
+# ──────────────────────────────────────────────────────────────
+# Updated project_orientations function
+import torch
+import torch.nn.functional as F
+from utils.general_utils import quaternion_to_rotation_matrix, convert_normal_to_camera_space
+
+def project_orientations(
+    viewpoint_cam,
+    gaussians
+) -> torch.Tensor:
+    """
+    Projects each Gaussian's local +Y axis into image space for the given camera.
+    Returns an (N, 2) tensor of 2D unit orientation vectors (dx, dy) for N Gaussians.
+    """
+    device = gaussians.get_xyz.device
+
+    # fetch local +Y direction in world space via quaternions
+    R_local = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (N,3,3)
+    y_world = R_local[:, :, 1]                                        # (N,3)
+
+    # project into camera space
+    dirs_cam = convert_normal_to_camera_space(
+        y_world,
+        viewpoint_cam.w2c[:3, :3],
+        viewpoint_cam.projection_matrix[:3, :3]
+    )  # (N,3)
+    dirs_2d = dirs_cam[:, :2]
+
+    # normalize to unit 2D vectors
+    dirs_unit = F.normalize(dirs_2d, dim=-1, eps=1e-6)  # (N,2)
+    return dirs_unit
 
 # ───────────────── depth normalisation ──────────────────
 def soft_percentile(x: torch.Tensor, mask: torch.Tensor,
@@ -70,6 +104,35 @@ def depth_to_rgb(d_pred: torch.Tensor,
     return (rgb * 255).astype(np.uint8)
 
 # ───────────── orientation visualisation ───────────────
+
+def orient_dirs_to_rgb(orient_dirs: torch.Tensor) -> np.ndarray:
+    """
+    Map (dx, dy) to RGB using full 360° HSV wheel.
+
+    Input:
+        orient_dirs : (N, 3) tensor with:
+            [:,0] = mask (1.0 if valid)
+            [:,1] = (dx + 1) / 2
+            [:,2] = (dy + 1) / 2
+
+    Returns:
+        (N, 3) numpy array of RGB values in [0,1], dtype=float32
+    """
+    assert orient_dirs.shape[1] == 3
+
+    mask = orient_dirs[:, 0].clamp(0, 1)
+    g, b = orient_dirs[:, 1], orient_dirs[:, 2]
+
+    dy = g * 2.0 - 1.0
+    dx = b * 2.0 - 1.0
+
+    # Full 360° mapping
+    hue = (torch.atan2(dy, dx) + math.pi) / (2 * math.pi)  # ∈ [0,1]
+    sat = val = mask
+
+    hsv = torch.stack([hue, sat, val], dim=1).cpu().numpy()  # (N, 3)
+    rgb = matplotlib.colors.hsv_to_rgb(hsv)
+    return rgb.astype(np.float32)
 
 def orient_to_rgb(orient: torch.Tensor) -> np.ndarray:
     """
@@ -140,7 +203,7 @@ def main():
     lpt,opt,ppt = lp.extract(args), op.extract(args), pp.extract(args)
 
     data_dir     = os.path.join(args.source_path, args.idname)
-    log_dir      = os.path.join(data_dir, "log")
+    log_dir      = "/data/add_disk4/arivero/imagine_data/arjit/log_asg"
     model_dir    = os.path.join(log_dir, "ckpt")
 
     scalp_mask = pickle.load(open(
@@ -248,17 +311,25 @@ def main():
         dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         spec_color = specular_mlp.step(gauss.get_asg_features, dir_pp_normalized, tangents)
 
+        orient_dirs = project_orientations(cam, gauss)
+        orient_dirs *= -1
+        r_channel = torch.ones((orient_dirs.shape[0], 1), device=orient_dirs.device)
+        orient_dirs = torch.cat([r_channel, orient_dirs], dim=-1)
+        orient_color = torch.tensor(orient_dirs_to_rgb(orient_dirs)).to(args.device)
+
         pkg = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask, spec_color=spec_color)
+        pkg_orient = render(cam, gauss, ppt, bg, kernel_size=lpt.kernel_size, occ_mask=occ_mask, override_color=orient_color)
 
         pred_rgb = to_image_np(pkg["render"])
         pred_seg = to_image_np(pkg["segment"])
+        pred_orient = to_image_np(pkg_orient["render"])
 
         gt_full = to_image_np(cam.original_image)
         mask_np = (cam.hair_mask[0].cpu().numpy() > 0.5)
         gt_rgb  = gt_full * mask_np[..., None]
         gt_seg  = to_image_np(cam.hair_mask.float())
 
-        orient  = orient_to_rgb(cam.hair_orient) if hasattr(cam,"hair_orient") else gt_seg
+        orient  = orient_to_rgb_360(cam.hair_orient) if hasattr(cam,"hair_orient") else gt_seg
         orient = cv2.resize(orient, (720, 720), interpolation=cv2.INTER_LINEAR)
 
         vr.append(pred_rgb); vs.append(pred_seg)
@@ -266,7 +337,7 @@ def main():
         strip = np.concatenate([
             rgbify(gt_rgb),  rgbify(pred_rgb),
             rgbify(gt_seg),  rgbify(pred_seg),
-            rgbify(orient),
+            rgbify(orient),  rgbify(pred_orient)
         ], axis=1)
         if depth_map is not None:
             strip = np.concatenate([strip, rgbify(to_image_np(depth_map))], axis=1)
