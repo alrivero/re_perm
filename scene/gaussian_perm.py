@@ -184,7 +184,7 @@ class GaussianPerm(nn.Module):
         self._features_asg = nn.Parameter(torch.zeros(M, self.max_asg_degree)).float()
 
         # ── 8) Uncertainty Initialization ─────────-────────────────────────────────
-        p_target = 0.5
+        p_target = 0.7002306385044914
         logit_p  = math.log(p_target / (1.0 - p_target))   # ≈ 2.1972245
         gate_init = torch.zeros(M, self.max_asg_degree + 1, device=device)
         gate_init[:, 0].fill_(logit_p) 
@@ -421,7 +421,7 @@ class GaussianPerm(nn.Module):
 
         # ------------------------------------------------------------------ 9.  other learnables
         # initialise gate *logits* (column 0) so that sigmoid(logit) ≈ N(0.9, 0.35²) in [0,1]
-        p_target = 0.5
+        p_target = 0.7002306385044914
         logit_p  = math.log(p_target / (1.0 - p_target))   # ≈ 2.1972245
         gate_init = torch.zeros(S_new, self.max_asg_degree + 1, device=device)
         gate_init[:, 0].fill_(logit_p) 

@@ -7,6 +7,7 @@ import math
 import numpy as np
 import cv2
 from tqdm import tqdm
+from scipy.special import betaln, digamma, polygamma
 
 from scene.gaussian_model import GaussianModel
 from scene.gaussian_perm import GaussianPerm
@@ -15,44 +16,71 @@ from arguments import ModelParams
 from utils.general_utils import PILtoTensor
 from utils.graphics_utils import focal2fov, fov2focal
 
-
 class Scene_mica:
     @staticmethod
-    def _fit_beta_spike(mask_arr: np.ndarray, spike_thresh: float = 0.999):
+    def _fit_beta_spike(
+        mask_arr: np.ndarray,
+        spike_thresh: float = 0.999,
+        max_iter: int = 5,
+        eps: float = 1e-8
+    ):
         """
-        Parameters
-        ----------
-        mask_arr : float32 array in [0,1]
-        Returns
-        -------
-        pi, alpha, beta, U, non_one_frac
+        Fit p(x) = pi*delta(x=1) + (1-pi)*Beta(x; alpha_param,beta_param)
+        via one EM cycle + Newton on the Beta tail.
+        Returns:
+          (pi, alpha_param, beta_param, neg_log_likelihood, non_one_frac)
         """
-        # 1) compute non-zero mask and fraction of those < 1.0
-        nz_mask = mask_arr > 0.0
-        nz = mask_arr[nz_mask]
-        if nz.size < 10:
+
+        # 1) flatten & filter zeros
+        xs = mask_arr.ravel().astype(np.float64)
+        xs = xs[xs > 0.0]
+        N = xs.size
+        if N < 10:
             return None
 
-        non_one_count = np.count_nonzero(mask_arr[nz_mask] < 1.0)
-        non_one_frac  = non_one_count / nz.size
-
-        # 2) original spike+Beta fit
-        spike = nz >= spike_thresh
-        pi    = spike.mean()
-        rim   = nz[~spike]
-        if rim.size < 2:
+        # 2) hard E-step: assign spike vs tail
+        is_spike = xs >= spike_thresh
+        n_spike  = int(is_spike.sum())
+        tail     = xs[~is_spike]
+        n_tail   = tail.size
+        non_one_frac = n_tail / float(N)
+        if n_tail < 5:
             return None
 
-        mu, var = rim.mean(), rim.var()
-        eps = 1e-8
-        common = mu * (1 - mu) / (var + eps) - 1.0
-        alpha  = mu * common
-        beta   = (1 - mu) * common
+        # 3) M-step for pi
+        pi = n_spike / float(N)
 
-        if not (np.isfinite(alpha) and np.isfinite(beta) and alpha > 0 and beta > 0):
-            return None
+        # 4) init alpha/beta by method-of-moments on tail
+        mean_tail = tail.mean()
+        var_tail  = tail.var()
+        common    = mean_tail*(1.0-mean_tail)/(var_tail + eps) - 1.0
+        alpha_param = max(mean_tail * common, eps)
+        beta_param  = max((1.0-mean_tail) * common, eps)
 
-        return pi, alpha, beta, alpha + beta, non_one_frac
+        # 5) refine alpha/beta by Newton steps
+        for _ in range(max_iter):
+            # gradient of tail log-likelihood
+            grad_a = tail.size * (digamma(alpha_param + beta_param) - digamma(alpha_param)) \
+                     + np.log(tail+eps).sum()
+            grad_b = tail.size * (digamma(alpha_param + beta_param) - digamma(beta_param)) \
+                     + np.log(1-tail+eps).sum()
+            # approximate Hessian diagonals
+            hess_aa = tail.size * (polygamma(1, alpha_param + beta_param) - polygamma(1, alpha_param))
+            hess_bb = tail.size * (polygamma(1, alpha_param + beta_param) - polygamma(1, beta_param))
+            # Newton update (damped by adding eps)
+            alpha_param = max(alpha_param - grad_a/(hess_aa+eps), eps)
+            beta_param  = max(beta_param  - grad_b/(hess_bb+eps), eps)
+
+        # 6) compute complete-data log-likelihood
+        ll_spike = n_spike * np.log(pi + eps)
+        ll_tail  = n_tail * np.log(1.0 - pi + eps)
+        ll_tail += (alpha_param-1.0)*np.log(tail+eps).sum()
+        ll_tail += (beta_param-1.0) * np.log(1.0-tail+eps).sum()
+        ll_tail -= n_tail * betaln(alpha_param, beta_param)
+        log_lik  = ll_spike + ll_tail
+
+        # return negative log-likelihood as “score” to minimize
+        return pi, alpha_param, beta_param, -log_lik, non_one_frac
 
     def __init__(self, datadir, mica_datadir, train_type, white_background, device):
         ## train_type: 0 for train, 1 for test, 2 for eval

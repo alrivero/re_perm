@@ -620,7 +620,21 @@ if __name__ == "__main__":
         )
 
         gaussians.update_learning_rate(it)
-        loss.backward()
+
+        if enable_uncertainty:
+            rm   = uncertainty_mlp.uncertainty.render_module
+            # analytic part, detached so no second-order graph
+            gca  = rm._g_corr_a.detach()          # (N,1)
+            gcb  = rm._g_corr_b.detach()          # (N,1)
+
+            # loss value per batch item (scalar) – broadcast to (N,1)
+            fz   = loss.detach()                  # 0-D tensor
+
+            rm._alpha.register_hook(lambda grad: grad + gca * fz)
+            rm._beta.register_hook(lambda grad: grad + gcb * fz)
+
+        total_loss = loss            # no other change
+        total_loss.backward()
 
         # Densification
         radii                  = render_pkg["radii"]                 # (M,) for renderer
@@ -779,7 +793,7 @@ if __name__ == "__main__":
             seg_canvas = make_side_by_side(gt_alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(img_segment, render_pkg["gate"], args.image_res)
-            cv2.imwrite(os.path.join(train_dir, f"{it:06d}_gate.png"), seg_canvas[:, :, ::-1])
+        cv2.imwrite(os.path.join(train_dir, f"{it:06d}_gate.png"), seg_canvas[:, :, ::-1])
 
         if it % 10000 == 0 or it == 1:
             export_strands_as_obj(
