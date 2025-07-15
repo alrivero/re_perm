@@ -776,189 +776,146 @@ class HairRoots(nn.Module):
     def sample_scalp_hex(
         self,
         num_samples: int,
-        pseudo_roots: Optional[torch.Tensor] = None  # unused; only here for signature
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        Build a true honeycomb‐lattice of UV‐vertices (i.e. the VERTICES of a hex‐tiling)
-        that covers the rectangle [u0,u1]×[v0,v1] exactly.  We choose the triangular
-       ‐lattice spacing `a` so that roughly `num_samples` cells fit inside, then
-        drop any lattice‐points whose (absolute UV) falls outside the AABB.  Finally,
-        we truncate (row‐major) to at most `num_samples` points, and send those
-        **absolute UV** coordinates directly into `spherical_to_cartesian(…)` (no extra
-        normalization).
+        pseudo_roots: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, float, torch.Tensor]:
+        """Hex-tiling sampling (original logic) + optional culling via pseudo_roots."""
 
-        Returns:
-          - xyz_tensor:  (N_out, 3) on the same device as `self.centroid`
-          - hex_radius:  float, the circumradius of each hex cell in UV‐space
-        """
-        assert self.scalp_bounds is not None, "Must set `scalp_bounds` before calling sample_scalp_honeycomb."
+        # ─── Original sampling logic (UNTOUCHED) ────────────────────────────────
+        assert self.scalp_bounds is not None, "Set `scalp_bounds` before calling."
         device = self.centroid.device
 
-        # 1) Extract the absolute‐UV AABB:
         u0, u1, v0, v1 = self.scalp_bounds
-        width_uv  = u1 - u0
-        height_uv = v1 - v0
-        area_uv   = width_uv * height_uv
+        width_uv, height_uv = u1 - u0, v1 - v0
+        area_uv = width_uv * height_uv
 
-        # 2) Solve for “triangular‐lattice spacing” a so that ≈num_samples cells tile the area:
-        #    Each hexagon in the dual has area = (√3/2) * a².  Therefore:
-        #      (√3/2) * a²  ≈  area_uv / num_samples
-        #    ⇒ a = sqrt( (2/√3) * (area_uv / num_samples) )
         a = math.sqrt((2.0 / math.sqrt(3.0)) * (area_uv / float(num_samples)))
         self.current_hc_spacing = a
-
-        # 3) In a triangular lattice of spacing “a”, each Voronoi‐hexagon has circumradius R = a / √3
         hex_radius = a / math.sqrt(3.0)
 
-        # 4) We now build a 2D triangular grid of points in absolute UV:
-        #    - horizontal spacing dx = a
-        #    - vertical spacing   dy = (√3/2) * a
         dx = a
         dy = (math.sqrt(3.0) / 2.0) * a
-
-        # 5) How many rows/cols do we need to cover [u0..u1]×[v0..v1]?  We overshoot then cull.
         n_cols = int(math.ceil(width_uv  / dx)) + 1
         n_rows = int(math.ceil(height_uv / dy)) + 1
 
-        # 6) Make NumPy index arrays for rows/columns:
-        row_idxs = np.arange(n_rows, dtype=np.int64)  # [0..n_rows-1]
-        col_idxs = np.arange(n_cols, dtype=np.int64)  # [0..n_cols-1]
+        row_idxs = np.arange(n_rows, dtype=np.int64)
+        col_idxs = np.arange(n_cols, dtype=np.int64)
 
-        #    Compute each row’s absolute‐UV v‐coordinate:  v = v0 + row * dy
-        v_coords_full  = v0 + row_idxs.astype(np.float32) * dy         # shape (n_rows,)
-        valid_row_mask = (v_coords_full <= v1)                          # keep only rows whose center ≤ v1
-        v_coords       = v_coords_full[valid_row_mask]                  # shape (R,)
-        actual_rows    = row_idxs[valid_row_mask]                        # shape (R,)
-        R              = v_coords.shape[0]                               # number of valid rows
+        v_coords_full  = v0 + row_idxs.astype(np.float32) * dy
+        valid_rows     = v_coords_full <= v1
+        v_coords       = v_coords_full[valid_rows]
+        actual_rows    = row_idxs[valid_rows]
 
-        #    On a triangular grid, each odd row is offset by (dx/2) horizontally:
-        offsets_for_row = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)  # shape (R,)
+        offsets = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)
+        uu  = (u0 + col_idxs.astype(np.float32) * dx)[None, :]
+        off = offsets[:, None]
+        u_grid = uu + off
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)
 
-        # 7) Build the full 2D array of candidate UV‐vertices:
-        #    u_grid[i,j] = u0 + j*dx + offsets_for_row[i],   for j=0..n_cols-1
-        uu     = (u0 + col_idxs.astype(np.float32) * dx)[None, :]   # shape (1, n_cols)
-        off    = offsets_for_row[:, None]                            # shape (R, 1)
-        u_grid = uu + off                                            # shape (R, n_cols)
-
-        #    v_grid[i,j] = v_coords[i]  (same across all columns in row i)
-        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)        # shape (R, n_cols)
-
-        # 8) Flatten into an (R*n_cols, 2) array of absolute UV‐points:
-        u_flat = u_grid.reshape(-1)  # (R * n_cols,)
-        v_flat = v_grid.reshape(-1)  # (R * n_cols,)
-        uv_all = np.stack([u_flat, v_flat], axis=1)  # shape (R*n_cols, 2)
-
-        # 9) Cull any candidate whose UV‐vertex lies strictly outside [u0..u1]×[v0..v1]:
-        keep_mask = (
+        uv_all = np.stack([u_grid.ravel(), v_grid.ravel()], axis=1)
+        inside = (
             (uv_all[:, 0] >= u0) & (uv_all[:, 0] <= u1) &
             (uv_all[:, 1] >= v0) & (uv_all[:, 1] <= v1)
         )
-        uv_in = uv_all[keep_mask]  # shape (K, 2)
+        uv_in = uv_all[inside]
 
-        # 10) If no valid points, return an empty tensor + hex_radius
-        K = uv_in.shape[0]
-        if K == 0:
+        if uv_in.shape[0] == 0:
             empty = torch.zeros((0, 3), device=device, dtype=torch.float32)
-            return empty, hex_radius
+            return empty, hex_radius, empty
 
-        # 11) Truncate in row‐major order to at most num_samples (no randomness):
-        if K > num_samples:
+        if uv_in.shape[0] > num_samples:
             uv_sel = uv_in[:num_samples]
         else:
-            uv_sel = uv_in  # shape (min(K, num_samples), 2)
+            uv_sel = uv_in
 
-        # 12) Convert these **absolute UV** coords directly to a torch‐tensor and feed to spherical_to_cartesian:
-        #     (We do NOT re‐normalize to [0,1] here—your spherical_to_cartesian must now expect absolute UV.)
-        uv_tensor = torch.from_numpy(uv_sel.astype(np.float32)).to(device)  # (N_out, 2)
-        xyz_tensor = self.spherical_to_cartesian(uv_tensor)                 # (N_out, 3)
+        uv_tensor = torch.from_numpy(uv_sel.astype(np.float32)).to(device)
+        all_xyz = self.spherical_to_cartesian(uv_tensor)  # (N,3)
 
-        return xyz_tensor, hex_radius
+        # ─── Culling via pseudo_roots (NEW) ─────────────────────────────────────
+        if pseudo_roots is not None and pseudo_roots.numel() > 0:
+            # 1) Project pseudo_roots to mesh & collect hit faces (original mesh!)
+            pseudo_np = pseudo_roots.detach().cpu().numpy()
+            _, _, faces_hit = self.head.nearest.on_surface(pseudo_np)
+            valid_faces = set(int(f) for f in faces_hit)
+
+            # 2) For each sampled root, find nearest face on ORIGINAL mesh
+            all_xyz_np = all_xyz.detach().cpu().numpy()
+            _, _, root_faces = self.head.nearest.on_surface(all_xyz_np)
+            mask = np.isin(root_faces, list(valid_faces))
+            culled_np = all_xyz_np[mask]
+            culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
+        else:
+            culled_xyz = all_xyz  # no culling requested
+
+        return all_xyz, hex_radius, culled_xyz
 
 
     @torch.no_grad()
     def densify_scalp_hex(
         self,
-        old_roots: Optional[torch.Tensor] = None  # ignored, because we re‐tile from scratch
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        “Densify” by halving the previously‐stored triangular spacing (self.current_hc_spacing),
-        rebuilding a finer honeycomb grid over the same AABB, culling anything outside,
-        and projecting directly to 3D.  We do NOT keep the old points; the new lattice
-        is strictly finer (step = a_old/2).  No duplicates, no randomness.
+        pseudo_roots: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, float, torch.Tensor]:
+        """Finer hex-tiling densification (original logic) + optional pseudo-root culling."""
 
-        Returns:
-           (xyz_new, hex_radius_new)
-             - xyz_new        : (M_new, 3) on the same device
-             - hex_radius_new : float = (a_new / √3)
-        """
-        assert hasattr(self, "current_hc_spacing"), "You must call sample_scalp_honeycomb(...) first."
+        # ─── Original densification logic (UNTOUCHED) ──────────────────────────
+        assert hasattr(self, "current_hc_spacing"), "Call sample_scalp_hex() first."
         device = self.centroid.device
 
-        # 1) Halve the old triangular‐spacing:
         a_old = self.current_hc_spacing
         a_new = a_old / 2.0
         self.current_hc_spacing = a_new
-
-        #    New hex-circumradius:
         hex_radius_new = a_new / math.sqrt(3.0)
 
-        # 2) Compute dx_new, dy_new for the finer triangular grid:
+        u0, u1, v0, v1 = self.scalp_bounds
         dx = a_new
         dy = (math.sqrt(3.0) / 2.0) * a_new
+        width_uv, height_uv = u1 - u0, v1 - v0
 
-        # 3) Same absolute‐UV AABB:
-        u0, u1, v0, v1 = self.scalp_bounds
-        width_uv  = u1 - u0
-        height_uv = v1 - v0
-
-        # 4) How many columns/rows to cover again?
         n_cols = int(math.ceil(width_uv  / dx)) + 1
         n_rows = int(math.ceil(height_uv / dy)) + 1
 
-        # 5) Build row/col index arrays:
         row_idxs = np.arange(n_rows, dtype=np.int64)
         col_idxs = np.arange(n_cols, dtype=np.int64)
 
-        #    Each row’s absolute‐UV v:
         v_coords_full  = v0 + row_idxs.astype(np.float32) * dy
-        valid_row_mask = (v_coords_full <= v1)
-        v_coords       = v_coords_full[valid_row_mask]        # (R,)
-        actual_rows    = row_idxs[valid_row_mask]             # (R,)
-        R              = v_coords.shape[0]
+        valid_rows     = v_coords_full <= v1
+        v_coords       = v_coords_full[valid_rows]
+        actual_rows    = row_idxs[valid_rows]
 
-        #    Horizontal offset for each odd row:
-        offsets_for_row = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)  # (R,)
+        offsets = ((actual_rows % 2) * (dx / 2.0)).astype(np.float32)
+        uu  = (u0 + col_idxs.astype(np.float32) * dx)[None, :]
+        off = offsets[:, None]
+        u_grid = uu + off
+        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)
 
-        # 6) Form the full finer grid of candidate UV‐vertices:
-        uu     = (u0 + col_idxs.astype(np.float32) * dx)[None, :]  # (1, n_cols)
-        off    = offsets_for_row[:, None]                          # (R, 1)
-        u_grid = uu + off                                          # (R, n_cols)
-        v_grid = np.repeat(v_coords[:, None], n_cols, axis=1)      # (R, n_cols)
-
-        # 7) Flatten to (R*n_cols, 2):
-        u_flat = u_grid.reshape(-1)
-        v_flat = v_grid.reshape(-1)
-        uv_all = np.stack([u_flat, v_flat], axis=1)  # (R*n_cols, 2)
-
-        # 8) Cull any vertices outside [u0..u1]×[v0..v1]:
-        keep_mask = (
+        uv_all = np.stack([u_grid.ravel(), v_grid.ravel()], axis=1)
+        inside = (
             (uv_all[:, 0] >= u0) & (uv_all[:, 0] <= u1) &
             (uv_all[:, 1] >= v0) & (uv_all[:, 1] <= v1)
         )
-        uv_in = uv_all[keep_mask]  # shape (M_new, 2)
+        uv_in = uv_all[inside]
 
-        # 9) If none remain, return empty + new radius:
-        M_new = uv_in.shape[0]
-        if M_new == 0:
+        if uv_in.shape[0] == 0:
             empty = torch.zeros((0, 3), device=device, dtype=torch.float32)
-            return empty, hex_radius_new
+            return empty, hex_radius_new, empty
 
-        # 10) Directly project those **absolute UV** points to 3D:
-        uv_tensor = torch.from_numpy(uv_in.astype(np.float32)).to(device)  # (M_new, 2)
-        xyz_new   = self.spherical_to_cartesian(uv_tensor)                 # (M_new, 3)
+        uv_tensor = torch.from_numpy(uv_in.astype(np.float32)).to(device)
+        all_xyz = self.spherical_to_cartesian(uv_tensor)  # (M,3)
 
-        return xyz_new, hex_radius_new
-    
+        # ─── Culling via pseudo_roots (NEW) ─────────────────────────────────────
+        if pseudo_roots is not None and pseudo_roots.numel() > 0:
+            pseudo_np = pseudo_roots.detach().cpu().numpy()
+            _, _, faces_hit = self.head.nearest.on_surface(pseudo_np)
+            valid_faces = set(int(f) for f in faces_hit)
+
+            all_xyz_np = all_xyz.detach().cpu().numpy()
+            _, _, root_faces = self.head.nearest.on_surface(all_xyz_np)
+            mask = np.isin(root_faces, list(valid_faces))
+            culled_np = all_xyz_np[mask]
+            culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
+        else:
+            culled_xyz = all_xyz
+
+        return all_xyz, hex_radius_new, culled_xyz
     @torch.no_grad()
     def sample_scalp_hex_cull(
         self,

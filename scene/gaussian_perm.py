@@ -30,7 +30,7 @@ class GaussianPerm(nn.Module):
         self.uniform_strand_color = False
 
         # sample scalp roots once
-        self.roots, self.global_strand_radii = self.perm.hair_roots.sample_scalp_hex(
+        self.roots_unculled, self.global_strand_radii, self.roots = self.perm.hair_roots.sample_scalp_hex(
             num_strands, pseudo_roots
         )
         self.roots = self.roots.to(self.perm.device)
@@ -186,7 +186,7 @@ class GaussianPerm(nn.Module):
         # ── 8) Uncertainty Initialization ─────────-────────────────────────────────
         p_target = 0.5
         logit_p  = math.log(p_target / (1.0 - p_target))   # ≈ 2.1972245
-        gate_init = torch.zeros(40250, self.max_asg_degree + 1, device=device)
+        gate_init = torch.zeros(M, self.max_asg_degree + 1, device=device)
         gate_init[:, 0].fill_(logit_p) 
 
         self._gate_logit = nn.Parameter(gate_init).float()
@@ -403,7 +403,7 @@ class GaussianPerm(nn.Module):
             rs_flat = colour[:, Ddc:]
 
             self._features_dc   = nn.Parameter(
-                dc_flat.view(self.num_gaussians, 1, Ddc).transpose(1, 2).contiguous(),
+                dc_flat.view(self.num_gaussians, 1, Ddc),
                 requires_grad=True
             )
             self._features_rest = nn.Parameter(
@@ -749,6 +749,7 @@ class GaussianPerm(nn.Module):
             self.theta,
             self.beta,
             self.roots,
+            self.roots_unculled,
 
             # 14–15: lookup buffers
             self._strand_id,
@@ -782,13 +783,14 @@ class GaussianPerm(nn.Module):
             self._features_asg,
             self._opacity,
             self._scaling_base,
-            _,
+            self._gate_logit,
 
             opt_state_dict,
 
             self.theta,
             self.beta,
             self.roots,
+            self.roots_unculled,
 
             strand_id_buf,
             gauss_offset_buf,

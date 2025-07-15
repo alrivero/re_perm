@@ -127,7 +127,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_len_consist = 1e11
         self.lambda_bend = 5e8
         self.lambda_smooth_scale = 1e7
-        self.lambda_sobel = 1e27
+        self.lambda_sobel = 1e28
         self.lambda_head_col = 30000.0
         self.lambda_gauss_head_col = 30000.0
         self.lambda_local_len = 300000.0
@@ -152,7 +152,7 @@ class OptimizationParams(ParamGroup):
 
         self.densify_strands_from_iter = 100
         self.densify_strands_until_iter = 8001
-        self.densification_strand_interval = 8000 # 5000
+        self.densification_strand_interval = 2000 # 5000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

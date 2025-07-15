@@ -86,8 +86,13 @@ class UncertaintyRender(nn.Module):
             parts.append(positional_encoding(aux, self.viewpe))
 
         x = torch.cat(parts, dim=-1)
-        logit = self.mlp(x)                # (N,1)
-        return logit
+        
+        # reparameterization trick: uni_logit is μ, mlp(x) predicts log σ
+        log_sigma = self.mlp(x)            
+        sigma     = torch.exp(log_sigma)   
+        eps       = torch.randn_like(sigma)
+        u         = uni_logit + sigma * eps
+        return u
 
 class UncertaintyNetwork(nn.Module):
     def __init__(self):
@@ -105,14 +110,14 @@ class UncertaintyNetwork(nn.Module):
         self.render_module = UncertaintyRender(self.view_pe, self.hidden_feature, self.num_theta, self.num_phi)
 
     def forward(self, lobes, view, normal, pos, frame_id):
-        uni_logit = torch.zeros_like(lobes[:, [0]])
+        uni_logit = lobes[:, [0]]
         lobes = lobes[:, 1:]
 
         feature = self.gaussian_feature(lobes)
         frame_ids = torch.zeros_like(frame_id[None].repeat(len(lobes)))
 
-        spec = self.render_module(view, feature, normal, uni_logit, pos, frame_ids)
-        return torch.sigmoid(spec + uni_logit)
+        u = self.render_module(view, feature, normal, uni_logit, pos, frame_ids)
+        return torch.sigmoid(u)
 
 class UncertaintyModel():
     def __init__(self):

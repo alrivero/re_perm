@@ -399,8 +399,9 @@ if __name__ == "__main__":
         warmup_iter=10_000
     )
 
-    uniform_strand_color = True
-    enable_uncertainty = True
+    uniform_strand_color = False
+    enable_uncertainty = False
+    densify_count = 0
 
     for it in range(first_iter + 1, opt.iterations + 1):
         if it % 500 == 0:
@@ -493,20 +494,23 @@ if __name__ == "__main__":
             # import pdb; pdb.set_trace()
             loss_uncertainty_kl, loss_dice, loss_nz_frac, kappa = kl_loss(alpha, gt_alpha, it)
         else:
-            loss_uncertainty_kl = torch.tensor(0.0)
-            loss_dice = torch.tensor(0.0)
+            loss_uncertainty_kl = torch.tensor(0.0).to(args.device)
+            loss_dice = torch.tensor(0.0).to(args.device)
+            loss_nz_frac = torch.tensor(0.0).to(args.device)
             kappa = 1.0
+            gt_alpha[gt_alpha <= 254/255] = 0.0
 
         orient    = cam.hair_orient
         depth_gt  = cam.depth_map
-        gt_img    = gt_img * alpha + bg_image * (1 - alpha)
+        gt_img    = gt_img * gt_alpha + bg_image * (1 - gt_alpha)
 
         
         if enable_uncertainty:
-            loss_h = kappa * hair_photo_loss(img_render, gt_img, it)
+            loss_h = kappa * hair_photo_loss(img_render, gt_img, it, gate_map=alpha.detach())
+            loss_seg = kappa * alpha_blended_loss(alpha, gt_alpha)
         else:
             loss_h = hair_photo_loss(img_render, gt_img, it)
-        loss_seg = kappa * alpha_blended_loss(alpha, gt_alpha)
+            loss_seg = alpha_blended_loss(img_segment, gt_alpha)
 
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
@@ -649,6 +653,9 @@ if __name__ == "__main__":
                 gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
         if it < opt.densify_strands_until_iter and it > opt.densify_strands_from_iter \
                                         and it % opt.densification_strand_interval == 0:
+            densify_count = 2
+            uniform_strand_color = True
+
             torch.save(
                 (deform_model.capture(), gaussians.capture(), it),
                 os.path.join(model_dir, f"chkpnt_{it:06d}_pre_dense.pth")
@@ -656,11 +663,11 @@ if __name__ == "__main__":
             specular_mlp.save_weights(model_dir, it)
             print(f"\n[ITER {it}] Pre-Densification Checkpoint saved.\n")
 
-            new_roots, new_radii = perm.hair_roots.densify_scalp_hex(gaussians.roots)
-            while new_roots.shape[0] <= gaussians.roots.shape[0]:
-                new_roots, new_radii = perm.hair_roots.densify_scalp_hex(gaussians.roots)
+            new_roots, new_radii, new_roots_culled = perm.hair_roots.densify_scalp_hex(pseudo_roots)
+            while new_roots.shape[0] <= gaussians.roots_unculled.shape[0]:
+                new_roots, new_radii, new_roots_culled = perm.hair_roots.densify_scalp_hex(pseudo_roots)
 
-            gaussians.reset_gaussians_to_new_roots(new_roots, new_radii, uniform_strand_color=True)
+            gaussians.reset_gaussians_to_new_roots(new_roots_culled, new_radii, uniform_strand_color=uniform_strand_color)
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
             gaussians.training_setup(opt, extra_parameters=extra_parameters)
@@ -669,9 +676,6 @@ if __name__ == "__main__":
             opt.densification_strand_interval *= 4
             opt.densify_from_iter = 500 + it
             opt.lambda_color_var *= 10.0
-
-            uniform_strand_color = True
-            enable_uncertainty = True
 
         if it % 100 == 0:
             num_reset = gaussians.halve_large_parallel_sigmas()
@@ -692,15 +696,17 @@ if __name__ == "__main__":
                 gaussians.optimizer.step()
                 deform_model.optimizer.step()
                 specular_mlp.optimizer.step()
-                uncertainty_mlp.optimizer.step()
 
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 deform_model.optimizer.zero_grad(set_to_none=True)
                 specular_mlp.optimizer.zero_grad()
-                uncertainty_mlp.optimizer.zero_grad()
                 
                 specular_mlp.update_learning_rate(it)
-                uncertainty_mlp.update_learning_rate(it)
+
+                if enable_uncertainty:
+                    uncertainty_mlp.optimizer.step()
+                    uncertainty_mlp.optimizer.zero_grad()
+                    uncertainty_mlp.update_learning_rate(it)
 
         if it % 20 == 0:
             print(
@@ -730,9 +736,9 @@ if __name__ == "__main__":
                 f"→ total {loss.item():.4f}     "
                 f"→ Gaussian Count {gaussians.num_gaussians}     "
                 f"→ Strand Count {gaussians.num_strands}     "
-                f"→ Uncertainty Mean {uncertainty_vals.mean()}     "
-                f"→ Uncertainty Min {uncertainty_vals.min()}     "
-                f"→ Uncertainty Max {uncertainty_vals.max()}     "
+                f"→ Uncertainty Mean {uncertainty_vals.mean() if uncertainty_vals is not None else 0.0}     "
+                f"→ Uncertainty Min {uncertainty_vals.min() if uncertainty_vals is not None else 0.0}     "
+                f"→ Uncertainty Max {uncertainty_vals.max() if uncertainty_vals is not None else 0.0}     "
             )
             if _use_wandb:
                 wandb.log({
@@ -762,9 +768,9 @@ if __name__ == "__main__":
                     "iter":                  it,
                     "num_gaussians":         gaussians.num_gaussians,
                     "num_strands":           gaussians.num_strands,
-                    "uncertianty mean":           uncertainty_vals.mean(),
-                    "uncertianty min":           uncertainty_vals.min(),
-                    "uncertianty max":           uncertainty_vals.max(),
+                    "uncertianty mean":           uncertainty_vals.mean() if uncertainty_vals is not None else 0.0,
+                    "uncertianty min":           uncertainty_vals.min() if uncertainty_vals is not None else 0.0,
+                    "uncertianty max":           uncertainty_vals.max() if uncertainty_vals is not None else 0.0,
                 }, step=it)
 
         if it % 500 == 0 or it == 1:
@@ -772,7 +778,8 @@ if __name__ == "__main__":
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(gt_alpha, img_segment, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}_seg.png"), seg_canvas[:, :, ::-1])
-            save_gate_vis(render_pkg["gate"], os.path.join(train_dir, f"{it:06d}_gate.png"))
+            seg_canvas = make_side_by_side(img_segment, render_pkg["gate"], args.image_res)
+            cv2.imwrite(os.path.join(train_dir, f"{it:06d}_gate.png"), seg_canvas[:, :, ::-1])
 
         if it % 10000 == 0 or it == 1:
             export_strands_as_obj(
@@ -816,3 +823,5 @@ if __name__ == "__main__":
             print(f"\n[ITER {it}] Checkpoint saved.\n")
 
         cam.load2device("cpu")
+
+        enable_uncertainty = densify_count == 2
