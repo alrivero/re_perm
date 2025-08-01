@@ -63,7 +63,7 @@ class UncertaintyRender(nn.Module):
     def safe_normalize(self, x, eps=1e-8):
         return x / (x.norm(dim=-1, keepdim=True).clamp_min(eps))
 
-    def forward(self, viewdirs, features, normal, uni_logit, pos, frame_ids):
+    def forward(self, viewdirs, features, normal, uni_logit, pos, scalp_mask):
         # unpack ASG params
         N = viewdirs.shape[0]
         asg = features.view(N, self.num_theta, self.num_phi, 4)
@@ -82,7 +82,7 @@ class UncertaintyRender(nn.Module):
             parts.append(viewdirs)
         if self.viewpe > 0:
             parts.append(positional_encoding(viewdirs, self.viewpe))
-            aux = torch.cat([pos.unsqueeze(-1), frame_ids.unsqueeze(-1), uni_logit], dim=-1)
+            aux = torch.cat([pos.unsqueeze(-1), scalp_mask.unsqueeze(-1), uni_logit], dim=-1)
             parts.append(positional_encoding(aux, self.viewpe))
 
         x = torch.cat(parts, dim=-1)
@@ -109,14 +109,12 @@ class UncertaintyNetwork(nn.Module):
 
         self.render_module = UncertaintyRender(self.view_pe, self.hidden_feature, self.num_theta, self.num_phi)
 
-    def forward(self, lobes, view, normal, pos, frame_id):
+    def forward(self, lobes, view, normal, pos, scalp_mask):
         uni_logit = lobes[:, [0]]
         lobes = lobes[:, 1:]
 
         feature = self.gaussian_feature(lobes)
-        frame_ids = torch.zeros_like(frame_id[None].repeat(len(lobes)))
-
-        u = self.render_module(view, feature, normal, uni_logit, pos, frame_ids)
+        u = self.render_module(view, feature, normal, uni_logit, pos, scalp_mask)
         return torch.sigmoid(u)
 
 class UncertaintyModel():

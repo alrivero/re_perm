@@ -396,12 +396,13 @@ if __name__ == "__main__":
         beta_final = 5e-2,
         t_start    = 8000,
         t_end      = 50_000,
-        warmup_iter=10_000
+        warmup_iter=8_000
     )
 
-    uniform_strand_color = False
-    enable_uncertainty = False
-    densify_count = 0
+    uniform_strand_color = True
+    enable_uncertainty = True
+    densify_count = 1
+    densify_on_start = False
 
     for it in range(first_iter + 1, opt.iterations + 1):
         if it % 500 == 0:
@@ -451,11 +452,11 @@ if __name__ == "__main__":
             return_normals=True,
         )
 
-        verts_final, guide_final, verts_final_def, guide_final_def, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
+        verts_final, guide_final, verts_final_def, guide_final_def, scalp_final, scalp_final_def, rot_delta, scale_coef = deform_model.decode(gaussians, codedict)
         strand_pts = verts_final_def.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         strand_pts_can = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
 
-        tangents = gaussians.update_xyz_rot_scale(strand_pts, rot_delta, scale_coef)
+        tangents = gaussians.update_xyz_rot_scale(strand_pts, scalp_final_def, rot_delta, scale_coef)
 
         if it == first_iter + 1:
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
@@ -470,12 +471,15 @@ if __name__ == "__main__":
         if enable_uncertainty:
             dir_pp = (gaussians.get_xyz - cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            is_scalp = torch.ones(dir_pp.shape[0]).to(args.device)
+            is_scalp[-gaussians.num_strands:] = 0.0
+
             uncertainty_vals = uncertainty_mlp.step(
                 gaussians.get_gate_per_gaussian,
                 dir_pp_normalized,
                 tangents,
                 gaussians.get_axial_weight,
-                torch.tensor(cam.uid / 1879).to(args.device)
+                is_scalp
             )
         else:
             uncertainty_vals = None
@@ -502,13 +506,12 @@ if __name__ == "__main__":
 
         orient    = cam.hair_orient
         depth_gt  = cam.depth_map
-        gt_img    = gt_img * gt_alpha + bg_image * (1 - gt_alpha)
-
         
         if enable_uncertainty:
             loss_h = kappa * hair_photo_loss(img_render, gt_img, it, gate_map=alpha.detach())
             loss_seg = kappa * alpha_blended_loss(alpha, gt_alpha)
         else:
+            gt_img    = gt_img * gt_alpha + bg_image * (1 - gt_alpha)
             loss_h = hair_photo_loss(img_render, gt_img, it)
             loss_seg = alpha_blended_loss(img_segment, gt_alpha)
 
@@ -651,10 +654,10 @@ if __name__ == "__main__":
 
             if num_clone + num_split > 0:
                 gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
-        if it < opt.densify_strands_until_iter and it > opt.densify_strands_from_iter \
-                                        and it % opt.densification_strand_interval == 0:
-            densify_count = 2
-            uniform_strand_color = True
+        if densify_on_start or (it < opt.densify_strands_until_iter and it > opt.densify_strands_from_iter and it % opt.densification_strand_interval == 0):
+            if not densify_on_start:
+                densify_count += 1
+                uniform_strand_color = densify_count >= 2
 
             torch.save(
                 (deform_model.capture(), gaussians.capture(), it),
@@ -664,18 +667,21 @@ if __name__ == "__main__":
             print(f"\n[ITER {it}] Pre-Densification Checkpoint saved.\n")
 
             new_roots, new_radii, new_roots_culled = perm.hair_roots.densify_scalp_hex(pseudo_roots)
-            while new_roots.shape[0] <= gaussians.roots_unculled.shape[0]:
+            while new_roots_culled.shape[0] <= gaussians.roots.shape[0]:
                 new_roots, new_radii, new_roots_culled = perm.hair_roots.densify_scalp_hex(pseudo_roots)
 
-            gaussians.reset_gaussians_to_new_roots(new_roots_culled, new_radii, uniform_strand_color=uniform_strand_color)
+            gaussians.reset_gaussians_to_new_roots(new_roots_culled, new_radii, uniform_strand_color=uniform_strand_color, random_color=densify_on_start)
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
             gaussians.training_setup(opt, extra_parameters=extra_parameters)
             save_tensor_to_obj(gaussians.roots / 100, os.path.join(train_dir, f"roots_{it}.obj"))
 
-            opt.densification_strand_interval *= 4
-            opt.densify_from_iter = 500 + it
-            opt.lambda_color_var *= 10.0
+            if not densify_on_start:
+                opt.densification_strand_interval *= 4
+                opt.densify_from_iter = 500 + it
+                opt.lambda_color_var *= 10.0
+            densify_on_start = False
+            gaussians.set_scalp_opacity()
 
         if it % 100 == 0:
             num_reset = gaussians.halve_large_parallel_sigmas()
@@ -774,6 +780,7 @@ if __name__ == "__main__":
                 }, step=it)
 
         if it % 500 == 0 or it == 1:
+            gt_img    = gt_img * gt_alpha + bg_image * (1 - gt_alpha)
             canvas = make_side_by_side(gt_img, img_render, args.image_res)
             cv2.imwrite(os.path.join(train_dir, f"{it:06d}.png"), canvas[:, :, ::-1])
             seg_canvas = make_side_by_side(gt_alpha, img_segment, args.image_res)

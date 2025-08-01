@@ -45,10 +45,10 @@ def _huber(x: torch.Tensor,
 def alpha_blended_loss(pred_alpha: torch.Tensor,
                        tgt_alpha : torch.Tensor,
                        *,
-                       delta: float = 0.1,
+                       delta: float = 0.00,
                        w_l1 : float = 1.0,
-                       w_ssim: float = 0.2,
-                       w_grad: float = 0.03) -> torch.Tensor:
+                       w_ssim: float = 0.0,
+                       w_grad: float = 0.00) -> torch.Tensor:
     """
     Composite α-matte loss:
 
@@ -74,7 +74,7 @@ def alpha_blended_loss(pred_alpha: torch.Tensor,
     tgt_alpha  = tgt_alpha.float()
 
     # --- component losses -------------------------------------------------
-    loss_huber = _huber(pred_alpha, tgt_alpha, delta)
+    loss_l1 = F.l1_loss(pred_alpha, tgt_alpha)
 
     # kornia ms-SSIM returns the dissimilarity (1 − MS-SSIM)
     loss_ssim  = ssim_loss(pred_alpha, tgt_alpha, window_size=11, reduction="mean")
@@ -85,7 +85,7 @@ def alpha_blended_loss(pred_alpha: torch.Tensor,
     loss_grad = F.l1_loss(grad_pred, grad_tgt)
 
     # --- weighted sum -----------------------------------------------------
-    loss =  w_l1 * loss_huber \
+    loss =  w_l1 * loss_l1 \
           + w_ssim * loss_ssim \
           + w_grad * loss_grad
     return loss
@@ -190,7 +190,7 @@ class MaskShapeKLWithExtras:
         if step < self.warmup_iter:     return 1.0
         if dice_val < 0.90:             return 0.0
         if dice_val >= 0.92:            return 1.0
-        frac = (0.92 - dice_val) / 0.02
+        frac = (0.92 - dice_val) / 100
         return math.exp(-self.kappa_lambda * (step - self.warmup_iter) * frac)
 
     def __call__(self,
@@ -386,9 +386,9 @@ class HairDetailLoss:
         fade_iters:   int = 20_000,
         polish_iters: int = 5_000,
         huber_delta:  float = 0.10,
-        w_ssim_final: float = 0.20,
-        w_grad_final: float = 0.02,
-        w_lpips_final:float = 0.10,
+        w_ssim_final: float = 0.00,
+        w_grad_final: float = 0.00,
+        w_lpips_final:float = 0.00,
         blur:         bool  = False,
         blur_sigma:   float = 1.0,
         device:       str   = "cuda"
@@ -489,12 +489,12 @@ class HairDetailLoss:
             loss += w_gr * (grad * g_map).sum() / (g_map.sum() + 1e-6)
 
         # LPIPS (polish)
-        if w_lp:
-            lp = self.lpips(
-                linear_to_lpips(pred4), linear_to_lpips(tgt4)
-            )                                          # (B,1,1,1)
-            # Gate LPIPS by the average gate: if gate_map is zero, this term is zero
-            loss += w_lp * lp.mean()
+        # if w_lp:
+        #     lp = self.lpips(
+        #         linear_to_lpips(pred4), linear_to_lpips(tgt4)
+        #     )                                          # (B,1,1,1)
+        #     # Gate LPIPS by the average gate: if gate_map is zero, this term is zero
+        #     loss += w_lp * lp.mean()
 
         return loss
 
@@ -510,8 +510,9 @@ def sdf_contain_and_flow(
 ):
     """Returns (loss_contain, loss_flow)."""
 
+    sid     = gaussians._strand_id
     centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
-    scales            = gaussians.get_scaling
+    scales            = gaussians.get_scaling[:len(sid)]
     sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
 
     M        = centers.shape[0]
@@ -559,8 +560,9 @@ def sdf_containment_loss(
     Returns a single scalar loss with gradients.
     """
 
+    sid     = gaussians._strand_id
     centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
-    scales           = gaussians.get_scaling
+    scales           = gaussians.get_scaling[:len(sid)]
     sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
 
     M        = centers.shape[0]
@@ -602,9 +604,11 @@ def sdf_hair_band_loss(
        L_band  = mean( clamp(|depth_i| - eps_band, 0)² )
     """
 
+    sid     = gaussians._strand_id
+
     # ---------- centers & tangents from canonical strands --------------
     centers, tangents = gaussians.world_centers_and_tangents(strand_vertices)
-    scales            = gaussians.get_scaling           # (M,3)
+    scales            = gaussians.get_scaling[:len(sid)]           # (M,3)
     sigma_perp, sigma_par = scales[:, 0], scales[:, 1]
 
     M        = centers.shape[0]
@@ -643,6 +647,8 @@ def sdf_hair_losses(
         chunk_size    = 2000_000,
         phys_scale    = 1.00,  # canonical metres
 ):
+    sid     = gaussians._strand_id
+
     """
     Returns (loss_in, loss_out) – both keep gradients.
     """
@@ -650,7 +656,7 @@ def sdf_hair_losses(
     centers, tangents = gaussians.world_centers_and_tangents(
                             strand_vertices)
 
-    scales      = gaussians.get_scaling
+    scales      = gaussians.get_scaling[:len(sid)]
     sigma_perp  = scales[:, 0]
     sigma_par   = scales[:, 1]
 
@@ -689,7 +695,9 @@ def filtered_opacity_penalty(gaussians):
     falls below `thresh`.
     """
     # (M,1) tensor of α̃ = α * coef
-    eff_opacity = gaussians.get_opacity_with_3D_filter
+    sid     = gaussians._strand_id
+
+    eff_opacity = gaussians.get_opacity_with_3D_filter[:len(sid)]
     
     return ((1.0 - eff_opacity)**2).mean()
 
@@ -846,7 +854,8 @@ def _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W):
     Returns integer pixel coordinates (u,v) and a boolean mask saying which
     gaussians lie inside the viewport.
     """
-    xyz = gaussians.get_xyz                         # (N,3)
+    sid     = gaussians._strand_id
+    xyz = gaussians.get_xyz[:len(sid)]                         # (N,3)
     uv  = project_to_screen(
             xyz,
             viewpoint_cam.projection_matrix[:3, :3].unsqueeze(0),
@@ -993,6 +1002,8 @@ def orientation_loss_v2_debug(
         max_arrows: int = 300):
 
     device = gaussians.get_xyz.device
+    sid     = gaussians._strand_id
+    occ_mask = occ_mask[:len(sid)]
 
     # channel split ------------------------------------------------------
     if orient_map.dim() == 3 and orient_map.size(0) == 3:      # (C,H,W)
@@ -1034,7 +1045,7 @@ def orientation_loss_v2_debug(
     gt_vec2d = F.normalize(torch.stack([dx[v, u], dy[v, u]], -1), dim=-1)
     gt_vec2d *= -1
 
-    R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation)
+    R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation[:len(sid)])
     y_world  = R_local[:, :, 1]
     dirs_cam = convert_normal_to_camera_space(
                   y_world[idx_g],
@@ -1093,158 +1104,6 @@ def orientation_loss_v2_debug(
 
     debug_np = (canvas.permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
     return loss, debug_np
-
-
-def orientation_loss(
-        viewpoint_cam,
-        gaussians,
-        hair_mask: torch.Tensor,      # (1,H,W) float 0-1
-        orient_map:  torch.Tensor,    # (C,H,W) or (H,W,C) in HairStep format
-        mask_thresh: float = 0.5):
-    """
-    HairStep strand-map:
-        R = mask  M(x)
-        G = (dx + 1)/2
-        B = (dy + 1)/2
-
-    Loss: 1 − cosΔ over pixels where mask > mask_thresh.
-    """
-
-    device = gaussians.get_xyz.device
-
-    # 1) arrange channels ------------------------------------------------
-    if orient_map.dim() == 3 and orient_map.size(0) == 3:      # (C,H,W)
-        m, g, b = orient_map[0], orient_map[1], orient_map[2]
-    elif orient_map.dim() == 3 and orient_map.size(2) == 3:    # (H,W,C)
-        m, g, b = orient_map[..., 0], orient_map[..., 1], orient_map[..., 2]
-    else:
-        return torch.tensor(0., device=device)
-
-    dx = g * 2.0 - 1.0
-    dy = b * 2.0 - 1.0
-    mask_pix = m > mask_thresh
-
-    H, W = m.shape[-2:]
-
-    # 2) project Gaussians ----------------------------------------------
-    u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
-    if u.numel() == 0:
-        return torch.tensor(0., device=device)
-    idx_g = in_view.nonzero(as_tuple=False).squeeze(1)
-
-    on_hair = mask_pix[v, u]
-    if on_hair.sum() == 0:
-        return torch.tensor(0., device=device)
-
-    u, v    = u[on_hair], v[on_hair]
-    idx_g   = idx_g[on_hair]
-
-    # 3) GT 2-D unit vectors --------------------------------------------
-    gt_vec2d = F.normalize(torch.stack([dx[v, u], dy[v, u]], -1), dim=-1)
-
-    # 4) predicted dir ---------------------------------------------------
-    R_local  = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (N,3,3)
-    y_world  = R_local[:, :, 1]                                       # (N,3)
-    dirs_cam = convert_normal_to_camera_space(
-                   y_world[idx_g],
-                   viewpoint_cam.w2c[:3, :3],
-                   viewpoint_cam.projection_matrix[:3, :3])[:, :2]
-    dirs_2d  = F.normalize(dirs_cam, dim=-1)
-
-    # 5) cosine loss, optional scale weight -----------------------------
-    inv_dot = 1.0 - (dirs_2d * gt_vec2d).sum(-1).clamp(-1., 1.)  # (M,)
-
-    scales      = gaussians.get_scaling
-    scale_ratio = (scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6)
-    weight      = torch.exp(-scale_ratio)
-
-    return (weight * inv_dot).mean()
-
-def orientation_loss_old(
-        viewpoint_cam,
-        gaussians,
-        hair_mask,          # (1,H,W) float {0,1}
-        orient_map,         # either (H,W,2) or (C,H,W), normalized [0,1]
-        conf_thresh=0.05
-    ):
-    """
-    Angular loss between rendered Gaussian orientations and a ground-truth
-    orientation map loaded via PILtoTensor (so both channels in [0,1]).
-    
-    Channel-0 is angle (8-bit stored → denormalized to [0,255]°)
-    Channel-1 is confidence [0,1].
-    """
-
-    device = gaussians.get_xyz.device
-
-    # 0) reshape to (H, W, C)
-    om = orient_map
-    if om.dim() == 3:
-        # (C,H,W) → (H,W,C)
-        om = om.permute(1, 2, 0).contiguous()
-    # drop any extra channels (e.g. blue)
-    if om.shape[2] > 2:
-        om = om[:, :, :2]
-
-    # 0b) denormalize angle channel: [0,1]→[0,255] degrees
-    angle_norm = om[..., 0]
-    conf_map   = om[..., 1]
-    angle_deg  = angle_norm * 255.0
-    om = torch.stack([angle_deg, conf_map], dim=-1)  # back to (H,W,2)
-
-    H, W = om.shape[:2]
-
-    # 1) project Gaussians into pixel coords
-    u, v, in_view = _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W)
-    if u.numel() == 0:
-        return torch.tensor(0.0, device=device)
-
-    idx_g = in_view.nonzero(as_tuple=False).squeeze(1)
-
-    # 2) keep only those that fall on the hair mask
-    on_hair = hair_mask[0, v, u] > 0.0
-    if on_hair.sum() == 0:
-        return torch.tensor(0.0, device=device)
-
-    u, v    = u[on_hair], v[on_hair]
-    idx_g   = idx_g[on_hair]
-
-    # 3) discard low-confidence pixels
-    gt_ang   = om[v, u, 0]
-    gt_conf  = om[v, u, 1]
-    keep     = gt_conf > conf_thresh
-    if keep.sum() == 0:
-        return torch.tensor(0.0, device=device)
-
-    u, v     = u[keep], v[keep]
-    idx_g    = idx_g[keep]
-    gt_rad   = gt_ang[keep] * pi / 180.0           # convert to radians
-
-    # 4) ground-truth unit vectors
-    gt_vec2d = torch.stack((torch.sin(gt_rad),
-                            torch.cos(gt_rad)), dim=-1)     # (M,2)
-
-    # 5) predicted directions from Gaussians
-    R_local    = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (N,3,3)
-    y_world    = R_local[:, :, 1]                                       # (N,3)
-    dirs_world = y_world[idx_g]                                         # (M,3)
-
-    dirs_cam   = convert_normal_to_camera_space(
-                     dirs_world,
-                     viewpoint_cam.w2c[:3, :3],
-                     viewpoint_cam.projection_matrix[:3, :3])
-    dirs_2d    = F.normalize(dirs_cam[:, :2], dim=-1)                   # (M,2)
-
-    # 6) cosine-based loss (1 − cos Δθ)
-    inv_dot   = 1.0 - (dirs_2d * gt_vec2d).sum(dim=-1).clamp(-1., 1.)    # (M,)
-
-    # optional scale weighting
-    scales      = gaussians.get_scaling                                # (N,3)
-    scale_ratio = (scales[idx_g, 0] / scales[idx_g, 1]).clamp_min(1e-6)
-    weight      = torch.exp(-scale_ratio)                              # (M,)
-
-    loss = (weight * inv_dot).mean()
-    return loss.to(device)
 
 def strand_length_loss(strand_points,
                        L_max   = 0.10,   # metres (== 10 cm in scene space)
@@ -1314,6 +1173,8 @@ def outside_opacity_loss(viewpoint_cam, gaussians, hair_mask):
     Returns:
         scalar loss on the same device as the Gaussians
     """
+    sid     = gaussians._strand_id
+
     device = gaussians.get_xyz.device
     H, W = hair_mask.shape[1:]
 
@@ -1331,7 +1192,7 @@ def outside_opacity_loss(viewpoint_cam, gaussians, hair_mask):
         return torch.tensor(0.0, device=device)
 
     # 3) fetch their opacities
-    opacity = gaussians.get_opacity.squeeze(-1)   # (N,)
+    opacity = gaussians.get_opacity[:len(sid)].squeeze(-1)   # (N,)
     opac_out = opacity[idxs[outside]]             # (M,)
 
     # 4) penalize “shutting off” → high when opacity→0, zero when opacity=1
@@ -1345,6 +1206,8 @@ def orientation_match_strands_loss(
     """
     Enforce each Gaussian’s rotation to align its local +Y with the strand segment.
     """
+    sid     = gaussians._strand_id
+
     # --- build edges & unit‐dirs ---
     edges = strands[:, 1:, :] - strands[:, :-1, :]        # (S, N-1, 3)
     M = edges.numel() // 3
@@ -1353,7 +1216,7 @@ def orientation_match_strands_loss(
     dirs = edge_dirs / edge_lens                            # (M,3)
 
     # --- get live quaternions and normalize ---
-    quats = gaussians.get_rotation  # (M,4)
+    quats = gaussians.get_rotation[:len(sid)]  # (M,4)
     w, x, y, z = quats.unbind(dim=1)
 
     # rotate +Y -> v_pred
@@ -1376,11 +1239,12 @@ def oblong_shape_loss_from_strands_loss(
     Push x/z scales to be much smaller than y scales.
     """
     # --- build edges & lengths for scale targets (unused) ---
+    sid     = gaussians._strand_id
     edges = strands[:, 1:, :] - strands[:, :-1, :]
     M = edges.numel() // 3
 
     # --- get live scales ---
-    scales = gaussians.scaling_activation(gaussians._scaling_base)  # (M,2)
+    scales = gaussians.scaling_activation(gaussians._scaling_base[:len(sid)])  # (M,2)
     xz = scales[:, 0]
     y  = scales[:, 1].clamp(min=1e-6)
 
@@ -1395,6 +1259,7 @@ def length_consistency_loss_from_strands_loss(
     """
     Make each Gaussian’s y‐scale equal the true segment length.
     """
+    sid     = gaussians._strand_id
     # --- build edges & true lengths ---
     edges = strands[:, 1:, :] - strands[:, :-1, :]
     M = edges.numel() // 3
@@ -1402,7 +1267,7 @@ def length_consistency_loss_from_strands_loss(
     edge_lens = edge_dirs.norm(dim=1, keepdim=True)        # (M,1)
 
     # --- get live y‐scale ---
-    scales = gaussians.scaling_activation(gaussians._scaling_base)  # (M,2)
+    scales = gaussians.scaling_activation(gaussians._scaling_base[:len(sid)])  # (M,2)
     scale_y = scales[:, 1].unsqueeze(1)                     # (M,1)
 
     return ((scale_y - edge_lens) ** 2).mean()
@@ -1591,7 +1456,8 @@ def gaussian_head_collision_loss(
     3) Penalize margin - signed_distance if signed_distance < margin.
     """
     # 1) collect Gaussian centers → (1, M, 3)
-    pts = gaussians.get_xyz.unsqueeze(0)     # (1, M, 3)
+    sid     = gaussians._strand_id
+    pts = gaussians.get_xyz[:len(sid)].unsqueeze(0)     # (1, M, 3)
 
     # 2) head point‐cloud → (1, H, 3)
     head = head_pts.unsqueeze(0)             # (1, H, 3)
@@ -1634,6 +1500,7 @@ def strand_repulsion_loss(
 
     Returns a scalar hinge loss.
     """
+    sid     = gaussians._strand_id
     device = strand_pts.device
     S, V, _ = strand_pts.shape
     if S < 2:
@@ -1667,7 +1534,7 @@ def strand_repulsion_loss(
     d2 = d_mat.pow(2)
 
     # 6) compute hinge threshold per pair: (r_s + r_t + safe_dist)^2 → (P,)
-    r = gaussians._strand_radius  # (S,)
+    r = gaussians._strand_radius[:len(sid)]  # (S,)
     r_s = r[pair_s]               # (P,)
     r_t = r[pair_t]               # (P,)
     thresh2 = (r_s + r_t + safe_dist).pow(2).view(P, 1, 1)
@@ -1696,7 +1563,8 @@ def gaussian_scale_regularization_loss(
         scalar loss
     """
     # (M,3): (σ⊥, σ∥, σ⊥)
-    scales = gaussians.get_scaling
+    sid     = gaussians._strand_id
+    scales = gaussians.get_scaling[:len(sid)]
     perp   = scales[:, 0]              # (M,)
     para   = scales[:, 1]              # (M,)
 
@@ -1743,8 +1611,10 @@ def color_variance_loss_sh(gaussians) -> torch.Tensor:
     """
     Compute the mean variance of SH color features across Gaussians on each strand.
     """
-    feat_all = gaussians.get_features           # (M, n_sh, 3)
-    M, n_sh, _ = feat_all.shape
+    sid     = gaussians._strand_id
+
+    feat_all = gaussians.get_features[:len(sid)]           # (M, 3, n_sh)
+    M, _, n_sh = feat_all.shape
     D = n_sh * 3
     feat_flat = feat_all.view(M, D)             # (M, D)
 
@@ -1788,8 +1658,8 @@ def asg_variance_loss(gaussians) -> torch.Tensor:
           = 1/S  ∑_s  (1/24) ∑_d (E[f²] – (E[f])²)_sd
     """
     # 1 ─ fetch data -------------------------------------------------------
-    asg_all   = gaussians.get_asg_features            # (M, 24)
     strand_id = gaussians._strand_id                  # (M,)
+    asg_all   = gaussians.get_asg_features[strand_id]            # (M, 24)
     S         = gaussians.num_strands
     device    = asg_all.device
     D         = asg_all.shape[1]                      # 24
@@ -1820,8 +1690,10 @@ def opacity_variance_loss(gaussians) -> torch.Tensor:
     Compute the mean variance of per‐Gaussian opacity across all Gaussians on each strand,
     in a memory‐efficient way and clamped to ≥0.
     """
+    sid     = gaussians._strand_id
+
     # 1) Fetch each Gaussian’s opacity as a 1-D tensor (M,)
-    opac_all  = gaussians.get_opacity_with_3D_filter.squeeze(-1)  # (M,)
+    opac_all  = gaussians.get_opacity_with_3D_filter[:len(sid)].squeeze(-1)  # (M,)
 
     # 2) Strand‐ID mapping
     strand_id = gaussians._strand_id                               # (M,)
@@ -1870,20 +1742,20 @@ def triangle_scale_area_loss(gaussians,
     """
 
     # 1) compute half‐scale area per Gaussian (as before) …
-    scales     = gaussians.get_scaling                 # (M,3)
+    sid     = gaussians._strand_id
+    scales     = gaussians.get_scaling[:len(sid)]                 # (M,3)
     sigma_para = scales[:,1] * 0.5                     # (M,)
 
-    P0 = gaussians.get_xyz                              # (M,3)
+    P0 = gaussians.get_xyz[:len(sid)]                              # (M,3)
 
-    R_local = quaternion_to_rotation_matrix(gaussians.get_rotation)  # (M,3,3)
+    R_local = quaternion_to_rotation_matrix(gaussians.get_rotation[:len(sid)])  # (M,3,3)
     tangent = R_local[:,:,1]                                         # (M,3)
 
     v  = tangent * sigma_para.unsqueeze(1)      # (M,3)
     P1 = P0 + v                                  # (M,3)
 
     # local‐segment projection (vectorized, O(M))
-    sid     = gaussians._strand_id
-    s_param = gaussians.get_axial_weight
+    s_param = gaussians.get_axial_weight[:len(sid)]
     strands = gaussians.strands                  # (S,V,3)
     S, V, _  = strands.shape
 

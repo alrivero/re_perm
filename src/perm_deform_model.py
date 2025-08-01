@@ -103,7 +103,17 @@ class PermDeformModel(nn.Module):
             trans
         )
 
-        return strands_final, guide_strands, strands_final_def, guide_strands_def, None, None
+        scalp_roots = gaussians.perm2scene(gaussians.scalp_roots)
+        scalp_def = self.flame.apply_neck_rotation(
+            scalp_roots,           # (N,3)  or (B,N,3)  – canonical coordinates
+            shape,            # (B, n_shape)
+            expr,             # (B, n_expr)
+            root_pose,
+            neck_pose,
+            trans
+        )
+
+        return strands_final, guide_strands, strands_final_def, guide_strands_def, scalp_roots, scalp_def, None, None
     
     def capture(self):
         return (

@@ -95,8 +95,11 @@ def make_p3d_camera(cam, device):
         device          = device
     )
 
-def compute_occlusion_mask(pc, cam, verts, faces, eps=1e-3):
+def compute_occlusion_mask(pc, cam, verts, faces, eps=1e-3, scale=0.96):
     device = pc.get_xyz.device
+    if scale != 1.0:
+        center = verts.mean(dim=1, keepdim=True)  # (1, V, 3) if batched
+        verts = (verts - center) * scale + center
     H, W   = int(cam.image_height), int(cam.image_width)
 
     # Build the camera

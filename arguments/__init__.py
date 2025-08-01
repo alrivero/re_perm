@@ -128,8 +128,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_bend = 5e8
         self.lambda_smooth_scale = 1e7
         self.lambda_sobel = 1e28
-        self.lambda_head_col = 30000.0
-        self.lambda_gauss_head_col = 30000.0
+        self.lambda_head_col = 300000.0
+        self.lambda_gauss_head_col = 300000.0
         self.lambda_local_len = 300000.0
         self.lambda_color_var = 10000.0
         self.lambda_asg_var = 10000.0
