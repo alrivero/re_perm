@@ -859,7 +859,9 @@ def _project_gaussians_to_uv(gaussians, viewpoint_cam, H, W):
     uv  = project_to_screen(
             xyz,
             viewpoint_cam.projection_matrix[:3, :3].unsqueeze(0),
-            viewpoint_cam.w2c.unsqueeze(0)
+            viewpoint_cam.w2c.unsqueeze(0),
+            H,
+            W
           )[0].long()                               # (N,2) long
 
     u, v = uv[:, 0], uv[:, 1]
@@ -1606,6 +1608,26 @@ def local_length_consistency_loss(
     diff = lengths.unsqueeze(1) - nbr_lengths                       # (S, k_eff)
     return (diff ** 2).mean()
 
+def geometric_fit_loss(gaussians, w_k=1.0, w_t=0.1):
+    """
+    Penalizes long Gaussians on highly curved/twisted strand segments.
+    This loss explicitly ignores scalp-disk Gaussians.
+    """
+    if not (hasattr(gaussians, 'kappa') and hasattr(gaussians, 'tau')):
+        return torch.tensor(0.0, device=gaussians._xyz.device)
+
+    # Create a mask to identify which Gaussians belong to strands (not the scalp)
+    num_strand_gaussians = gaussians._strand_id.shape[0]
+    strand_mask = torch.zeros(gaussians.num_gaussians, dtype=torch.bool, device=gaussians._xyz.device)
+    strand_mask[:num_strand_gaussians] = True
+    
+    # Only compute complexity and scale for the strand Gaussians
+    complexity = w_k * gaussians.kappa.abs() + w_t * gaussians.tau.abs()
+    sigma_parallel = gaussians.get_scaling[strand_mask, 1]
+
+    loss = complexity * sigma_parallel
+    
+    return loss.mean()
 
 def color_variance_loss_sh(gaussians) -> torch.Tensor:
     """

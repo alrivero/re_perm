@@ -28,7 +28,6 @@ def save_pc_as_obj(pts, fpath="debug_points.obj", rgb=None):
     Usage (inside pdb):
         >>> save_pc_as_obj(my_tensor, "/tmp/pc.obj")
     """
-    import numpy as np, torch
 
     # --- bring everything to CPU-numpy ---------------------------------
     if isinstance(pts, torch.Tensor):
@@ -116,8 +115,9 @@ class HairRoots(nn.Module):
         head_mesh: str,
         scalp_vertex_idxs: Optional[List[int]] = None,   # <-- list of vertex indices
         scalp_bounds: Optional[List[float]] = None,
-        mask_resolution: int = 256,                    # <-- UV-mask size (H = W)
-        mesh_scale: float = 1.0
+        mesh_scale: float = 1.0,
+        mesh_translate: np.array = None,
+        mean_center_before_rigid: bool = True
     ) -> None:
         """
         Args:
@@ -130,6 +130,12 @@ class HairRoots(nn.Module):
 
         # ── load mesh & build centroid ───────────────────────────────
         self.head = trimesh.load(head_mesh)
+
+        # Translate, then scale here. Meant to align with FLAME canonical space.
+        if mean_center_before_rigid:
+            self.head.vertices -= self.head.vertices.mean(axis=0)
+        if mesh_translate is not None:
+            self.head += mesh_translate
         self.head.vertices *= mesh_scale
 
         centroid = (self.head.bounds[0] + self.head.bounds[1]) / 2.0
@@ -830,21 +836,22 @@ class HairRoots(nn.Module):
         uv_tensor = torch.from_numpy(uv_sel.astype(np.float32)).to(device)
         all_xyz = self.spherical_to_cartesian(uv_tensor)  # (N,3)
 
-        # ─── Culling via pseudo_roots (NEW) ─────────────────────────────────────
-        if pseudo_roots is not None and pseudo_roots.numel() > 0:
-            # 1) Project pseudo_roots to mesh & collect hit faces (original mesh!)
-            pseudo_np = pseudo_roots.detach().cpu().numpy()
-            _, _, faces_hit = self.head.nearest.on_surface(pseudo_np)
-            valid_faces = set(int(f) for f in faces_hit)
+        culled_xyz = all_xyz  # keep everything by default
+        if self.scalp_vertex_idxs is not None and len(self.scalp_vertex_idxs):
+            # Cache the list of faces made exclusively of scalp-vertices
+            if not hasattr(self, "_scalp_face_indices"):
+                faces_np   = self.head.faces                 # (F,3)
+                in_mask    = np.isin(faces_np, list(self.scalp_vertex_idxs))
+                valid_mask = np.all(in_mask, axis=1)
+                self._scalp_face_indices = np.where(valid_mask)[0]
 
-            # 2) For each sampled root, find nearest face on ORIGINAL mesh
-            all_xyz_np = all_xyz.detach().cpu().numpy()
-            _, _, root_faces = self.head.nearest.on_surface(all_xyz_np)
-            mask = np.isin(root_faces, list(valid_faces))
-            culled_np = all_xyz_np[mask]
-            culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
-        else:
-            culled_xyz = all_xyz  # no culling requested
+            if len(self._scalp_face_indices):
+                # For each candidate, find which face it projects onto
+                xyz_np = all_xyz.detach().cpu().numpy()
+                _, _, root_faces = self.head.nearest.on_surface(xyz_np)
+                keep = np.isin(root_faces, self._scalp_face_indices)
+                culled_np  = xyz_np[keep]
+                culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
 
         return all_xyz, hex_radius, culled_xyz
 
@@ -902,18 +909,23 @@ class HairRoots(nn.Module):
         all_xyz = self.spherical_to_cartesian(uv_tensor)  # (M,3)
 
         # ─── Culling via pseudo_roots (NEW) ─────────────────────────────────────
-        if pseudo_roots is not None and pseudo_roots.numel() > 0:
-            pseudo_np = pseudo_roots.detach().cpu().numpy()
-            _, _, faces_hit = self.head.nearest.on_surface(pseudo_np)
-            valid_faces = set(int(f) for f in faces_hit)
+        culled_xyz = all_xyz  # keep everything by default
 
-            all_xyz_np = all_xyz.detach().cpu().numpy()
-            _, _, root_faces = self.head.nearest.on_surface(all_xyz_np)
-            mask = np.isin(root_faces, list(valid_faces))
-            culled_np = all_xyz_np[mask]
-            culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
-        else:
-            culled_xyz = all_xyz
+        if self.scalp_vertex_idxs is not None and len(self.scalp_vertex_idxs):
+            # Cache the list of faces made exclusively of scalp-vertices
+            if not hasattr(self, "_scalp_face_indices"):
+                faces_np   = self.head.faces                 # (F,3)
+                in_mask    = np.isin(faces_np, list(self.scalp_vertex_idxs))
+                valid_mask = np.all(in_mask, axis=1)
+                self._scalp_face_indices = np.where(valid_mask)[0]
+
+            if len(self._scalp_face_indices):
+                # For each candidate, find which face it projects onto
+                xyz_np = all_xyz.detach().cpu().numpy()
+                _, _, root_faces = self.head.nearest.on_surface(xyz_np)
+                keep = np.isin(root_faces, self._scalp_face_indices)
+                culled_np  = xyz_np[keep]
+                culled_xyz = torch.from_numpy(culled_np.astype(np.float32)).to(device)
 
         return all_xyz, hex_radius_new, culled_xyz
     @torch.no_grad()

@@ -52,13 +52,11 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._perm_path = ""
         self._obj_head_path = ""
-        self._loaded_roots_path = ""
-        self._nphm_config_path = ""
-        self._geo_nphm_path = ""
-        self._app_nphm_path = ""
-        self._xp_nphm_path = ""
-        self._dict_loaded_nphm_path = ""
-        self._cached_roots_path = "roots.pt"
+
+        self._vertex_idxs_scalp = ""
+        self._joints_smplx = ""
+        self._data_smplx = ""
+
         self._emp_hair_path = ""
         self._images = "images"
         self._resolution = -1
@@ -83,7 +81,7 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 150_000
+        self.iterations = 40_000
         self.theta_warmup = 1
 
         self.theta_lr_init = 0.000250
@@ -91,8 +89,8 @@ class OptimizationParams(ParamGroup):
         self.beta_lr_init = 0.000250
         self.beta_lr_final = 0.00025
         self.perm_lr_delay_mult = 0.01
-        self.perm_lr_max_steps = 150_000
-        self.uncertainty_lr_max_steps = 150_000
+        self.perm_lr_max_steps = 40_000
+        self.uncertainty_lr_max_steps = 40_000
 
         # self.position_lr_init = 0.00016
         # self.position_lr_final = 0.0000016
@@ -118,8 +116,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_huber = 800 # 1000.0 * 0.7
         self.lambda_seg = 10000.0 * 5.0
         self.lambda_orient = 125.0 * 5.0
-        self.lambda_sdf_contain = 0.0
-        self.lambda_sdf_flow = 0.0
+        self.lambda_geom_fit = 5000
         self.lambda_neigh = 0.1
         self.lambda_out = 0.0
         self.lambda_ori_match = 1e2
@@ -133,12 +130,12 @@ class OptimizationParams(ParamGroup):
         self.lambda_local_len = 300000.0
         self.lambda_color_var = 10000.0
         self.lambda_asg_var = 10000.0
-        self.lambda_opacity_var = 1e8
+        self.lambda_opacity_var = 1e10
         self.lambda_theta_l2 = 0.000000 # 4
         self.lambda_beta_l2 = 0.000000
         self.lambda_scale_reg = 0.0
-        self.lambda_flame_rot_reg = 3e1
-        self.lambda_flame_trans_reg = 3e2
+        self.lambda_flame_rot_reg = 3e4
+        self.lambda_flame_trans_reg = 3e5
         self.lambda_dssim = 0.2
         self.lambda_uncertainty_kl = 100.0 * 3 * 20 * 4
         self.lambda_dice = 75.0  
@@ -147,11 +144,12 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100 # 7500
         self.opacity_reset_interval = 3500
         self.densify_from_iter = 500
-        self.densify_until_iter = 0 # 22500
+        self.densify_until_iter = 25000 # 22500
         self.densify_grad_threshold = 0.0002
 
-        self.densify_strands_from_iter = 100
-        self.densify_strands_until_iter = 8001
+        self.min_opacity = 0.005
+        self.densify_strands_from_iter = 500
+        self.densify_strands_until_iter = 18001
         self.densification_strand_interval = 2000 # 5000
         super().__init__(parser, "Optimization Parameters")
 

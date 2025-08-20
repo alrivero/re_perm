@@ -42,8 +42,10 @@ class Perm(nn.Module):
         model_path: str,
         head_mesh: str,
         scalp_vertex_idxs: Optional[List[int]] = None,
-        scalp_bounds: Optional[Tuple[float]] = None,
-        mesh_scale: float = 1.0
+        scalp_bounds: Optional[List[int]] = None,
+        mesh_scale: float = 1.0,
+        mesh_translate: np.array = None,
+        mean_center_before_rigid: bool = True
     ):
         super().__init__()
 
@@ -70,7 +72,9 @@ class Perm(nn.Module):
             head_mesh,
             scalp_vertex_idxs=scalp_vertex_idxs,
             scalp_bounds=scalp_bounds,
-            mesh_scale=mesh_scale
+            mesh_scale=mesh_scale,
+            mesh_translate=mesh_translate,
+            mean_center_before_rigid=mean_center_before_rigid
         )
 
         # Compute guide_roots buffer

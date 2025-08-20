@@ -21,6 +21,7 @@ import pickle
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 from pxr import Usd, UsdGeom, Gf
+import torch.nn.functional as F
 
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -307,7 +308,7 @@ def quaternion_to_rotation_matrix(quaternions):
     # Calculate rotation matrix elements
     aa, bb, cc, dd = a*a, b*b, c*c, d*d
     ab, ac, ad, bc, bd, cd = a*b, a*c, a*d, b*c, b*d, c*d
-
+ 
     # Form the rotation matrix
     rotation_matrix = torch.stack([
         torch.stack([aa + bb - cc - dd, 2 * (bc - ad), 2 * (bd + ac)]),
@@ -317,7 +318,71 @@ def quaternion_to_rotation_matrix(quaternions):
 
     return rotation_matrix
 
-def project_to_screen(points, all_k, all_w2c, width=512, height=512):
+def project_gaussians_to_screen_uv(gaussians, camera, mask_to_project):
+    """
+    Projects a SUBSET of 3D world-space Gaussian centers to integer pixel coordinates.
+    """
+    # Only project the Gaussians specified by the mask
+    xyz = gaussians.get_xyz[mask_to_project]
+
+    if xyz.shape[0] == 0:
+        return torch.tensor([], device=xyz.device, dtype=torch.long), \
+               torch.tensor([], device=xyz.device, dtype=torch.long)
+
+    # Add homogeneous coordinate
+    points = torch.cat((xyz, torch.ones((xyz.shape[0], 1), device=xyz.device)), dim=-1)
+    points = points.unsqueeze(0)
+
+    # Get camera matrices
+    w2c = camera.w2c.unsqueeze(0)
+    k = camera.projection_matrix[:3, :3].unsqueeze(0)
+    height, width = camera.image_height, camera.image_width
+
+    # Transform to camera space and perform perspective divide
+    points_cam = torch.bmm(points, w2c.transpose(1, 2))
+    points_cam = points_cam[:, :, :3]
+    points_cam /= (points_cam[:, :, [2]] + 1e-9)
+
+    # Transform to screen space UV coordinates
+    points_screen = torch.bmm(points_cam, k.transpose(1, 2))[:, :, :2]
+    
+    u = (points_screen[:, :, 0] + 1.0) * 0.5 * width
+    v = (points_screen[:, :, 1] + 1.0) * 0.5 * height
+    
+    return u.squeeze(0), v.squeeze(0)
+
+
+def create_outside_mask(gaussians, camera, occ_mask, gt_alpha):
+    """
+    Creates a boolean mask identifying Gaussians that project outside the gt_alpha mask.
+    This version correctly uses the occlusion mask for efficiency.
+    """
+    dev = gaussians.get_xyz.device
+    
+    # --- FIX: Project ONLY the potentially visible Gaussians ---
+    visible_indices = occ_mask.nonzero(as_tuple=False).squeeze(1)
+    if visible_indices.numel() == 0:
+        return torch.zeros(gaussians.num_gaussians, dtype=torch.bool, device=dev)
+        
+    u, v = project_gaussians_to_screen_uv(gaussians, camera, occ_mask)
+    
+    # Clamp coordinates to be within the image bounds for sampling
+    H, W = gt_alpha.shape[-2:]
+    u_clamped = torch.clamp(u.round().long(), 0, W - 1)
+    v_clamped = torch.clamp(v.round().long(), 0, H - 1)
+
+    # Sample the mask at the visible Gaussian locations
+    mask_values = gt_alpha.squeeze()[v_clamped, u_clamped]
+    is_outside_visible = mask_values < 0.1
+    
+    # Create the final mask for ALL Gaussians
+    outside_mask = torch.zeros(gaussians.num_gaussians, dtype=torch.bool, device=dev)
+    # Scatter the results back to their original positions
+    outside_mask[visible_indices] = is_outside_visible
+    
+    return outside_mask
+
+def project_to_screen(points, all_k, all_w2c, height=512, width=512):
     points = torch.cat((points, torch.ones((len(points), 1)).cuda()), dim=-1)
     points = points.unsqueeze(0).expand(len(all_k), -1, -1)
 

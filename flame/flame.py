@@ -584,6 +584,7 @@ class FlameHead(nn.Module):
         return_normals=False,      # ─ new
         return_trimesh=False,      # ─ new
     ):
+        import pdb; pdb.set_trace()
         """
         Generates a posed FLAME mesh and optional extras.
 
