@@ -31,7 +31,7 @@ from scene import Scene_mica
 from src.perm_deform_model import PermDeformModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.general_utils import save_tensor_to_ply, export_strands_as_obj, export_strands_to_usd, save_tensor_to_obj, average_opacity_for_strand, average_opacity_per_strand, compute_occlusion_mask, create_outside_mask
+from utils.general_utils import save_tensor_to_ply, export_strands_as_obj, export_strands_to_usd, save_tensor_to_obj, average_opacity_for_strand, average_opacity_per_strand, compute_occlusion_mask, create_outside_mask, blur_orientation_map
 from utils.loss_utils import (
     orientation_loss_v2_debug,
     neighbour_orientation_loss,
@@ -181,7 +181,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--idname", type=str, default="id1_25")
-    parser.add_argument('--image_res', type=int, nargs=2, default=[1280, 720], metavar=('WIDTH', 'HEIGHT'))
+    parser.add_argument('--image_res', type=int, nargs=2, default=[1920, 1080], metavar=('WIDTH', 'HEIGHT'))
     parser.add_argument("--start_checkpoint", type=str, default=None)
     # Ensure OptimizationParams defines:
     #   lambda_color_var, lambda_local_len, lambda_strand_rep
@@ -218,7 +218,8 @@ if __name__ == "__main__":
         data_dir,
         white_background=lpt.white_background,
         device=args.device,
-        img_dim=args.image_res
+        img_dim=args.image_res,
+        focal_scale=0.5
     )
     all_cameras = scene.getCameras().copy()
     viewpoint_stack = None
@@ -248,7 +249,9 @@ if __name__ == "__main__":
     if lpt.emp_hair_path:
         start_hair_style = np.load(lpt.emp_hair_path)
 
-    gaussians = GaussianPerm(perm, start_hair_style, lpt.sh_degree, lpt.asg_degree, smplx_params["global_scale"].item()).to(args.device)
+    num_init_strands = 1500
+
+    gaussians = GaussianPerm(perm, start_hair_style, lpt.sh_degree, lpt.asg_degree, smplx_params["global_scale"].item(), num_strands=num_init_strands).to(args.device)
     gaussians.roots = gaussians.roots.to(args.device)
     save_tensor_to_obj(gaussians.roots, os.path.join(train_dir, "roots.obj"))
 
@@ -302,11 +305,11 @@ if __name__ == "__main__":
     first_iter = 0
     uniform_strand_color = False
     enable_uncertainty = False
-    densify_count = 1
+    densify_count = 0
     densify_on_start = False
 
     if args.start_checkpoint:
-        (g_params, first_iter, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var) = torch.load(args.start_checkpoint)
+        (g_params, first_iter, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var, num_init_strands) = torch.load(args.start_checkpoint)
         gaussians.restore(g_params, opt, extra_parameters=extra_parameters)
         specular_mlp.load_weights(model_dir, iteration=first_iter)
         uncertainty_mlp.load_weights(model_dir, iteration=first_iter)
@@ -325,9 +328,9 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device=args.device)
 
     hair_photo_loss = HairDetailLoss(
-        warmup_iters=8000,
-        fade_iters=12000,
-        polish_iters=5000,
+        warmup_iters=20000,
+        fade_iters=30000,
+        polish_iters=10000,
         blur=True,
         device=args.device
     )
@@ -347,7 +350,6 @@ if __name__ == "__main__":
 
 
     head_faces = torch.tensor(list(perm.hair_roots.head.faces)).to(args.device)
-    bp = False
 
     for it in range(first_iter + 1, opt.iterations + 1):
         if it % 500 == 0:
@@ -390,13 +392,12 @@ if __name__ == "__main__":
            head_final,
            head_final_def,
            normals_final,
-           normals_final_def
+           normals_final_def,
+           perm_coeff
         ) = deform_model.decode(gaussians, codedict)
         strand_pts_can = verts_final.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
         strand_pts = verts_final_def.reshape(gaussians.num_strands, STRAND_VERTEX_COUNT, 3)
 
-        if bp:
-            import pdb; pdb.set_trace()
         tangents = gaussians.update_xyz_rot_scale(strand_pts, scalp_final_def)
 
         gt_img    = cam.original_image
@@ -408,7 +409,7 @@ if __name__ == "__main__":
             gaussians.set_scalp_opacity(scalp_final)
             gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
 
-        if it >= 3000:
+        if False:
             dir_pp = (gaussians.get_xyz - cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
             spec_color = specular_mlp.step(gaussians.get_asg_features, dir_pp_normalized, tangents)
@@ -459,11 +460,13 @@ if __name__ == "__main__":
 
         guide_pts = guide_final.reshape(-1, STRAND_VERTEX_COUNT, 3)
 
+        orient = blur_orientation_map(orient, 2 ** (4 - densify_count))
+
         loss_o                    = kappa * orientation_loss_v2_debug(cam, gaussians, alpha, orient, occ_mask)
         loss_geom_fit             = geometric_fit_loss(gaussians)
         loss_nei                  = neighbour_orientation_loss(strand_pts[:, :STRAND_VERTEX_COUNT, :], gaussians.neighbor_idx)
         loss_bend                 = bending_loss(strand_pts)
-        loss_sobel                = torch.tensor(0.0).to(args.device)
+        loss_sobel                = 10000 * -torch.log(perm_coeff[:, 10:].abs().mean() + 1e-8)
         loss_head_col             = head_collision_loss(strand_pts, head_final_def, normals_final_def)
         loss_gauss_head_col       = gaussian_head_collision_loss(gaussians, head_final_def, normals_final_def)
         loss_local_len            = local_length_consistency_loss(gaussians)
@@ -569,8 +572,6 @@ if __name__ == "__main__":
         viewspace_point_tensor = render_pkg["viewspace_points"]
 
         # track running ∥∇xy∥ statistics
-        if bp:
-            import pdb; pdb.set_trace()
         gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, occ_mask, outside_mask)
 
         # densify / prune within schedule window
@@ -579,7 +580,7 @@ if __name__ == "__main__":
         if densify_on_start or (it < opt.densify_strands_until_iter and it > opt.densify_strands_from_iter and it % opt.densification_strand_interval == 0):
             
             torch.save(
-                (gaussians.capture(), it, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var),
+                (gaussians.capture(), it, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var, num_init_strands),
                 os.path.join(model_dir, f"chkpnt_{it:06d}_pre_dense.pth")
             )
             specular_mlp.save_weights(model_dir, it)
@@ -588,7 +589,7 @@ if __name__ == "__main__":
             
             if not densify_on_start:
                 densify_count += 1
-                uniform_strand_color = densify_count >= 3
+                uniform_strand_color = densify_count > 3
 
             new_roots, new_radii, new_roots_culled = perm.hair_roots.densify_scalp_hex()
             while new_roots_culled.shape[0] <= gaussians.roots.shape[0]:
@@ -601,40 +602,38 @@ if __name__ == "__main__":
             save_tensor_to_obj(gaussians.roots, os.path.join(train_dir, f"roots_{it}.obj"))
 
             if not densify_on_start:
-                opt.densification_strand_interval *= 3
-                opt.densify_from_iter = 1 + it
+                opt.densification_strand_interval = opt.densification_strand_interval + (2000 + densify_count * 2000)
+                opt.densify_from_iter = 500 + it
                 opt.lambda_color_var *= 10.0
                 opt.lambda_opacity_var *= 10.0
             densify_on_start = False
             gaussians.set_scalp_opacity(scalp_final)
 
-        if it < opt.densify_until_iter and it > opt.densify_from_iter \
-                                        and it % opt.densification_interval == 0:
-            if occ_mask is not None:
-                with torch.no_grad():
-                    radii = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, spec_color=spec_color)["radii"]
+        # if it < opt.densify_until_iter and it > opt.densify_from_iter \
+        #                                 and it % opt.densification_interval == 0:
+        #     if occ_mask is not None:
+        #         with torch.no_grad():
+        #             radii = render(cam, gaussians, ppt, background, kernel_size=lpt.kernel_size, spec_color=spec_color)["radii"]
                                         
-            size_threshold = 20 if it > opt.opacity_reset_interval else None
-            n_split, n_clone, n_merge, n_prune = gaussians.densify_and_prune(
-                radii=radii,
-                grad_thresh=opt.densify_grad_threshold,
-                min_opac=opt.min_opacity 
-            )
-            print(f"\n[ITER {it}] Gaussians Cloned: {n_clone} Gaussians Split {n_split} Gaussians Merged {n_merge} Gaussians Pruned {n_prune}\n")
-            print(f"\n[ITER {it}] Scale Min: {gaussians.get_scaling[:, 1].min()}, Scale Max: {gaussians.get_scaling[:, 1].max()}, Scale Median: {gaussians.get_scaling[:, 1].median()}\n")
-            print(f"\n[ITER {it}] 5th Quantile: {gaussians.get_scaling[:, 1].quantile(0.05)}, 10th Quantile: {gaussians.get_scaling[:, 1].quantile(0.10)}, 15th Quantile: {gaussians.get_scaling[:, 1].quantile(0.15)}\n")
+        #     size_threshold = 20 if it > opt.opacity_reset_interval else None
+        #     n_split, n_clone, n_merge, n_prune = gaussians.densify_and_prune(
+        #         radii=radii,
+        #         grad_thresh=opt.densify_grad_threshold,
+        #         min_opac=opt.min_opacity 
+        #     )
+        #     print(f"\n[ITER {it}] Gaussians Cloned: {n_clone} Gaussians Split {n_split} Gaussians Merged {n_merge} Gaussians Pruned {n_prune}\n")
+        #     print(f"\n[ITER {it}] Scale Min: {gaussians.get_scaling[:, 1].min()}, Scale Max: {gaussians.get_scaling[:, 1].max()}, Scale Median: {gaussians.get_scaling[:, 1].median()}\n")
+        #     print(f"\n[ITER {it}] 5th Quantile: {gaussians.get_scaling[:, 1].quantile(0.05)}, 10th Quantile: {gaussians.get_scaling[:, 1].quantile(0.10)}, 15th Quantile: {gaussians.get_scaling[:, 1].quantile(0.15)}\n")
 
-            num_reset = gaussians.halve_large_parallel_sigmas()
-            print(f"Gaussians Scales Halved: {num_reset}")
-
-            if n_clone + n_split + n_merge + n_prune > 0:
-                gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
-            
-            bp  = True
-
-        # if it % 100 == 0:
         #     num_reset = gaussians.halve_large_parallel_sigmas()
         #     print(f"Gaussians Scales Halved: {num_reset}")
+
+        #     if n_clone + n_split + n_merge + n_prune > 0:
+        #         gaussians.compute_3D_filter(cameras=all_cameras, device=args.device)
+
+        if it % 100 == 0:
+            num_reset = gaussians.halve_large_parallel_sigmas()
+            print(f"Gaussians Scales Halved: {num_reset}")
 
         # periodic global opacity reset (commented out)
         # if it < opt.densify_until_iter and \
@@ -739,6 +738,11 @@ if __name__ == "__main__":
                 os.path.join(train_dir, f"{it:06d}.obj")
             )
 
+            export_strands_as_obj(
+                strand_pts.detach(),
+                os.path.join(train_dir, f"{it:06d}_def.obj")
+            )
+
         if it % 2000 == 0 or it == 1:
             with torch.no_grad():
                 dense_roots = perm.hair_roots.sample_scalp_mesh(10000, gaussians.roots).to(args.device)
@@ -764,14 +768,14 @@ if __name__ == "__main__":
 
         if it % 10000 == 0 or it == 1:
             torch.save(
-                (gaussians.capture(), it, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var),
+                (gaussians.capture(), it, uniform_strand_color, enable_uncertainty, densify_count, densify_on_start, opt.densification_strand_interval, opt.densify_from_iter, opt.lambda_color_var, opt.lambda_opacity_var, num_init_strands),
                 os.path.join(model_dir, f"chkpnt_{it:06d}.pth")
             )
             specular_mlp.save_weights(model_dir, it)
             uncertainty_mlp.save_weights(model_dir, it)
             if lpt.learn_flame_rigid_offset:
                 torch.save(rotation_offsets, os.path.join(model_dir, f"flame_rot_{it:06d}.pth"))
-                torch.save(translation_offsets, os.path.join(model_dir, f"flame_trans_{it:06d}.pth"))
+                torch.save(translation_offsets, os.path.jo in(model_dir, f"flame_trans_{it:06d}.pth"))
             print(f"\n[ITER {it}] Checkpoint saved.\n")
 
         cam.load2device("cpu")

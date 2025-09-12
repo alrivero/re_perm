@@ -19,9 +19,9 @@ SCALE_DIVISOR = 1
 class GaussianPerm(nn.Module):
     def __init__(self, perm,
                  start_hair_style, sh_degree, asg_degree, global_scale,
-                 num_strands=2500,
+                 num_strands=1500,
                  neighbor_k=6,
-                 num_gaussians=2000000):
+                 num_gaussians=3000000):
         super().__init__()
 
         self.perm          = perm
@@ -230,7 +230,7 @@ class GaussianPerm(nn.Module):
 
         # ── 6) Default scale bases ──────────────────────────────────────────
         sigma_perp0 = thick_perp * self.global_scale
-        sigma_par0  = sigma_perp0 * par_ratio * self.global_scale
+        sigma_par0  = sigma_perp0 * par_ratio
         log0        = torch.tensor([sigma_perp0, sigma_par0, sigma_perp0],
                                 device=device).log()
         self._scaling_base = nn.Parameter(log0.expand(M,3).clone(), requires_grad=True)
@@ -305,7 +305,7 @@ class GaussianPerm(nn.Module):
         scalp_opac = self.inverse_opacity_activation(1.0 * torch.ones((N_scalp,1), device=device))
 
         # e) scaling: use same default log σ, making them disk‑like later
-        log0 = torch.tensor([self.global_strand_radii * self.global_scale, thick_perp * self.global_scale, self.global_strand_radii * self.global_scale],
+        log0 = torch.tensor([self.global_strand_radii * 2 * self.global_scale, thick_perp * self.global_scale, self.global_strand_radii * 2 * self.global_scale],
                             device=device).log()
         scalp_scale = log0.expand(N_scalp,3).clone()
         self.scalp_radii = self.global_strand_radii * self.global_scale
@@ -373,7 +373,7 @@ class GaussianPerm(nn.Module):
         self,
         new_roots: torch.Tensor,         # (S_new, 3) in metres
         new_radii: float = 1.0,
-        total_gaussians: int = 2_000_000,
+        total_gaussians: int = 3_500_000,
         thick_perp: float = 5.645693247264717e-05,
         par_ratio:   float = 20.0,
         k_neighbors: int   = 1,
@@ -1739,8 +1739,9 @@ class GaussianPerm(nn.Module):
     def halve_large_parallel_sigmas(
         self,
         thick_perp: float = 5.645693247264717e-05,  # default σ⊥
-        par_ratio:  float = 20.0,                  # default σ‖ / σ⊥
-        thresh_mul_perp: float = 3.0                    # clamp when σ‖ ≥ 3× default
+        par_ratio:  float = 10.0,                  # default σ‖ / σ⊥
+        thresh_mul_perp: float = 2.25,                    # clamp when σ‖ ≥ 3× default
+        thresh_mul_para: float = 2.25                    # clamp when σ‖ ≥ 3× default
     ) -> int:
         """
         If σ‖ ≥ thick_perp * par_ratio * thresh_mul, divide that σ‖ by two.
@@ -1749,19 +1750,25 @@ class GaussianPerm(nn.Module):
 
         # 1. Current sigmas for those rows
         sigma_perp = self._scaling_base[:len(self._strand_id), 0].exp()   # σ⊥   (N_scalp,)
+        sigma_para = self._scaling_base[:len(self._strand_id), 1].exp()
         threshold_perp = thick_perp * thresh_mul_perp * self.global_scale
+        threshold_para = thick_perp * thresh_mul_perp * self.global_scale * par_ratio
 
         # 2. Offending gaussians
-        mask = (sigma_perp >= threshold_perp)
-        n_fixed = int(mask.sum().item())
+        perp_mask = (sigma_perp >= threshold_perp)
+        para_mask = (sigma_para >= threshold_para)
+        n_fixed = int(para_mask.sum().item()) + int(perp_mask.sum().item())
         if n_fixed == 0:
             return 0
 
         # 3. Halve both σ‖ and σ⊥ for masked rows → subtract ln 2 in log‑space
         idx_fix = torch.zeros(len(self._scaling_base)).bool()
-        idx_fix[:len(self._strand_id)] = mask
+        idx_fix[:len(self._strand_id)] = perp_mask
         self._scaling_base.data[idx_fix, 0] -= math.log(thresh_mul_perp)   # σ⊥ /2  (cap size)
 
+        idx_fix = torch.zeros(len(self._scaling_base)).bool()
+        idx_fix[:len(self._strand_id)] = para_mask
+        self._scaling_base.data[idx_fix, 1] -= math.log(thresh_mul_para)   # σ⊥ /2  (cap size)
         return n_fixed
 
     # ================================================================
@@ -2029,8 +2036,6 @@ class GaussianPerm(nn.Module):
         M0 = self._strand_id.shape[0]
         dev = self._xyz.device
 
-        import pdb; pdb.set_trace()
-
         # 0) Aggregate running diagnostics from the period since the last densification
         denom = self.strand_grad_denom[:M0].clamp(min=1e-9)
         avg_gkappa = (self.strand_grad_kappa_accum[:M0] / denom).squeeze(-1)
@@ -2078,15 +2083,16 @@ class GaussianPerm(nn.Module):
         merge_victims_indices = torch.tensor([pair[1] for pair in merge_pairs], device=dev, dtype=torch.long) if merge_pairs else torch.tensor([], device=dev, dtype=torch.long)
         
         combined_prune_mask = torch.zeros(M0, dtype=torch.bool, device=dev)
-        combined_prune_mask[merge_victims_indices] = True
+        combined_prune_mask[merge_victims_indices] = False # TRUE
         combined_prune_mask |= opacity_prune_mask
-        combined_prune_mask |= split_mask
+        # combined_prune_mask |= split_mask
 
         # clone_mask[combined_prune_mask] = False
         # import pdb; pdb.set_trace()
 
         
-        n_merge = self._merge(merge_pairs)
+        # n_merge = self._merge(merge_pairs)
+        n_merge = 0
         split_children_tensors = self._get_split_children(split_mask)
         # clone_children_tensors = self._get_clone_children(clone_mask)
         
@@ -2094,7 +2100,8 @@ class GaussianPerm(nn.Module):
         full_prune_mask[:M0] = combined_prune_mask
         n_prune_total = self._prune(full_prune_mask)
         
-        n_split = self._add_new_gaussians(split_children_tensors)
+        n_split = 0
+        # n_split = self._add_new_gaussians(split_children_tensors)
         # n_clone = self._add_new_gaussians(clone_children_tensors)
 
         # 4) Final bookkeeping: Reset accumulators for the next densification window

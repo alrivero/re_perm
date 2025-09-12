@@ -5,6 +5,52 @@ import os
 import csv
 from pathlib import Path
 
+def fft_upscale(channel, target_size):
+    """
+    Upscales a single channel image using Fourier Transform.
+
+    Args:
+        channel (np.ndarray): The single-channel source image.
+        target_size (tuple): The target (width, height).
+
+    Returns:
+        np.ndarray: The upscaled single-channel image.
+    """
+    # 1. Get original and target dimensions
+    h_orig, w_orig = channel.shape
+    w_new, h_new = target_size
+
+    # 2. Perform 2D FFT and shift the zero-frequency component to the center
+    f_transform = np.fft.fft2(channel)
+    f_shifted = np.fft.fftshift(f_transform)
+
+    # 3. Create a new, larger array for the padded frequency domain
+    #    and copy the original frequency data to its center.
+    new_f_shifted = np.zeros((h_new, w_new), dtype=np.complex128)
+    
+    y_start = (h_new - h_orig) // 2
+    x_start = (w_new - w_orig) // 2
+    
+    new_f_shifted[y_start:y_start + h_orig, x_start:x_start + w_orig] = f_shifted
+
+    # 4. Inverse shift to move zero-frequency back to the corner
+    new_f = np.fft.ifftshift(new_f_shifted)
+
+    # 5. Perform inverse 2D FFT
+    img_new_complex = np.fft.ifft2(new_f)
+    
+    # 6. Take the real part and normalize the amplitude
+    #    The amplitude scales with the number of elements, so we must correct for it.
+    img_new = np.real(img_new_complex)
+    scale_factor = (h_new * w_new) / (h_orig * w_orig)
+    img_new *= scale_factor
+
+    # 7. Clip to valid image range and convert to uint8
+    img_new = np.clip(img_new, 0, 255)
+    
+    return img_new.astype(np.uint8)
+
+
 def main():
     """Parse arguments and reconstruct images (optionally onto a scaled canvas)."""
     parser = argparse.ArgumentParser(
@@ -42,8 +88,6 @@ def main():
     output_path = Path(args.output_dir)
     log_path = Path(args.log_file)
     output_path.mkdir(parents=True, exist_ok=True)
-
-    # The fill color is parsed as (R, G, B), but OpenCV uses (B, G, R)
     fill_bgr = args.fill_color[::-1]
 
     # --- Read Log File ---
@@ -51,7 +95,6 @@ def main():
         print(f"❌ Error: Log file not found at '{log_path}'")
         return
     
-    # Map original_filename -> row
     log_map = {}
     with open(log_path, 'r', newline='') as f:
         reader = csv.DictReader(f)
@@ -62,10 +105,6 @@ def main():
     image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']
     input_files = [p for p in input_path.iterdir() if p.suffix.lower() in image_extensions]
 
-    if len(log_map) != len(input_files):
-        print("⚠️ Warning: The number of images in the input directory does not match the number of entries in the log file.")
-        print(f"   Log entries: {len(log_map)}, Image files found: {len(input_files)}")
-    
     print(f"Found {len(input_files)} images to process and {len(log_map)} log entries.")
     if args.scale != 1.0:
         print(f"➡️  Using scale S = {args.scale}. Output canvases and placements will be scaled.")
@@ -75,81 +114,57 @@ def main():
         try:
             image_filename = image_to_place_path.name
             log_entry = log_map.get(image_filename)
-
             if log_entry is None:
-                print(f"   - Skipping '{image_filename}': No matching entry found in log file.")
+                print(f"   - Skipping '{image_filename}': No matching entry in log file.")
                 continue
 
-            # --- 1. Parse Log Data ---
+            # --- 1. Parse and Scale Geometry ---
             orig_w = int(log_entry['original_width'])
             orig_h = int(log_entry['original_height'])
             x1 = int(log_entry['top_left_x'])
             y1 = int(log_entry['top_left_y'])
-            crop_size = int(log_entry['crop_size_before_resize'])
-
-            # --- 2. Compute scaled geometry ---
             S = float(args.scale)
-            # Round to nearest integer to keep placements aligned to pixels
             scaled_w = max(1, int(round(orig_w * S)))
             scaled_h = max(1, int(round(orig_h * S)))
             x1_s = int(round(x1 * S))
             y1_s = int(round(y1 * S))
-            crop_s = max(1, int(round(crop_size * S)))
+            crop_s = max(1, int(round(int(log_entry['crop_size_before_resize']) * S)))
 
-            # --- 3. Create Canvas ---
+            # --- 2. Create Canvas ---
             canvas = np.full((scaled_h, scaled_w, 3), fill_bgr, dtype=np.uint8)
 
-            # --- 4. Load and Resize Image to Place ---
+            # --- 3. Load Image ---
             image_to_place = cv2.imread(str(image_to_place_path), cv2.IMREAD_UNCHANGED)
             if image_to_place is None:
                 print(f"   - Skipping '{image_filename}': Could not be read by OpenCV.")
                 continue
             
-            # Ensure 3-channel BGR
             if image_to_place.ndim == 2:
                 image_to_place = cv2.cvtColor(image_to_place, cv2.COLOR_GRAY2BGR)
             elif image_to_place.shape[2] == 4:
                 image_to_place = image_to_place[:, :, :3]
 
-            # First, ensure it matches the *unscaled* crop size from the log
-            if image_to_place.shape[:2] != (crop_size, crop_size):
-                image_to_place = cv2.resize(
-                    image_to_place, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR
-                )
-            # Then scale it to the scaled crop size for the scaled canvas
-            if crop_s != crop_size:
-                image_to_place = cv2.resize(
-                    image_to_place, (crop_s, crop_s), interpolation=cv2.INTER_LINEAR
-                )
+            # --- 4. Resize if Necessary ---
+            target_size = (crop_s, crop_s)
+            if image_to_place.shape[:2] != target_size:
+                b_channel, g_channel, r_channel = cv2.split(image_to_place)
+                b_resized = fft_upscale(b_channel, target_size)
+                g_resized = fft_upscale(g_channel, target_size)
+                r_resized = cv2.resize(r_channel, target_size, interpolation=cv2.INTER_NEAREST)
+                image_to_place = cv2.merge([b_resized, g_resized, r_resized])
 
-            # --- 5. Place Image on Canvas with safe clipping ---
-            # Target region on canvas: [y1_s : y1_s+crop_s, x1_s : x1_s+crop_s]
-            y0_t = y1_s
-            x0_t = x1_s
-            y1_t = y1_s + crop_s
-            x1_t = x1_s + crop_s
-
-            # Clip to canvas bounds
-            y0_c = max(0, y0_t)
-            x0_c = max(0, x0_t)
-            y1_c = min(scaled_h, y1_t)
-            x1_c = min(scaled_w, x1_t)
-
-            # Corresponding source window
-            src_y0 = y0_c - y0_t
-            src_x0 = x0_c - x0_t
-            src_y1 = src_y0 + (y1_c - y0_c)
-            src_x1 = src_x0 + (x1_c - x0_c)
-
+            # --- 5. Place Image on Canvas ---
+            y0_t, x0_t = y1_s, x1_s
+            y1_t, x1_t = y1_s + crop_s, x1_s + crop_s
+            y0_c, x0_c = max(0, y0_t), max(0, x0_t)
+            y1_c, x1_c = min(scaled_h, y1_t), min(scaled_w, x1_t)
+            src_y0, src_x0 = y0_c - y0_t, x0_c - x0_t
+            src_y1, src_x1 = src_y0 + (y1_c - y0_c), src_x0 + (x1_c - x0_c)
             if (y1_c > y0_c) and (x1_c > x0_c):
                 canvas[y0_c:y1_c, x0_c:x1_c] = image_to_place[src_y0:src_y1, src_x0:src_x1]
-            else:
-                # Entirely out of bounds after scaling; nothing to place
-                print(f"   - Warning for '{image_filename}': Scaled placement outside canvas; nothing placed.")
 
             # --- 6. Save Result ---
-            output_filename = log_entry['original_filename']  # keep original name
-            output_filepath = output_path / output_filename
+            output_filepath = output_path / log_entry['original_filename']
             cv2.imwrite(str(output_filepath), canvas)
 
         except KeyError as e:
@@ -158,7 +173,6 @@ def main():
             print(f"❌ An unexpected error occurred while processing {image_to_place_path.name}: {e}")
 
     print(f"\n✅ Reconstruction complete. Images are saved in '{output_path}'.")
-
 
 if __name__ == '__main__':
     main()

@@ -22,6 +22,7 @@ from pytorch3d.structures import Meshes
 from pytorch3d.renderer.mesh import rasterize_meshes
 from pxr import Usd, UsdGeom, Gf
 import torch.nn.functional as F
+import torchvision.transforms.functional as B
 
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -351,6 +352,64 @@ def project_gaussians_to_screen_uv(gaussians, camera, mask_to_project):
     
     return u.squeeze(0), v.squeeze(0)
 
+def blur_orientation_map(
+    image_tensor: torch.Tensor, 
+    scale_factor: int
+) -> torch.Tensor:
+    """
+    Applies a Gaussian blur to the vector channels of an orientation map tensor.
+
+    This function assumes the input tensor is in (C, H, W) format where C=3.
+    It blurs the last two channels (e.g., G and B, the vector components)
+    while leaving the first channel (e.g., R, the mask) untouched.
+    The blur parameters are derived from the scale_factor to simulate a lower
+    effective resolution. The operations are fully differentiable.
+
+    Args:
+        image_tensor (torch.Tensor): 
+            The input image tensor of shape (3, H, W).
+        scale_factor (int): 
+            The factor by which to blur, simulating a resolution of 1/S. 
+            For example, a factor of 16 blurs over a ~16x16 pixel area.
+
+    Returns:
+        torch.Tensor: The blurred tensor, same shape as the input.
+    """
+    # 1. Validate input shape
+    if not (image_tensor.dim() == 3 and image_tensor.shape[0] == 3):
+        raise ValueError("Input tensor must have shape (3, H, W)")
+
+    if scale_factor <= 0:
+        return image_tensor
+
+    # 2. Derive blur parameters from the scale factor
+    # Heuristic: sigma is about half the size of the window we want to average over.
+    sigma = float(scale_factor) / 2.0
+    
+    # Kernel size should be an odd integer, roughly 6x the sigma to capture the
+    # full distribution.
+    kernel_size = int(6 * sigma)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    
+    # 3. Separate the mask channel from the vector channels
+    # Assuming Channel 0 is the mask and Channels 1, 2 are vectors.
+    # Slicing with [0:1] and [1:3] preserves the channel dimension.
+    mask_channel = image_tensor[0:1, :, :]
+    vector_channels = image_tensor[1:3, :, :]
+
+    # 4. Apply Gaussian blur to the vector channels only
+    # This operation supports backpropagation.
+    blurred_vectors = B.gaussian_blur(
+        vector_channels, 
+        kernel_size=[kernel_size, kernel_size], 
+        sigma=sigma
+    )
+
+    # 5. Recombine the untouched mask with the blurred vectors
+    final_tensor = torch.cat([mask_channel, blurred_vectors], dim=0)
+
+    return final_tensor
 
 def create_outside_mask(gaussians, camera, occ_mask, gt_alpha):
     """

@@ -64,7 +64,7 @@ class ModelParams(ParamGroup):
         self._kernel_size = 0.1
         self.data_device = "cuda"
         self.eval = False
-        self.learn_flame_rigid_offset = True
+        self.learn_flame_rigid_offset = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -81,7 +81,7 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 40_000
+        self.iterations = 60_000
         self.theta_warmup = 1
 
         self.theta_lr_init = 0.000250
@@ -89,7 +89,7 @@ class OptimizationParams(ParamGroup):
         self.beta_lr_init = 0.000250
         self.beta_lr_final = 0.00025
         self.perm_lr_delay_mult = 0.01
-        self.perm_lr_max_steps = 40_000
+        self.perm_lr_max_steps = 60_000
         self.uncertainty_lr_max_steps = 40_000
 
         # self.position_lr_init = 0.00016
@@ -114,8 +114,8 @@ class OptimizationParams(ParamGroup):
         self.k_neigh = 8
 
         self.lambda_huber = 800 # 1000.0 * 0.7
-        self.lambda_seg = 10000.0 * 5.0
-        self.lambda_orient = 125.0 * 5.0
+        self.lambda_seg = 10000.0 * 5.0 * 2.0
+        self.lambda_orient = 125.0 * 5.0 * 5.0
         self.lambda_geom_fit = 5000
         self.lambda_neigh = 0.1
         self.lambda_out = 0.0
@@ -124,7 +124,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_len_consist = 1e11
         self.lambda_bend = 5e8
         self.lambda_smooth_scale = 1e7
-        self.lambda_sobel = 1e28
+        self.lambda_sobel = 0.0
         self.lambda_head_col = 300000.0
         self.lambda_gauss_head_col = 300000.0
         self.lambda_local_len = 300000.0
@@ -149,7 +149,7 @@ class OptimizationParams(ParamGroup):
 
         self.min_opacity = 0.005
         self.densify_strands_from_iter = 500
-        self.densify_strands_until_iter = 18001
+        self.densify_strands_until_iter = 21000
         self.densification_strand_interval = 2000 # 5000
         super().__init__(parser, "Optimization Parameters")
 

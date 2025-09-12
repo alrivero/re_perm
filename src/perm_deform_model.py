@@ -150,7 +150,8 @@ class PermDeformModel(nn.Module):
         head_final          = head_def          @ R_delta.T + t_delta
         normals_final       = F.normalize(normals_def @ R_delta.T, dim=1)
 
-        return strands_can, guide_strands_can, strands_final, guide_strands_final, scalp_can, scalp_final, head_can, head_final, normals_can, normals_final
+        perm_coeff = perm_out["coef"][0]
+        return strands_can, guide_strands_can, strands_final, guide_strands_final, scalp_can, scalp_final, head_can, head_final, normals_can, normals_final, perm_coeff
     
     def capture(self):
         return (

@@ -3,6 +3,7 @@ import random
 import json
 from PIL import Image
 import torch
+import pickle
 import math
 import numpy as np
 import cv2
@@ -85,7 +86,7 @@ class Scene_mica:
         # return negative log-likelihood as “score” to minimize
         return pi, alpha_param, beta_param, -log_lik, non_one_frac
 
-    def __init__(self, datadir, white_background, device, img_dim=(1280, 720)):
+    def __init__(self, datadir, white_background, device, img_dim=(1280, 720), focal_scale=0.5):
         ## train_type: 0 for train, 1 for test, 2 for eval
         images_folder = os.path.join(datadir, "images")
         hair_mask_folder = os.path.join(datadir, "hair_mask")
@@ -95,6 +96,20 @@ class Scene_mica:
         cameras_intrinsic_file = os.path.join(datadir, "sparse/0", "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+
+        cam_res_path = os.path.join(datadir, "camera_res.pkl")
+
+        # Load camera residuals if the fitted camera file exists
+        params_cam_rotation, params_cam_translation, params_cam_fov = {}, {}, {}
+        if os.path.exists(cam_res_path):
+            print(f"✅ [Scene] Loading fitted camera residuals from:\n  {cam_res_path}")
+            try:
+                with open(cam_res_path, 'rb') as f:
+                    params_cam_rotation, params_cam_translation, params_cam_fov = pickle.load(f)
+            except Exception as e:
+                print(f"❌ [Scene] Error loading fitted cameras: {e}. Using COLMAP defaults.")
+        else:
+            print("⚠️ [Scene] No fitted camera file found. Using COLMAP defaults.")
 
         H = img_dim[0]
         W = img_dim[1]
@@ -114,33 +129,36 @@ class Scene_mica:
         best_idx          = -1
         best_params       = None
 
-        for frame_id, key in enumerate(cam_extrinsics):
+        for frame_id, key in enumerate(tqdm(cam_extrinsics, desc="Loading camera data")):
             # 1. Gather our COLMAP cameras
             extr = cam_extrinsics[key]
             intr = cam_intrinsics[extr.camera_id]
             image_name_ori = str(int(Path(cam_extrinsics[key].name).stem)).zfill(6)
 
-            # 2. Get image data
-            image_path = os.path.join(images_folder, image_name_ori+'.png')
-            image = Image.open(image_path)
-            resized_image_rgb = PILtoTensor(image)
-            gt_image = resized_image_rgb[:3, ...]
-
-
             R = np.transpose(qvec2rotmat(extr.qvec))
             T = np.array(extr.tvec)
 
+            # Apply focal_scale to adjust intrinsics for the target rendering resolution
             if intr.model=="SIMPLE_PINHOLE":
-                focal_length_x = intr.params[0]
-                FovY = focal2fov(focal_length_x, H)
-                FovX = focal2fov(focal_length_x, W)
+                focal = intr.params[0] * focal_scale
+                FovY = focal2fov(focal, H)
+                FovX = focal2fov(focal, W)
             elif intr.model=="PINHOLE":
-                focal_length_x = intr.params[0]
-                focal_length_y = intr.params[1]
-                FovY = focal2fov(focal_length_y, H)
-                FovX = focal2fov(focal_length_x, W)
+                focal_x = intr.params[0] * focal_scale
+                focal_y = intr.params[1] * focal_scale
+                FovY = focal2fov(focal_y, H)
+                FovX = focal2fov(focal_x, W)
             else:
-                assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+                assert False, "Colmap camera model not handled."
+
+            # image data
+            try:
+                image_path = os.path.join(images_folder, image_name_ori+'.png')
+                image = Image.open(image_path)
+            except:
+                continue
+            resized_image_rgb = PILtoTensor(image)
+            gt_image = resized_image_rgb[:3, ...]
 
             # hair_mask
             hair_mask_path = os.path.join(hair_mask_folder, image_name_ori+'.png')
@@ -162,10 +180,19 @@ class Scene_mica:
                     best_params       = (pi, alpha, beta)
                     best_non_one_frac = non_one_frac
 
-            camera_indiv = Camera(colmap_id=frame_id, R=R, T=T, 
-                                FoVx=FovX, FoVy=FovY, 
+            # Get residuals for the current camera, defaulting to None if not found
+            rotation_res = params_cam_rotation.get(image_name_ori)
+            translation_res = params_cam_translation.get(image_name_ori)
+            fov_res = params_cam_fov.get(image_name_ori)
+
+            camera_indiv = Camera(colmap_id=frame_id, R=R, T=T,
+                                FoVx=FovX, FoVy=FovY,
                                 image=gt_image, hair_mask=hair_mask, hair_orient=hair_orient,
-                                image_name=image_name_ori, uid=frame_id, data_device=device)
+                                image_name=image_name_ori, uid=frame_id,
+                                # Pass the loaded residuals to the camera constructor
+                                rotation_res=rotation_res,
+                                translation_res=translation_res,
+                                fov_res=fov_res)
             self.cameras.append(camera_indiv)
 
         if best_params is not None:
@@ -176,19 +203,13 @@ class Scene_mica:
                 alpha          = alpha_best,
                 beta           = beta_best,
                 U              = best_U,
-                non_one_frac   = best_non_one_frac,
+                non_one_frac   = non_one_frac,
             )
         else:
             print("[Scene_mica] Warning: no valid hair-mask tail found; "
                   "target_dist left as None.")
-        
+
         self.cameras = np.array(self.cameras)
-    
+
     def getCameras(self):
         return self.cameras
-
-
-
-
-
-    

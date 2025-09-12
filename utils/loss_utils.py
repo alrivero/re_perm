@@ -386,9 +386,9 @@ class HairDetailLoss:
         fade_iters:   int = 20_000,
         polish_iters: int = 5_000,
         huber_delta:  float = 0.10,
-        w_ssim_final: float = 0.00,
-        w_grad_final: float = 0.00,
-        w_lpips_final:float = 0.00,
+        w_ssim_final: float = 0.05,
+        w_grad_final: float = 0.03,
+        w_lpips_final:float = 0.1,
         blur:         bool  = False,
         blur_sigma:   float = 1.0,
         device:       str   = "cuda"
@@ -470,7 +470,7 @@ class HairDetailLoss:
         if w_ss:
             ssim_map = 1 - ms_ssim(
                 pred4, tgt4,
-                window_size=11, max_val=1.0,
+                window_size=7, max_val=1.0,
                 reduction='none'
             )                                           # (B,1,H,W)
             loss += w_ss * (ssim_map * g_map).sum() / (g_map.sum() + 1e-6)
@@ -488,13 +488,13 @@ class HairDetailLoss:
             grad = (sobel(lum_p) - sobel(lum_t)).abs()  # (B,1,H,W)
             loss += w_gr * (grad * g_map).sum() / (g_map.sum() + 1e-6)
 
-        # LPIPS (polish)
-        # if w_lp:
-        #     lp = self.lpips(
-        #         linear_to_lpips(pred4), linear_to_lpips(tgt4)
-        #     )                                          # (B,1,1,1)
-        #     # Gate LPIPS by the average gate: if gate_map is zero, this term is zero
-        #     loss += w_lp * lp.mean()
+        #LPIPS (polish)
+        if w_lp:
+            lp = self.lpips(
+                linear_to_lpips(pred4), linear_to_lpips(tgt4)
+            )                                          # (B,1,1,1)
+            # Gate LPIPS by the average gate: if gate_map is zero, this term is zero
+            loss += w_lp * lp.mean()
 
         return loss
 
